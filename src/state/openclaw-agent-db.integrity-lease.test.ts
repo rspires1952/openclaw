@@ -161,19 +161,20 @@ it("independent schema registration lets an agent writer commit shared state bef
     register: true,
   });
 
-  const [outcome] = await committed;
-  expect(outcome).toEqual({ status: "committed" });
+  expect((await committed)[0]).toEqual({ status: "committed" });
   expect(await exited).toEqual([0, null]);
-  expect(database.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+  expect(queryRow(database, "PRAGMA foreign_keys")).toEqual({ foreign_keys: 1 });
   expect(
-    database
-      .prepare("SELECT state_json FROM auth_profile_state WHERE state_key='schema-lock-order'")
-      .get(),
+    queryRow(
+      database,
+      "SELECT state_json FROM auth_profile_state WHERE state_key='schema-lock-order'",
+    ),
   ).toEqual({ state_json: "{}" });
   expect(
-    shared.db
-      .prepare("SELECT value_json FROM config_machine_state WHERE state_key='schema-lock-order'")
-      .get(),
+    queryRow(
+      shared.db,
+      "SELECT value_json FROM config_machine_state WHERE state_key='schema-lock-order'",
+    ),
   ).toEqual({ value_json: "{}" });
 });
 
@@ -213,20 +214,15 @@ it.each(["forced cleanup", "stale admission"])(
     const child = await openChild(owner.path, owner.env);
     const state = openState({ env: owner.env });
     const row = state.db
-      .prepare("SELECT * FROM agent_database_leases WHERE owner_pid = ?")
-      .get(child.pid!) as {
-      lease_id: string;
-      agent_id: string;
-      path: string;
-      owner_pid: number;
-      owner_start_time: number | null;
-    };
+      .prepare(`SELECT lease_id AS leaseId, agent_id AS agentId, path,
+      owner_pid AS ownerPid, owner_start_time AS ownerStartTime
+      FROM agent_database_leases WHERE owner_pid = ?`)
+      .get(child.pid!) as Omit<
+      OpenClawAgentDatabaseWorkerLeaseReceipt,
+      "sharedStatePath" | "sharedStateIdentity"
+    >;
     const receipt: OpenClawAgentDatabaseWorkerLeaseReceipt = {
-      leaseId: row.lease_id,
-      agentId: row.agent_id,
-      path: row.path,
-      ownerPid: row.owner_pid,
-      ownerStartTime: row.owner_start_time,
+      ...row,
       sharedStatePath: state.path,
       sharedStateIdentity: readDatabasePathIdentitySync(state.path).key,
     };
@@ -245,13 +241,10 @@ it.each(["forced cleanup", "stale admission"])(
         },
         lease: receipt,
       });
-      expect(owner.cleanClose()).toBe(false);
-      owner.close();
-      expect(owner.cleanClose()).toBe(false);
-    } else {
-      owner.close();
-      expect(owner.cleanClose()).toBe(false);
     }
+    expect(owner.cleanClose()).toBe(false);
+    owner.close();
+    expect(owner.cleanClose()).toBe(false);
     const gate = schema.agentDatabaseIntegrityBeforeMutationSteps;
     let diagnostics: SqliteIntegrityDiagnostics | undefined;
     vi.spyOn(schema, "agentDatabaseIntegrityBeforeMutationSteps").mockImplementation(function* (
@@ -262,10 +255,10 @@ it.each(["forced cleanup", "stale admission"])(
       return result;
     });
     const reopened = owner.reopen();
-    expect(diagnostics?.integrityGateOutcome).toBe("healthy");
-    if (recovery === "stale admission") {
-      expect(diagnostics?.integrityGateReason).toBe("stale-lease-full");
-    }
+    expect(diagnostics).toMatchObject({
+      integrityGateOutcome: "healthy",
+      ...(recovery === "stale admission" ? { integrityGateReason: "stale-lease-full" } : {}),
+    });
     expect(
       queryRow(
         reopened.db,
@@ -368,20 +361,17 @@ it.each(["idle-peer", "settled", "pinned", "checkpoint-error"] as const)(
         db.close();
       }
     }
-    if (outcome === "checkpoint-error") {
-      expect(owner.cleanClose()).toBe(false);
-    } else {
+    expect(owner.cleanClose()).toBe(outcome === "idle-peer" || outcome === "settled");
+    if (outcome !== "checkpoint-error") {
       expect(incompleteCheckpoint).toBe(outcome !== "idle-peer");
       const walBytes = fs.statSync(`${database.path}-wal`, { throwIfNoEntry: false })?.size ?? 0;
       if (outcome === "pinned") {
         expect(walBytes).toBeGreaterThan(0);
-        expect(owner.cleanClose()).toBe(false);
       } else {
         expect(walBytes).toBe(0);
-        expect(owner.cleanClose()).toBe(true);
-        if (outcome === "idle-peer") {
-          expect(reader.isOpen).toBe(true);
-        }
+      }
+      if (outcome === "idle-peer") {
+        expect(reader.isOpen).toBe(true);
       }
     }
   },
@@ -562,7 +552,7 @@ it.each(["quarantine", "schema-version latch"] as const)(
   "gates fresh read-only admission on %s and permits a repaired generation",
   (condition) => {
     const owner = openOwner();
-    const options = owner.options;
+    const { options, env } = owner;
     owner.close();
     closeState();
     if (condition === "quarantine") {
@@ -572,7 +562,7 @@ it.each(["quarantine", "schema-version latch"] as const)(
           kind: "agent",
           path: owner.path,
           reason: "synthetic readonly quarantine",
-          env: owner.env,
+          env,
         }),
       ).toBe(true);
     }
@@ -581,18 +571,15 @@ it.each(["quarantine", "schema-version latch"] as const)(
     latchError.name = "SqliteSchemaVersionError";
     if (condition === "schema-version latch") {
       expect(recordOpenFailure(owner.path, latchError)).toBe(true);
-      expect(readQuarantineFailure("agent", owner.path, { env: owner.env })).toBeUndefined();
+      expect(readQuarantineFailure("agent", owner.path, { env })).toBeUndefined();
       expect(() => openReadOnly(options)).toThrow(latchError);
-      expect(clearOpenFailure(owner.path, { env: owner.env })).toBe(true);
-    } else if (condition === "quarantine") {
-      expect(readQuarantineFailure("agent", owner.path, { env: owner.env })).toBeDefined();
-
+      expect(clearOpenFailure(owner.path, { env })).toBe(true);
+    } else {
+      expect(readQuarantineFailure("agent", owner.path, { env })).toBeDefined();
       expect(() => openReadOnly(options)).toThrow(
         expect.objectContaining({ name: "SqliteIntegrityError" }),
       );
-
-      // Clearing the quarantine (Doctor repair) makes the same generation readable again.
-      expect(clearQuarantine(owner.path, { env: owner.env })).toBe(true);
+      expect(clearQuarantine(owner.path, { env })).toBe(true);
     }
     const repaired = openReadOnly(options);
     expect(repaired.found).toBe(true);
