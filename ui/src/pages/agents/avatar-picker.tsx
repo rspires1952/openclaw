@@ -122,25 +122,37 @@ export function AvatarPicker(props: AvatarPickerProps) {
     <div class="avatar-picker" aria-label={t("agents.identity.avatarPicker")}>
       <div class="avatar-picker__preview">
         <Show
-          when={candidate()?.dataUrl ?? props.avatar}
+          when={busy() && mode() === "generate"}
           fallback={
-            <div
-              class="avatar-picker__sprite lobster-pet lobster-pet--palette-crimson"
-              style={lobsterLookStyle(canonicalLobsterLook(LOBSTER_PALETTE_WEIGHTS[0][0]))}
+            <Show
+              when={candidate()?.dataUrl ?? props.avatar}
+              fallback={
+                <div
+                  class="avatar-picker__sprite lobster-pet lobster-pet--palette-crimson"
+                  style={lobsterLookStyle(canonicalLobsterLook(LOBSTER_PALETTE_WEIGHTS[0][0]))}
+                >
+                  <LobsterSvg
+                    look={canonicalLobsterLook(LOBSTER_PALETTE_WEIGHTS[0][0])}
+                    standalone
+                  />
+                </div>
+              }
             >
-              <LobsterSvg look={canonicalLobsterLook(LOBSTER_PALETTE_WEIGHTS[0][0])} standalone />
-            </div>
+              {(source) => (
+                <AgentIdentityAvatar
+                  agent={{
+                    id: props.agentId,
+                    avatar: source(),
+                    name: candidate()?.name ?? t("agents.identity.avatarPreview"),
+                  }}
+                />
+              )}
+            </Show>
           }
         >
-          {(source) => (
-            <AgentIdentityAvatar
-              agent={{
-                id: props.agentId,
-                avatar: source(),
-                name: candidate()?.name ?? t("agents.identity.avatarPreview"),
-              }}
-            />
-          )}
+          <svg class="avatar-picker__ghost" viewBox="0 0 120 120" aria-hidden="true">
+            <path d="M27 31C30 18 43 13 55 17c13-7 28 1 31 13 12 1 19 13 16 25 6 12-1 25-13 28-7 11-19 13-30 7-12 6-24 1-29-9-13-2-19-14-14-25-3-10 1-20 11-25Z" />
+          </svg>
         </Show>
       </div>
       <div class="avatar-picker__panel">
@@ -213,21 +225,15 @@ export function AvatarPicker(props: AvatarPickerProps) {
                 onInput={(event) => setPrompt(event.currentTarget.value)}
               />
             </label>
-            <p class="avatar-picker__hint">{t("agents.identity.avatarPrivacy")}</p>
             <Show when={candidate()}>
               {(preview) => (
                 <div class="avatar-picker__candidate">
                   <strong>{preview().name}</strong>
                   <p>{preview().description}</p>
-                  <div
-                    class="avatar-picker__sizes"
-                    aria-label={t("agents.identity.avatarSmallPreview")}
-                  >
-                    <img width="24" height="24" src={preview().dataUrl} alt="" />
-                    <img width="40" height="40" src={preview().dataUrl} alt="" />
-                    <span>{t("agents.identity.avatarSmallPreview")}</span>
-                  </div>
                   <div class="avatar-picker__actions">
+                    <button type="button" class="btn" onClick={() => setCandidate(null)}>
+                      {t("agents.identity.avatarDiscard")}
+                    </button>
                     <button
                       type="button"
                       class="btn primary"
@@ -239,9 +245,6 @@ export function AvatarPicker(props: AvatarPickerProps) {
                       }}
                     >
                       {t("agents.identity.avatarUse")}
-                    </button>
-                    <button type="button" class="btn" onClick={() => setCandidate(null)}>
-                      {t("agents.identity.avatarDiscard")}
                     </button>
                   </div>
                 </div>

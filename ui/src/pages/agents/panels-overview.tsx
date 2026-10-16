@@ -229,6 +229,17 @@ export function AgentOverview(
   };
 
   const [avatarPickerOpen, setAvatarPickerOpen] = createSignal(false);
+  const renderIdentityAvatar = () => (
+    <AgentIdentityAvatar
+      agent={{
+        id: params.agent.id,
+        avatar: identityAvatarUrl(),
+        textAvatar:
+          identityDraft().emoji ?? resolveAgentTextAvatar(params.agent, params.agentIdentity),
+      }}
+      onImageError={identityImageError()}
+    />
+  );
 
   // Same catalog the primary picker offers; the field hides the effective
   // primary and current chain itself. Order is preserved: a pick appends.
@@ -247,18 +258,35 @@ export function AgentOverview(
       >
         <div class="settings-row settings-row--stacked">
           <div class="agent-identity-editor">
-            <span class="agent-identity-editor__avatar" aria-hidden="true">
-              <AgentIdentityAvatar
-                agent={{
-                  id: params.agent.id,
-                  avatar: identityAvatarUrl(),
-                  textAvatar:
-                    identityDraft().emoji ??
-                    resolveAgentTextAvatar(params.agent, params.agentIdentity),
-                }}
-                onImageError={identityImageError()}
-              />
-            </span>
+            {uploadsEnabled(params.applicationConfig) ? (
+              <button
+                type="button"
+                class="agent-identity-editor__avatar"
+                aria-label={t("agents.identity.chooseAvatar")}
+                aria-expanded={avatarPickerOpen() ? "true" : "false"}
+                title={t("agents.identity.chooseAvatar")}
+                disabled={identityBusy()}
+                onClick={() => setAvatarPickerOpen((open) => !open)}
+              >
+                {renderIdentityAvatar()}
+                <span class="agent-identity-editor__avatar-edit" aria-hidden="true">
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <path d="m16 5 3 3M4 20l4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z" />
+                  </svg>
+                </span>
+              </button>
+            ) : (
+              <span class="agent-identity-editor__avatar" aria-hidden="true">
+                {renderIdentityAvatar()}
+              </span>
+            )}
             <div class="agent-identity-editor__content">
               <div class="agent-identity-editor__fields">
                 <label class="field">
@@ -307,17 +335,6 @@ export function AgentOverview(
                 </div>
               ) : undefined}
               <div class="agent-identity-editor__actions">
-                {uploadsEnabled(params.applicationConfig) ? (
-                  <button
-                    type="button"
-                    class="btn btn--sm"
-                    aria-expanded={avatarPickerOpen() ? "true" : "false"}
-                    disabled={identityBusy()}
-                    onClick={() => setAvatarPickerOpen((open) => !open)}
-                  >
-                    {t("agents.identity.chooseAvatar")}
-                  </button>
-                ) : undefined}
                 <button
                   type="button"
                   class="btn btn--sm primary"

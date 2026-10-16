@@ -93,6 +93,25 @@
   width: 100px;
 }
 
+.avatar-picker__ghost {
+  width: 100px;
+  height: 100px;
+  fill: var(--bg-hover);
+  animation: avatar-picker-ghost-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes avatar-picker-ghost-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .avatar-picker__ghost {
+    animation: none;
+  }
+}
+
 .avatar-picker__sprite svg {
   overflow: visible;
 }
@@ -117,8 +136,6 @@
   border-radius: 16px;
 }
 
-.avatar-picker__hint,
-.avatar-picker__sizes,
 .avatar-picker__upload > p {
   margin: 0;
   font-size: 12px;
@@ -131,17 +148,15 @@
   font-size: 13px;
 }
 
-.avatar-picker__sizes,
 .avatar-picker__actions {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
   margin-block-start: 12px;
-  flex-wrap: wrap;
 }
 
-.avatar-picker__sizes > img {
-  object-fit: contain;
+.avatar-picker__actions > .btn {
+  width: 100%;
 }
 
 .avatar-picker__generate {

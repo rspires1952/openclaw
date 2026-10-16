@@ -66,7 +66,12 @@ it("submits only the description and requires acceptance before replacing identi
   await waitForFast(() => expect(view.container.textContent).toContain("Garden keeper"));
   expect(generate).toHaveBeenCalledWith("A patient gardener with a watering can");
   expect(view.props.onSelect).not.toHaveBeenCalled();
-  expect(view.container.querySelectorAll(".avatar-picker__sizes img")).toHaveLength(2);
+  expect(view.container.textContent).not.toContain("Chat and sidebar preview");
+  expect(
+    [...view.container.querySelectorAll(".avatar-picker__actions button")].map((button) =>
+      button.textContent?.trim(),
+    ),
+  ).toEqual(["Discard", "Use avatar"]);
   view.click("Discard");
   expect(view.props.onSelect).not.toHaveBeenCalled();
   view.click("Generate");
@@ -80,7 +85,7 @@ it("retires generation on mode changes and when its agent chooser is disposed", 
   const view = mount(() => pending.promise);
   view.describe("Explorer");
   view.click("Generate");
-  view.click("Bot");
+  view.click("Blobster");
   pending.resolve(generated);
   await pending.promise;
   await Promise.resolve();
@@ -96,6 +101,18 @@ it("retires generation on mode changes and when its agent chooser is disposed", 
   await next.promise;
   await Promise.resolve();
   expect(view.props.onSelect).not.toHaveBeenCalled();
+});
+
+it("shows a Blobster silhouette and generating label while a preview is pending", async () => {
+  const pending = createDeferred<GeneratedAvatar>();
+  const view = mount(() => pending.promise);
+  view.describe("Explorer");
+  view.click("Generate");
+  expect(view.container.querySelector(".avatar-picker__ghost path")).not.toBeNull();
+  expect(view.container.textContent).toContain("Generating...");
+  pending.resolve(generated);
+  await waitForFast(() => expect(view.container.textContent).toContain("Use avatar"));
+  expect(view.container.querySelector(".avatar-picker__ghost")).toBeNull();
 });
 
 it("shows generation failures without changing the selected avatar", async () => {

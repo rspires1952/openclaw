@@ -258,8 +258,8 @@ it("keeps a reopened picker preview pending until the authenticated avatar resol
   const response = createDeferred<Response>();
   fetchAvatar.mockReturnValue(response.promise);
   const view = createView();
-  const chooser = [...view.container.querySelectorAll("button")].find(
-    (button) => button.textContent?.trim() === "Choose avatar…",
+  const chooser = view.container.querySelector<HTMLButtonElement>(
+    'button[aria-label="Edit avatar"]',
   );
   if (!chooser) {
     throw new Error("Missing avatar chooser");

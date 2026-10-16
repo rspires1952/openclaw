@@ -71,14 +71,16 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 8px;
 }
 
 .agent-identity-editor__avatar {
+  position: relative;
   flex: 0 0 auto;
   width: 56px;
   height: 56px;
+  padding: 0;
   border-radius: 50%;
   overflow: hidden;
   display: flex;
@@ -87,6 +89,42 @@
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   font-size: 24px;
+}
+
+.agent-identity-editor__avatar-edit {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  opacity: 0;
+  transition: opacity var(--duration-fast) ease;
+}
+
+.agent-identity-editor__avatar-edit svg {
+  width: 20px;
+  height: 20px;
+}
+
+.agent-identity-editor__avatar:is(button):is(:hover, :focus-visible, [aria-expanded="true"])
+  .agent-identity-editor__avatar-edit {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .agent-identity-editor__avatar-edit {
+    inset: auto 0 0 auto;
+    width: 25px;
+    height: 25px;
+    border-radius: 50%;
+    opacity: 1;
+  }
+
+  .agent-identity-editor__avatar-edit svg {
+    width: 15px;
+    height: 15px;
+  }
 }
 
 .agent-identity-editor__avatar img {

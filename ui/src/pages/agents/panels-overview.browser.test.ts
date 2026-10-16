@@ -11,7 +11,14 @@ it("opens agent avatar selection from the keyboard and respects the busy state",
   const props = createAgentViewTestProps();
   const mounted = mountSolid(Agents, props, container);
   try {
-    await page.getByRole("button", { name: "Choose avatar…", exact: true }).click();
+    const editAvatar = page.getByRole("button", { name: "Edit avatar", exact: true });
+    const avatarButton = editAvatar.element();
+    if (!(avatarButton instanceof HTMLButtonElement)) {
+      throw new Error("Avatar edit affordance must use a native button");
+    }
+    avatarButton.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(avatarButton.getAttribute("aria-expanded")).toBe("true");
     await page.getByRole("button", { name: "Upload", exact: true }).click();
     const input = container.querySelector<HTMLInputElement>('input[type="file"]');
     if (!input) {
