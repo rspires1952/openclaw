@@ -1,5 +1,5 @@
-import type { AgentIdentity } from "../components/identity-avatar-view.ts";
 import type { IconName } from "../components/solid/icon.tsx";
+import type { AgentIdentity } from "./identity-avatar-view.ts";
 
 export type ToastDismissReason = "action" | "dismiss" | "disconnected" | "replaced" | "timeout";
 
