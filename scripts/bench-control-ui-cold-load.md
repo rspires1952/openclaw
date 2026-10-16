@@ -129,7 +129,11 @@ measured results must be reported separately from private deployment evidence.
 ## Source-mapped CPU attribution
 
 Use `--cpu-profile --live-events --untraced` to collect separate reload and live
-profiles without the additional timeline trace. `--cpu-profile` also captures
+profiles without the additional timeline trace. CPU mode leaves the legacy
+owner-method and animation-frame wrappers disabled (`ownerProbes: false`,
+`solidChat`/`solidSidebar` absent as `null`); source stacks supply the attribution.
+This also lets live replay run after renderer owners have been replaced by native
+Solid components. `--cpu-profile` also captures
 `--streaming-reply` when selected. Each phase prints self time, inclusive function
 time (application sources first), and inclusive source-file time. Recursion and
 multiple frames from one file count once per sample. All rows are saved in

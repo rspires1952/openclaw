@@ -194,6 +194,15 @@ describe("cold-load CPU accounting", () => {
               columnNumber: generatedColumn,
             },
           },
+          {
+            id: 2,
+            callFrame: {
+              functionName: "t",
+              url: "http://localhost/assets/app.js",
+              lineNumber: 0,
+              columnNumber: 1,
+            },
+          },
         ],
       },
       { assetBaseUrl: "http://localhost/assets/", assetDirectory: directory },
@@ -202,6 +211,11 @@ describe("cold-load CPU accounting", () => {
       url: "../../src/timestamp.ts",
       lineNumber: 1,
       columnNumber: 9,
+    });
+    expect(mapped.profile.nodes[1]?.callFrame).toMatchObject({
+      url: "../../src/timestamp.ts",
+      lineNumber: 0,
+      columnNumber: 7,
     });
   });
 
@@ -244,7 +258,19 @@ describe("cold-load CPU accounting", () => {
     ).toThrow();
   });
 
-  it("retains an unmapped bundler runtime without inventing its source", async () => {
+  it.each(["missing map", "unmapped segment"])("retains a frame with %s", async (kind) => {
+    const directory = tempDirs.make("openclaw-cold-load-unmapped-");
+    if (kind === "unmapped segment") {
+      await writeFile(
+        path.join(directory, "runtime.js.map"),
+        JSON.stringify({
+          version: 3,
+          sources: ["app.ts"],
+          names: [],
+          mappings: "A,KAAA",
+        }),
+      );
+    }
     const profile: ColdLoadCpuProfile = {
       nodes: [{ id: 1, callFrame: frame("runtime", "http://localhost/assets/runtime.js") }],
       samples: [1],
@@ -252,7 +278,7 @@ describe("cold-load CPU accounting", () => {
     };
     const mapped = await mapColdLoadCpuProfile(profile, {
       assetBaseUrl: "http://localhost/assets/",
-      assetDirectory: tempDirs.make("openclaw-cold-load-unmapped-"),
+      assetDirectory: directory,
     });
     expect(mapped).toMatchObject({ mappedFrames: 0, unmappedFrames: 1 });
     expect(mapped.profile.nodes[0]).toBe(profile.nodes[0]);

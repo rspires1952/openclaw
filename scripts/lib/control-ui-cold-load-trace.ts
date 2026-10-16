@@ -134,15 +134,17 @@ export async function mapColdLoadCpuProfile(
         return node;
       }
       const origin = map.findEntry(frame.lineNumber, frame.columnNumber);
-      if (origin.originalSource === undefined) {
+      if (!("originalSource" in origin) || typeof origin.originalSource !== "string") {
         unmappedFrames += 1;
         return node;
       }
       mappedFrames += 1;
+      // Node's SourceMapping declarations omit the optional decoded name.
+      const name = asRecord(origin)?.name;
       return {
         ...node,
         callFrame: {
-          functionName: origin.name || frame.functionName,
+          functionName: typeof name === "string" && name ? name : frame.functionName,
           url: path.posix.normalize(origin.originalSource),
           lineNumber: origin.originalLine,
           columnNumber: origin.originalColumn,
@@ -347,8 +349,12 @@ export function summarizeCpuProfile(
         if (entry.functionName !== "(root)" && entry.functionName !== "(idle)") {
           const key = JSON.stringify(entry);
           const row = functions.get(key) ?? { ...entry, selfMs: 0, inclusiveMs: 0 };
-          if (current === sample.id) row.selfMs += selfMs;
-          if (!seenFunctions.has(key)) row.inclusiveMs += selfMs;
+          if (current === sample.id) {
+            row.selfMs += selfMs;
+          }
+          if (!seenFunctions.has(key)) {
+            row.inclusiveMs += selfMs;
+          }
           functions.set(key, row);
           seenFunctions.add(key);
           if (entry.url && !seenFiles.has(entry.url)) {

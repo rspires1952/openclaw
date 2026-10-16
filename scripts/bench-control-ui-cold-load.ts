@@ -447,7 +447,7 @@ try {
   );
   const warmProbes = values["warm-reload"] ? `\n(${warmReloadProbe.toString()})();` : "";
   await page.addInitScript({
-    content: `;(() => { if (window !== window.top) return; const __name = (fn) => fn; (${installWidgetReadiness.toString()})(); ${createControlUiMockGatewayInitScript(prepared.scenario)}\n${rigProbeScript}\n${fixture.sidebarListChurn ? `window.__teamScaleSidebarLists = { apply: (mutation) => window.__teamScaleMutate(mutation) }; window.openclawControlUiE2eGateway.setRequestHandler("sessions.list", async ({ params, respond }) => respond(await window.__teamScaleList(params)));` : ""}\n${createColdLoadProbeInitScript({ latencyMs, frameGapMs, events: fixture.events, liveEvents: fixture.liveEvents, liveHistory: fixture.liveHistory, ownerProbes: !values["session-event-churn"] })}\n${streamingReply ? createStreamingReplyProbeInitScript() : ""}\n${extraInitScripts.join("\n")}\n${warmProbes} })();`,
+    content: `;(() => { if (window !== window.top) return; const __name = (fn) => fn; (${installWidgetReadiness.toString()})(); ${createControlUiMockGatewayInitScript(prepared.scenario)}\n${rigProbeScript}\n${fixture.sidebarListChurn ? `window.__teamScaleSidebarLists = { apply: (mutation) => window.__teamScaleMutate(mutation) }; window.openclawControlUiE2eGateway.setRequestHandler("sessions.list", async ({ params, respond }) => respond(await window.__teamScaleList(params)));` : ""}\n${createColdLoadProbeInitScript({ latencyMs, frameGapMs, events: fixture.events, liveEvents: fixture.liveEvents, liveHistory: fixture.liveHistory, ownerProbes: !cpuProfile && !values["session-event-churn"] })}\n${streamingReply ? createStreamingReplyProbeInitScript() : ""}\n${extraInitScripts.join("\n")}\n${warmProbes} })();`,
   });
   const url = controlUiSessionUrl(server.baseUrl, fixture.selectedSessionKey, "dashboard");
   async function settle() {
@@ -548,6 +548,10 @@ try {
       await writeFile(
         path.join(artifactDir, `run-${run + 1}.${phase}.cpuprofile`),
         JSON.stringify(profile),
+      );
+      await writeFile(
+        path.join(artifactDir, `run-${run + 1}.cpu-profile.json`),
+        JSON.stringify(cpuPhases, null, 2),
       );
       return { ...mapped, summary };
     }
@@ -740,7 +744,9 @@ try {
         deltas: number;
         milliseconds: Record<string, number>;
       }> = [];
-      if (cpuProfile) await cdp.send("Profiler.start");
+      if (cpuProfile) {
+        await cdp.send("Profiler.start");
+      }
       await page.evaluate((input) => Reflect.get(window, "__streamingReply").start(input), {
         ...streamingReply,
         sessionKey: fixture.selectedSessionKey,
@@ -793,7 +799,9 @@ try {
         streamingInput.abort();
         await nativeInput;
       }
-      if (cpuProfile) await recordCpu("streaming", (await cdp.send("Profiler.stop")).profile);
+      if (cpuProfile) {
+        await recordCpu("streaming", (await cdp.send("Profiler.stop")).profile);
+      }
       streaming = {
         ...(await page.evaluate(() => Reflect.get(window, "__streamingReply").finish())),
         cpu,
@@ -858,15 +866,16 @@ try {
       const before = await readLivePresentation();
       const liveTrace: unknown[] = [];
       collectedTrace = liveTrace;
-      if (!values.untraced) {
+      if (!values.untraced || cpuProfile) {
         await cdp.send("Profiler.start");
+      }
+      if (!values.untraced) {
         await cdp.send("Tracing.start", {
           categories:
             "toplevel,blink.user_timing,devtools.timeline,disabled-by-default-v8.cpu_profiler",
           transferMode: "ReportEvents",
         });
       }
-      if (cpuProfile) await cdp.send("Profiler.start");
       const listOffset = sidebarLists?.stats().length ?? 0;
       await page.evaluate((captureProbes) => {
         if (captureProbes) {
@@ -908,13 +917,18 @@ try {
         }
       }
       await page.evaluate(() => Reflect.get(window, "__coldLoad").finishLive());
-      if (cpuProfile) await recordCpu("live", (await cdp.send("Profiler.stop")).profile);
-      if (!values.untraced) {
+      if (!values.untraced || cpuProfile) {
         const liveProfile = await cdp.send("Profiler.stop");
-        await writeFile(
-          path.join(artifactDir, `run-${run + 1}.live.cpuprofile`),
-          JSON.stringify(liveProfile.profile),
-        );
+        if (cpuProfile) {
+          await recordCpu("live", liveProfile.profile);
+        } else {
+          await writeFile(
+            path.join(artifactDir, `run-${run + 1}.live.cpuprofile`),
+            JSON.stringify(liveProfile.profile),
+          );
+        }
+      }
+      if (!values.untraced) {
         const liveComplete = new Promise<void>((resolve) => {
           cdp.once("Tracing.tracingComplete", () => resolve());
         });
@@ -991,12 +1005,6 @@ try {
         );
       }
     }
-    if (cpuProfile) {
-      await writeFile(
-        path.join(artifactDir, `run-${run + 1}.cpu-profile.json`),
-        JSON.stringify(cpuPhases, null, 2),
-      );
-    }
     const overlays = values["overlay-probe"]
       ? await probeColdLoadOverlays(
           page,
@@ -1048,7 +1056,9 @@ try {
       );
       if (baselineCpu) {
         const before = baselineCpu[phase];
-        if (!before) throw new Error(`Baseline CPU report is missing the ${phase} phase`);
+        if (!before) {
+          throw new Error(`Baseline CPU report is missing the ${phase} phase`);
+        }
         comparisons[phase] = compareCpuTables(before, tables);
         console.log(
           formatCpuTables(
@@ -1059,11 +1069,12 @@ try {
         );
       }
     }
-    if (baselineCpu)
+    if (baselineCpu) {
       await writeFile(
         path.join(artifactDir, "cpu-profile-compare.json"),
         JSON.stringify(comparisons, null, 2),
       );
+    }
   }
   await context.close();
 } finally {
