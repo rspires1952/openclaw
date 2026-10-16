@@ -83,12 +83,18 @@ export function readGatewayAvatarNotificationIcon(
   let pending = notificationIcons.get(source);
   if (!pending) {
     pending = (async () => {
-      const image = await createAvatarThumbnail(source, 32, AbortSignal.timeout(5_000));
-      if (image.contentType !== "image/png") {
-        return undefined;
+      const signal = AbortSignal.timeout(5_000);
+      for (const maxSide of [32, 24]) {
+        const image = await createAvatarThumbnail(source, maxSide, signal);
+        if (image.contentType !== "image/png") {
+          return undefined;
+        }
+        const icon = `data:image/png;base64,${image.body.toString("base64")}`;
+        if (icon.length <= 2_400) {
+          return icon;
+        }
       }
-      const icon = `data:image/png;base64,${image.body.toString("base64")}`;
-      return icon.length <= 2_400 ? icon : undefined;
+      return undefined;
     })().catch(() => {
       notificationIcons.delete(source);
       return undefined;

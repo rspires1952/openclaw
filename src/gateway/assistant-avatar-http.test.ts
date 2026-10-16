@@ -95,6 +95,19 @@ it("retries a failed notification image on the next delivery", async () => {
   expect(fetch).toHaveBeenCalledTimes(2);
 });
 
+it("keeps a detailed saved picker avatar within the notification image budget", async () => {
+  const bytes = fs.readFileSync(new URL("./fixtures/notification-avatar.webp", import.meta.url));
+  const icon = await readGatewayAvatarNotificationIcon({
+    dataUrl: `data:image/webp;base64,${bytes.toString("base64")}`,
+    revision: "detailed-picker-avatar",
+  });
+  expect(icon).toMatch(/^data:image\/png;base64,/);
+  expect(icon!.length).toBeLessThanOrEqual(2_400);
+  const size = readImageMetadataFromHeader(Buffer.from(icon!.split(",")[1]!, "base64"));
+  expect(size?.width).toBeLessThanOrEqual(32);
+  expect(size?.height).toBeLessThanOrEqual(32);
+});
+
 // Two 2×2 red/blue frames encoded with img2webp; VP8X animation flag and timing are retained.
 const ANIMATED_WEBP = Buffer.from(
   "UklGRoQAAABXRUJQVlA4WAoAAAACAAAAAQAAAQAAQU5JTQYAAAD/////AABBTk1GKAAAAAAAAAAAAAEAAAEAAGQAAAJWUDhMDwAAAC8BQAAABxD9j/4HIqL/AQBBTk1GKAAAAAAAAAAAAAEAAAEAAGQAAABWUDhMDwAAAC8BQAAABxDR//4HIqL/AQA=",
