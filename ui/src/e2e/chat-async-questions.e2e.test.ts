@@ -24,11 +24,30 @@ const questionPanel = (page: Page) =>
   page.locator(".agent-chat__question-dock openclaw-chat-question-panel");
 const summaryFor = (page: Page) =>
   page.locator(".chat-thread .chat-question-summary").filter({ hasText: title });
-const button = (owner: Locator, name: string) => owner.getByRole("button", { name, exact: true });
+const button = (owner: Locator | Page, name: string) =>
+  owner.getByRole("button", { name, exact: true });
+const transcriptText = (page: Page, text: string) =>
+  page.locator(".chat-thread-inner").getByText(text, { exact: true });
 type MessageIdentity = { id: string; seq: number };
+type Gateway = Awaited<ReturnType<typeof installMockGateway>>;
+
+async function noRequests(gateway: Gateway, ...methods: string[]) {
+  for (const method of methods) {
+    expect(await gateway.getRequests(method)).toHaveLength(0);
+  }
+}
+
+async function visibleText(locator: Locator, ...texts: string[]) {
+  await expectBrowser(locator).toBeVisible();
+  for (const text of texts) {
+    await expectBrowser(locator).toContainText(text);
+  }
+}
+
+const queueIds = async (page: Page) => (await readOutboxQueue(page)).map((item) => item.id);
 
 function emitMessage(
-  gateway: Awaited<ReturnType<typeof installMockGateway>>,
+  gateway: Gateway,
   message: { __openclaw: MessageIdentity },
   fields: Record<string, unknown> = {},
 ) {
@@ -93,9 +112,11 @@ async function openChat(page: Page, options: ControlUiMockGatewayScenario = {}) 
 suite.define(() => {
   it("keeps an admitted optional answer with its original outbox owner after reconnect", async () => {
     await withPage(async ({ page }) => {
-      const { gateway, card } = await openChat(page, { historyMessages: [questionMessage] });
+      const { gateway, card, custom, summary } = await openChat(page, {
+        historyMessages: [questionMessage],
+      });
       const answer = "The customer support team";
-      await card.getByRole("textbox", { name: `Your own answer for ${title}` }).fill(answer);
+      await custom.fill(answer);
       await gateway.deferNext("chat.send");
       await button(card, "Submit").click();
       const firstRequest = await gateway.waitForRequest("chat.send");
@@ -107,14 +128,11 @@ suite.define(() => {
         .poll(async () => (await readOutboxQueue(page))[0]?.sendState)
         .toBe("unconfirmed");
       await expectBrowser(card).toHaveCount(0);
-      const summary = summaryFor(page);
       await expectBrowser(summary).toContainText(answer);
       const unconfirmed = page.locator('.chat-send-status[data-send-state="unconfirmed"]');
       const retry = unconfirmed.getByRole("button", { name: "Retry queued message" });
       await expectBrowser(retry).toBeVisible();
-      expect((await readOutboxQueue(page)).map((item) => item.id)).toEqual(
-        admitted.map((item) => item.id),
-      );
+      expect(await queueIds(page)).toEqual(admitted.map((item) => item.id));
       expect(await gateway.getRequests("chat.send")).toHaveLength(1);
       await gateway.deferNext("chat.send");
       await retry.click();
@@ -124,9 +142,7 @@ suite.define(() => {
         message: firstParams.message,
         idempotencyKey: firstParams.idempotencyKey,
       });
-      expect((await readOutboxQueue(page)).map((item) => item.id)).toEqual(
-        admitted.map((item) => item.id),
-      );
+      expect(await queueIds(page)).toEqual(admitted.map((item) => item.id));
       await gateway.resolveDeferred("chat.send");
       await expectBrowser(unconfirmed).toHaveCount(0);
       await expectBrowser(card).toHaveCount(0);
@@ -138,97 +154,83 @@ suite.define(() => {
   it.each([false, true])(
     "archives an old reminder after a later completed run and can reopen it (recovery=%s)",
     async (recovery) => {
-      const completedHistory = await suite.withPage(
-        createControlUiE2eContextOptions(),
-        async ({ page }) => {
-          const prompt = {
-            ...questionMessage,
-            ...(recovery ? {} : { runId: "question-run", phase: "final_answer" }),
-            __openclaw: {
-              id: "audience-prompt",
-              seq: 2,
-              ...(recovery ? {} : { runId: "question-run" }),
-              mirrorOrigin: "codex-app-server",
-            },
-          };
-          const ownFinal = terminalMessage(
-            "Draft ready; choose an audience.",
-            "draft-ready",
-            3,
-            "question-run",
-            "final_answer",
-          );
-          const history = [
-            {
-              role: "user",
-              content: "Prepare a project summary.",
-              __openclaw: {
-                id: "initial-request",
-                seq: 1,
-                runId: "question-run",
-              },
-            },
-            prompt,
-            ...(recovery ? [] : [ownFinal]),
-          ];
-          const { gateway } = await openChat(page, { historyMessages: history });
-          const dock = page.locator(".agent-chat__question-dock");
-          await expectBrowser(dock).toBeVisible();
-          const draft = dock.getByRole("textbox", { name: `Your own answer for ${title}` });
-          const nextFinal = terminalMessage(
-            "Summary complete.",
-            "summary-finalized",
-            5,
-            "finishing-run",
-          );
-          const nextRequest = {
+      const completedHistory = await withPage(async ({ page }) => {
+        const prompt = {
+          ...questionMessage,
+          ...(recovery ? {} : { runId: "question-run", phase: "final_answer" }),
+          __openclaw: {
+            id: "audience-prompt",
+            seq: 2,
+            ...(recovery ? {} : { runId: "question-run" }),
+            mirrorOrigin: "codex-app-server",
+          },
+        };
+        const ownFinal = terminalMessage(
+          "Draft ready; choose an audience.",
+          "draft-ready",
+          3,
+          "question-run",
+          "final_answer",
+        );
+        const history = [
+          {
             role: "user",
-            content: recovery ? "Resume after restart." : "Finalize the summary.",
-            ...(recovery
-              ? {
-                  provenance: {
-                    kind: "internal_system",
-                    sourceTool: "main_session_restart_recovery",
-                  },
-                }
-              : {}),
-            __openclaw: { id: "follow-up", seq: 4, runId: "finishing-run" },
-          };
-          const finalHistory = [...history, nextRequest, nextFinal];
-          await gateway.setHistoryMessages([...history, nextRequest]);
-          await emitMessage(gateway, nextRequest);
-          await expectBrowser(
-            page
-              .locator(".chat-thread-inner")
-              .getByText(recovery ? "System · restart recovery" : nextRequest.content, {
-                exact: true,
-              }),
-          ).toBeVisible();
-          await expectBrowser(dock).toBeVisible();
-          await gateway.setHistoryMessages(finalHistory);
-          await emitMessage(gateway, nextFinal);
-          await expectBrowser(dock).toHaveCount(0);
-          const summary = summaryFor(page);
-          await expectBrowser(summary).toContainText("No longer pending");
-          await button(summary, "Answer").click();
-          await expectBrowser(dock).toBeVisible();
-          await expectBrowser(draft).toHaveValue("");
-          expect(await gateway.getRequests("chat.send")).toHaveLength(0);
-          expect(await gateway.getRequests("question.resolve")).toHaveLength(0);
-
-          return finalHistory;
-        },
-      );
-
-      // A fresh tab reconstructs archival from the saved transcript, not a
-      // remembered dismissal or the first tab's reopened draft.
-      await withPage(async ({ page }) => {
-        const { gateway } = await openChat(page, { historyMessages: completedHistory });
+            content: "Prepare a project summary.",
+            __openclaw: { id: "initial-request", seq: 1, runId: "question-run" },
+          },
+          prompt,
+          ...(recovery ? [] : [ownFinal]),
+        ];
+        const {
+          gateway,
+          custom: draft,
+          summary,
+        } = await openChat(page, { historyMessages: history });
         const dock = page.locator(".agent-chat__question-dock");
-        const summary = summaryFor(page);
+        await expectBrowser(dock).toBeVisible();
+        const nextFinal = terminalMessage(
+          "Summary complete.",
+          "summary-finalized",
+          5,
+          "finishing-run",
+        );
+        const nextRequest = {
+          role: "user",
+          content: recovery ? "Resume after restart." : "Finalize the summary.",
+          ...(recovery
+            ? {
+                provenance: {
+                  kind: "internal_system",
+                  sourceTool: "main_session_restart_recovery",
+                },
+              }
+            : {}),
+          __openclaw: { id: "follow-up", seq: 4, runId: "finishing-run" },
+        };
+        const finalHistory = [...history, nextRequest, nextFinal];
+        await gateway.setHistoryMessages([...history, nextRequest]);
+        await emitMessage(gateway, nextRequest);
         await expectBrowser(
-          page.locator(".chat-thread-inner").getByText("Summary complete.", { exact: true }),
+          transcriptText(page, recovery ? "System · restart recovery" : nextRequest.content),
         ).toBeVisible();
+        await expectBrowser(dock).toBeVisible();
+        await gateway.setHistoryMessages(finalHistory);
+        await emitMessage(gateway, nextFinal);
+        await expectBrowser(dock).toHaveCount(0);
+        await expectBrowser(summary).toContainText("No longer pending");
+        await button(summary, "Answer").click();
+        await expectBrowser(dock).toBeVisible();
+        await expectBrowser(draft).toHaveValue("");
+        await noRequests(gateway, "chat.send", "question.resolve");
+
+        return finalHistory;
+      });
+
+      // Fresh tabs must reconstruct archival, not remember a dismissal.
+      await withPage(async ({ page }) => {
+        const { gateway, summary } = await openChat(page, { historyMessages: completedHistory });
+        const dock = page.locator(".agent-chat__question-dock");
+        await expectBrowser(transcriptText(page, "Summary complete.")).toBeVisible();
         await expectBrowser(dock).toHaveCount(0);
         await expectBrowser(summary).toContainText("No longer pending");
         await page.reload();
@@ -236,7 +238,7 @@ suite.define(() => {
         await expectBrowser(dock).toHaveCount(0);
         await button(summary, "Answer").click();
         await expectBrowser(dock).toBeVisible();
-        await dock.getByRole("button", { name: "Submit", exact: true }).click();
+        await button(dock, "Submit").click();
         const sent = await gateway.waitForRequest("chat.send");
         expect(requireRecord(sent.params).message).toBe(`> ${title}\n\nEngineers`);
         await expectBrowser(dock).toHaveCount(0);
@@ -253,48 +255,37 @@ suite.define(() => {
         __openclaw: { id: "draft-question", seq: 1 },
       };
       const history = [prompt];
-      const { gateway } = await openChat(page, { historyMessages: history });
-      const dock = page.locator(".agent-chat__question-dock");
-      const draft = dock.getByRole("textbox", { name: `Your own answer for ${title}` });
-      await draft.fill("New contributors and maintainers");
-      const ownFinal = {
+      const { gateway, custom: draft } = await openChat(page, { historyMessages: history });
+      const draftText = "New contributors and maintainers";
+      await draft.fill(draftText);
+      const final = (content: string, id: string, seq: number, runId: string) => ({
         role: "assistant",
-        content: "Draft ready.",
-        __openclaw: { id: "draft-final", seq: 2, runTerminal: true },
-        runId: "draft-run",
+        content,
+        runId,
         phase: "final_answer",
-      };
-      const laterFinal = {
-        role: "assistant",
-        content: "Other work finished.",
-        __openclaw: { id: "later-final", seq: 3, runTerminal: true },
-        runId: "later-run",
-        phase: "final_answer",
-      };
+        __openclaw: { id, seq, runTerminal: true },
+      });
+      const ownFinal = final("Draft ready.", "draft-final", 2, "draft-run");
+      const laterFinal = final("Other work finished.", "later-final", 3, "later-run");
       await gateway.setHistoryMessages([...history, ownFinal, laterFinal]);
       for (const message of [ownFinal, laterFinal]) {
         await emitMessage(gateway, message);
       }
-      await expectBrowser(
-        page.locator(".chat-thread-inner").getByText("Other work finished.", { exact: true }),
-      ).toBeVisible();
-      await expectBrowser(draft).toHaveValue("New contributors and maintainers");
+      await expectBrowser(transcriptText(page, "Other work finished.")).toBeVisible();
+      await expectBrowser(draft).toHaveValue(draftText);
       // Observe the owning IndexedDB transaction, not a timeout, before simulating a reload.
       await expect
         .poll(async () =>
           (await readStoredQuestionDrafts(page)).some((question) =>
-            question.answers.some(
-              (answer) => answer.freeText === "New contributors and maintainers",
-            ),
+            question.answers.some(({ freeText }) => freeText === draftText),
           ),
         )
         .toBe(true);
       await page.reload();
-      await expectBrowser(draft).toHaveValue("New contributors and maintainers");
+      await expectBrowser(draft).toHaveValue(draftText);
       await reconnectMockGateway(page, gateway, "question-draft-reconnect");
-      await expectBrowser(draft).toHaveValue("New contributors and maintainers");
-      expect(await gateway.getRequests("chat.send")).toHaveLength(0);
-      expect(await gateway.getRequests("question.resolve")).toHaveLength(0);
+      await expectBrowser(draft).toHaveValue(draftText);
+      await noRequests(gateway, "chat.send", "question.resolve");
     });
   });
 
@@ -351,6 +342,8 @@ suite.define(() => {
       await withPage(async ({ page }) => {
         const sessionKey = "agent:main:dashboard:async-question-proof";
         const followUpTitle = "What should I emphasize?";
+        const answer = "Include one practical example.\nKeep the next steps separate.";
+        const audience = "/stop is an example for the whole team";
         const multipleQuestions = {
           ...withFollowUp(followUpTitle),
           runId: "working-run",
@@ -375,16 +368,12 @@ suite.define(() => {
         await page.locator(".chat-thread").getByText(title, { exact: true }).waitFor();
 
         await expect.poll(() => card.count()).toBe(1);
-        await card.getByRole("radio", { name: /Engineers/ }).waitFor();
-        expect(
-          await card.getByRole("radio", { name: /Engineers/ }).getAttribute("aria-checked"),
-        ).toBe("true");
+        const engineers = card.getByRole("radio", { name: /Engineers/ });
+        await expectBrowser(engineers).toBeVisible();
+        await expectBrowser(engineers).toHaveAttribute("aria-checked", "true");
         await expectRequestCountStable(gateway, "chat.send", 0);
         await page.locator(".chat-group.user .chat-bubble").hover();
-        await page
-          .locator(".chat-group.user")
-          .getByRole("button", { name: "Reply to message", exact: true })
-          .click();
+        await button(page.locator(".chat-group.user"), "Reply to message").click();
         const composerReply = page.locator(".chat-reply-preview").filter({
           has: page.getByRole("button", { name: "Cancel reply" }),
         });
@@ -392,10 +381,8 @@ suite.define(() => {
 
         await composer.fill("Keep this separate composer draft.");
 
-        await custom.fill("/stop is an example for the whole team");
-        expect(
-          await card.getByRole("radio", { name: /Engineers/ }).getAttribute("aria-checked"),
-        ).toBe("false");
+        await custom.fill(audience);
+        await expectBrowser(engineers).toHaveAttribute("aria-checked", "false");
         await button(card, "Next").click();
         const freeText = card.getByRole("textbox", { name: "Answer", exact: true });
         await freeText.fill("Include one practical example.");
@@ -406,9 +393,7 @@ suite.define(() => {
         await freeText.press("End");
         await freeText.press("Enter");
         await freeText.pressSequentially("Keep the next steps separate.");
-        await expectBrowser(freeText).toHaveValue(
-          "Include one practical example.\nKeep the next steps separate.",
-        );
+        await expectBrowser(freeText).toHaveValue(answer);
         await expect
           .poll(async () => (await freeText.boundingBox())!.height)
           .toBeGreaterThan(initialAnswerHeight);
@@ -420,16 +405,14 @@ suite.define(() => {
         await expect
           .poll(() => freeText.evaluate((element) => element.scrollHeight > element.clientHeight))
           .toBe(true);
-        await freeText.fill("Include one practical example.\nKeep the next steps separate.");
+        await freeText.fill(answer);
         await expect
           .poll(async () => (await freeText.boundingBox())!.height)
           .toBe(multilineAnswerHeight);
         expect(await gateway.getRequests("chat.send")).toHaveLength(0);
         await button(card, "Collapse question").click();
         const expand = button(card, "Expand question");
-        await expand.waitFor();
-        expect(await expand.textContent()).toContain(followUpTitle);
-        expect(await expand.textContent()).toContain("2 unanswered questions");
+        await visibleText(expand, followUpTitle, "2 unanswered questions");
         expect(await composer.isVisible()).toBe(true);
         if (!active) {
           const finalMessage = {
@@ -451,42 +434,33 @@ suite.define(() => {
             state: "final",
             message: finalMessage,
           });
-          await page
-            .getByRole("button", { name: "Stop generating" })
-            .waitFor({ state: "detached" });
+          await button(page, "Stop generating").waitFor({ state: "detached" });
           await expect
             .poll(() => page.locator(".chat-work-group button").getAttribute("aria-expanded"))
             .toBe("false");
-          expect(await expand.isVisible()).toBe(true);
-          expect(await expand.textContent()).toContain(followUpTitle);
+          await visibleText(expand, followUpTitle);
           expect(await card.getByRole("textbox").count()).toBe(0);
         }
         await expand.click();
-        expect(await freeText.inputValue()).toBe(
-          "Include one practical example.\nKeep the next steps separate.",
-        );
+        expect(await freeText.inputValue()).toBe(answer);
         await button(card, "Back").click();
-        expect(await custom.inputValue()).toBe("/stop is an example for the whole team");
+        expect(await custom.inputValue()).toBe(audience);
         await button(card, "Next").click();
         await button(card, "Submit").click();
         const request = await gateway.waitForRequest("chat.send");
         const params = requireRecord(request.params);
-        expect(params.message).toBe(
-          `> ${title}\n\n/stop is an example for the whole team\n\n> ${followUpTitle}\n\nInclude one practical example.\nKeep the next steps separate.`,
-        );
+        expect(params.message).toBe(`> ${title}\n\n${audience}\n\n> ${followUpTitle}\n\n${answer}`);
         expect(params.queueMode).toBe(active ? "steer" : undefined);
         expect(params.replyToId).toBe("audience-prompt");
         expect(await composer.inputValue()).toBe("Keep this separate composer draft.");
         expect(await composerReply.textContent()).toContain(replyMessage.content);
-        expect(await gateway.getRequests("chat.abort")).toHaveLength(0);
-        expect(await gateway.getRequests("question.resolve")).toHaveLength(0);
+        await noRequests(gateway, "chat.abort", "question.resolve");
         await card.waitFor({ state: "detached" });
         if (!active) {
           await page.locator(".chat-work-group button").click();
         }
 
-        await summary.waitFor();
-        expect(await summary.textContent()).toContain("Include one practical example.");
+        await visibleText(summary, "Include one practical example.");
         await expectRequestCountStable(gateway, "chat.send", 1);
         if (!active) {
           // Stop overriding the old run's history: startup must recover the answer
@@ -494,11 +468,11 @@ suite.define(() => {
           await gateway.setMethodResponse("chat.history", { cases: [] });
           await page.reload();
           await expectBrowser(summary).toContainText("Include one practical example.");
-          await expectBrowser(summary).toContainText("/stop is an example for the whole team");
+          await expectBrowser(summary).toContainText(audience);
           await expectBrowser(card).toHaveCount(0);
           await expectBrowser(
             page.locator(".chat-group.user .chat-bubble").filter({
-              hasText: "/stop is an example for the whole team",
+              hasText: audience,
             }),
           ).toHaveCount(1);
           await expectRequestCountStable(gateway, "chat.send", 0);
@@ -544,8 +518,7 @@ suite.define(() => {
       };
       await arrive(questionMessage, 2);
       const initialExpand = button(card, "Expand question");
-      await initialExpand.waitFor();
-      expect(await initialExpand.textContent()).toContain("1 unanswered question");
+      await visibleText(initialExpand, "1 unanswered question");
       expect(await card.getByRole("textbox").count()).toBe(0);
       expect(await composer.evaluate((element) => element === document.activeElement)).toBe(true);
       await initialExpand.click();
@@ -640,9 +613,7 @@ suite.define(() => {
           __mockError: { code: "UNAVAILABLE", message: "Synthetic send rejection" },
         });
         await card.waitFor({ state: "detached" });
-        expect(await button(card, "Submit").count()).toBe(0);
-        await summary.waitFor();
-        expect(await summary.textContent()).toContain(answer);
+        await visibleText(summary, answer);
         const failedSend = page.locator('.chat-send-status[data-send-state="failed"]');
         const retry = button(summary, "Retry answer");
         await retry.waitFor();
@@ -687,7 +658,7 @@ suite.define(() => {
           await expectBrowser(summary).toContainText("Answer not sent");
           await expectBrowser(card).toHaveCount(0);
         }
-        expect((await readOutboxQueue(page)).map((item) => item.id)).toEqual([queueId]);
+        expect(await queueIds(page)).toEqual([queueId]);
         await expectRequestCountStable(gateway, "chat.send", 0);
         if (confirmation === "discard") {
           const laterRequest = {
@@ -709,35 +680,26 @@ suite.define(() => {
           for (const message of [laterRequest, laterFinal]) {
             await emitMessage(gateway, message);
           }
-          await expectBrowser(
-            page.locator(".chat-thread-inner").getByText(laterFinal.content, { exact: true }),
-          ).toBeVisible();
+          await expectBrowser(transcriptText(page, laterFinal.content)).toBeVisible();
           await expectBrowser(summary).toContainText("Answer not sent");
-          await failedSend.getByRole("button", { name: "Discard", exact: true }).click();
-          await expectBrowser(card).toBeVisible();
-          await expectBrowser(card.getByRole("radio", { name: /Engineers/ })).toHaveAttribute(
-            "aria-checked",
-            "true",
-          );
-          await expectBrowser(custom).toHaveValue("");
-          expect(await readOutboxQueue(page)).toEqual([]);
+          await button(failedSend, "Discard").click();
+          const expectDiscarded = async () => {
+            await expectBrowser(card).toBeVisible();
+            const engineers = card.getByRole("radio", { name: /Engineers/ });
+            await expectBrowser(engineers).toHaveAttribute("aria-checked", "true");
+            await expectBrowser(custom).toHaveValue("");
+            expect(await readOutboxQueue(page)).toEqual([]);
+          };
+          await expectDiscarded();
           await expectBrowser(summary).not.toContainText("Awaiting delivery confirmation");
           await page.reload();
-          await expectBrowser(card).toBeVisible();
-          await expectBrowser(card.getByRole("radio", { name: /Engineers/ })).toHaveAttribute(
-            "aria-checked",
-            "true",
-          );
-          await expectBrowser(custom).toHaveValue("");
-          expect(await readOutboxQueue(page)).toEqual([]);
+          await expectDiscarded();
           await expectRequestCountStable(gateway, "chat.send", 0);
           return;
         }
         await gateway.deferNext("chat.send");
         await (
-          confirmation === "legacy"
-            ? failedSend.getByRole("button", { name: "Retry queued message", exact: true })
-            : retry
+          confirmation === "legacy" ? button(failedSend, "Retry queued message") : retry
         ).click();
         const retried = await gateway.waitForRequest("chat.send");
         expect(requireRecord(retried.params)).toMatchObject({
@@ -746,7 +708,7 @@ suite.define(() => {
         });
         const userMessages = page.locator(".chat-group.user .chat-bubble");
         expect(await userMessages.count()).toBe(1);
-        expect((await readOutboxQueue(page)).map((item) => item.id)).toEqual([queueId]);
+        expect(await queueIds(page)).toEqual([queueId]);
         if (confirmation === "legacy") {
           // Old persisted rows have no question association. Their existing
           // outbox status owns retry until canonical saved history resolves it.
@@ -818,8 +780,7 @@ suite.define(() => {
       await page.reload();
       await expectBrowser(card).toHaveCount(0);
 
-      await summary.waitFor();
-      await expectBrowser(summary).toContainText("Everyone");
+      await visibleText(summary, "Everyone");
       // Remount must derive completion from history, not the prior mount's draft map.
       await page.reload();
       await expectBrowser(card).toHaveCount(0);
