@@ -528,6 +528,15 @@ const cpuTablesSchema = z.object({
   files: z.array(z.object({ url: z.string(), inclusiveMs: z.number().nonnegative().finite() })),
 });
 
-export function readCpuProfileReport(value: unknown): Record<string, ColdLoadCpuTables> {
-  return z.record(z.string(), cpuTablesSchema).parse(value);
+export function readCpuProfileReport(
+  value: unknown,
+  phases: string[],
+): Record<string, ColdLoadCpuTables> {
+  const report = z.record(z.string(), cpuTablesSchema).parse(value);
+  const baseline = Object.keys(report).toSorted().join(", ");
+  const candidate = phases.toSorted().join(", ");
+  if (baseline !== candidate) {
+    throw new Error(`CPU profile phases differ: baseline [${baseline}], candidate [${candidate}]`);
+  }
+  return report;
 }

@@ -254,10 +254,20 @@ describe("cold-load CPU accounting", () => {
       inclusiveMs: -2.5,
     });
     expect(formatCpuTables("Median", median)).toContain("app.ts:1:1 reconcile");
-    expect(readCpuProfileReport({ reload: median })).toEqual({ reload: median });
+    expect(readCpuProfileReport({ reload: median }, ["reload"])).toEqual({ reload: median });
     expect(() =>
-      readCpuProfileReport({ reload: { functions: [{ selfMs: "2" }], files: [] } }),
+      readCpuProfileReport({ reload: { functions: [{ selfMs: "2" }], files: [] } }, ["reload"]),
     ).toThrow();
+  });
+
+  it.each(["live", "streaming"])("rejects comparisons that omit the %s phase", (phase) => {
+    const tables = { functions: [], files: [] };
+    const report = { reload: tables, [phase]: tables };
+    expect(() => readCpuProfileReport(report, ["reload"])).toThrow("CPU profile phases differ");
+    expect(() => readCpuProfileReport({ reload: tables }, ["reload", phase])).toThrow(
+      "CPU profile phases differ",
+    );
+    expect(readCpuProfileReport(report, [phase, "reload"])).toEqual(report);
   });
 
   it.each(["missing map", "unmapped segment"])("retains a frame with %s", async (kind) => {
