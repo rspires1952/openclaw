@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTempDirTracker, useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import * as nodeSqlite from "../infra/node-sqlite.js";
+import type { EngineConnection } from "../infra/sql-connection.js";
 import { revokeSqliteDatabaseAdmissionsForPath } from "../infra/sqlite-database-admission.js";
 import { SQLITE_IDLE_HANDLE_TTL_MS } from "../infra/sqlite-handle-lifecycle.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -15,15 +16,15 @@ import { retainOpenClawAgentDatabaseReadOnly } from "./openclaw-agent-db-readonl
 import {
   borrowOpenClawAgentDatabase,
   clearOpenClawAgentDatabaseOpenFailure,
-  closeOpenClawAgentDatabaseByPath,
+  closeOpenClawAgentDatabaseByPath as closeAgent,
   closeOpenClawAgentDatabasesForTest,
-  getOpenClawAgentDatabaseIfOpen,
-  listOpenClawRegisteredAgentDatabases,
-  openOpenClawAgentDatabase,
+  getOpenClawAgentDatabaseIfOpen as cachedAgent,
+  listOpenClawRegisteredAgentDatabases as registeredAgents,
+  openOpenClawAgentDatabase as openAgent,
   recordOpenClawAgentDatabaseOpenFailure,
   settleOpenClawAgentDatabaseWorkerClose,
-  withOpenClawAgentDatabaseAdmission,
-  withOpenClawAgentDatabaseAsync,
+  withOpenClawAgentDatabaseAdmission as withAdmission,
+  withOpenClawAgentDatabaseAsync as withAgent,
   runOpenClawAgentWriteTransaction,
   type OpenClawAgentDatabaseWriteAdmission,
 } from "./openclaw-agent-db.js";
@@ -32,6 +33,22 @@ import {
   openOpenClawStateDatabase,
 } from "./openclaw-state-db.js";
 import { claimOpenClawStateOwnership } from "./openclaw-state-ownership-operations.js";
+
+function interceptOpen(pathname: string, opened: (connection: DatabaseSync) => void) {
+  const nativeOpen = nodeSqlite.openNodeSqliteDatabase;
+  return vi.spyOn(nodeSqlite, "openNodeSqliteDatabase").mockImplementation((location, config) => {
+    const connection = nativeOpen(location, config);
+    if (location === pathname) {
+      opened(connection);
+    }
+    return connection;
+  });
+}
+
+function idle(db: EngineConnection, isOpen: boolean, elapsed = SQLITE_IDLE_HANDLE_TTL_MS) {
+  vi.advanceTimersByTime(elapsed);
+  expect(db.isOpen).toBe(isOpen);
+}
 
 describe("agent database lease acquisition owner", () => {
   const tempDirs = createTempDirTracker();
@@ -62,7 +79,7 @@ describe("agent database lease acquisition owner", () => {
 
   it.each([true, false])("observes live leases before maintenance (cached: %s)", (cached) => {
     const { env } = createOwner();
-    const agent = openOpenClawAgentDatabase({ agentId: "main", env });
+    const agent = openAgent({ agentId: "main", env });
     if (!cached) {
       closeOpenClawStateDatabaseForTest();
     }
@@ -74,7 +91,7 @@ describe("agent database lease acquisition owner", () => {
       "database is still open in process",
     );
 
-    expect(closeOpenClawAgentDatabaseByPath(agent.path)).toBe(true);
+    expect(closeAgent(agent.path)).toBe(true);
     if (!cached) {
       closeOpenClawStateDatabaseForTest();
     }
@@ -97,7 +114,7 @@ describe("agent database lease acquisition owner", () => {
     const operation = vi.fn();
 
     await expect(
-      withOpenClawAgentDatabaseAdmission(
+      withAdmission(
         options,
         async (run) =>
           run(() => {
@@ -111,39 +128,33 @@ describe("agent database lease acquisition owner", () => {
     expect(fs.readdirSync(directory)).toEqual([]);
     expect(fs.statSync(directory).mode).toBe(mode);
     expect(owner.leases()).toEqual([]);
-    expect(getOpenClawAgentDatabaseIfOpen(options)).toBeUndefined();
-    await expect(
-      withOpenClawAgentDatabaseAdmission(options, admitted, (database) => database.agentId),
-    ).resolves.toBe(options.agentId);
+    expect(cachedAgent(options)).toBeUndefined();
+    await expect(withAdmission(options, admitted, (database) => database.agentId)).resolves.toBe(
+      options.agentId,
+    );
   });
 
   it("unwinds an unfinished physical open when the scheduler rejects the next permit", async () => {
     const owner = createOwner();
     const options = { agentId: "worker", env: owner.env };
-    const original = openOpenClawAgentDatabase(options);
+    const original = openAgent(options);
     original.db.exec(`
       INSERT INTO cache_entries (scope,key,value_json,expires_at,updated_at)
         VALUES ('admission','retained','{"retained":true}',100,1);
       DROP INDEX idx_agent_cache_expiry;
     `);
-    expect(closeOpenClawAgentDatabaseByPath(original.path)).toBe(true);
+    expect(closeAgent(original.path)).toBe(true);
     closeOpenClawAgentDatabasesForTest(owner.stateDir);
     revokeSqliteDatabaseAdmissionsForPath(original.path);
     const nativeOpen = nodeSqlite.openNodeSqliteDatabase;
     let opened: DatabaseSync | undefined;
-    const open = vi
-      .spyOn(nodeSqlite, "openNodeSqliteDatabase")
-      .mockImplementation((location, config) => {
-        const connection = nativeOpen(location, config);
-        if (location === original.path) {
-          opened = connection;
-          connections.push(connection);
-        }
-        return connection;
-      });
+    const open = interceptOpen(original.path, (connection) => {
+      opened = connection;
+      connections.push(connection);
+    });
     const lostScheduler = new Error("synthetic parent closed during database admission");
     let permits = 0;
-    const withAdmission: OpenClawAgentDatabaseWriteAdmission = async (run) => {
+    const scheduler: OpenClawAgentDatabaseWriteAdmission = async (run) => {
       if (++permits === 2) {
         expect(owner.leases()).toHaveLength(1);
         expect(opened?.isOpen).toBe(true);
@@ -153,14 +164,12 @@ describe("agent database lease acquisition owner", () => {
     };
     const operation = vi.fn();
 
-    await expect(
-      withOpenClawAgentDatabaseAdmission(options, withAdmission, operation),
-    ).rejects.toBe(lostScheduler);
+    await expect(withAdmission(options, scheduler, operation)).rejects.toBe(lostScheduler);
 
     expect(permits).toBe(2);
     expect(operation).not.toHaveBeenCalled();
     expect(opened?.isOpen).toBe(false);
-    expect(getOpenClawAgentDatabaseIfOpen(options)).toBeUndefined();
+    expect(cachedAgent(options)).toBeUndefined();
     expect(owner.leases()).toEqual([]);
     open.mockRestore();
     {
@@ -179,9 +188,9 @@ describe("agent database lease acquisition owner", () => {
         },
       ]);
     }
-    await expect(
-      withOpenClawAgentDatabaseAdmission(options, admitted, (database) => database.agentId),
-    ).resolves.toBe(options.agentId);
+    await expect(withAdmission(options, admitted, (database) => database.agentId)).resolves.toBe(
+      options.agentId,
+    );
   });
 
   it("resets a recreated fixture root without retiring another root", () => {
@@ -189,10 +198,10 @@ describe("agent database lease acquisition owner", () => {
     const owner = createOwner();
     const env = owner.env;
     const otherEnv = { OPENCLAW_STATE_DIR: owner.nextStateDir };
-    const closed = openOpenClawAgentDatabase({ agentId: "closed", env });
-    closeOpenClawAgentDatabaseByPath(closed.path);
-    const active = openOpenClawAgentDatabase({ agentId: "active", env });
-    const other = openOpenClawAgentDatabase({ agentId: "other", env: otherEnv });
+    const closed = openAgent({ agentId: "closed", env });
+    closeAgent(closed.path);
+    const active = openAgent({ agentId: "active", env });
+    const other = openAgent({ agentId: "other", env: otherEnv });
     const failedPath = path.join(owner.stateDir, "failed.sqlite");
     const otherFailedPath = path.join(owner.nextStateDir, "failed.sqlite");
     const failure = new Error("fixture open failure");
@@ -204,32 +213,25 @@ describe("agent database lease acquisition owner", () => {
     expect(active.db.isOpen).toBe(false);
     expect(owner.leases()).toEqual([]);
     expect(other.db.isOpen).toBe(true);
-    expect(openOpenClawAgentDatabase({ agentId: "other", env: otherEnv })).toBe(other);
-    expect(() =>
-      openOpenClawAgentDatabase({ agentId: "failed", env: otherEnv, path: otherFailedPath }),
-    ).toThrow(failure);
-    expect(openOpenClawAgentDatabase({ agentId: "failed", env, path: failedPath }).db.isOpen).toBe(
-      true,
+    expect(openAgent({ agentId: "other", env: otherEnv })).toBe(other);
+    expect(() => openAgent({ agentId: "failed", env: otherEnv, path: otherFailedPath })).toThrow(
+      failure,
     );
+    expect(openAgent({ agentId: "failed", env, path: failedPath }).db.isOpen).toBe(true);
 
     now.mockReturnValue(2_000);
     revokeSqliteDatabaseAdmissionsForPath(closed.path);
-    openOpenClawAgentDatabase({ agentId: closed.agentId, env });
-    expect(
-      listOpenClawRegisteredAgentDatabases({ env }).find((entry) => entry.path === closed.path),
-    ).toMatchObject({ lastSeenAt: 2_000 });
+    openAgent({ agentId: closed.agentId, env });
+    expect(registeredAgents({ env }).find((entry) => entry.path === closed.path)).toMatchObject({
+      lastSeenAt: 2_000,
+    });
   });
 
   it.each([
-    { kind: "ambient environment", ambient: true, external: false, worker: false },
-    { kind: "removed external supervision marker", ambient: false, external: true, worker: false },
-    {
-      kind: "Worker settlement after environment mutation",
-      ambient: false,
-      external: false,
-      worker: true,
-    },
-  ])("releases the original lease with $kind", ({ ambient, external, worker }) => {
+    ["ambient environment", true, false, false],
+    ["removed external supervision marker", false, true, false],
+    ["Worker settlement after environment mutation", false, false, true],
+  ] as const)("releases the original lease with %s", (_kind, ambient, external, worker) => {
     const owner = createOwner();
     if (external) {
       owner.env.OPENCLAW_SUPERVISOR_MODE = "external";
@@ -237,7 +239,7 @@ describe("agent database lease acquisition owner", () => {
     }
     vi.stubEnv("OPENCLAW_STATE_DIR", owner.stateDir);
     vi.stubEnv("OPENCLAW_AGENT_DIR", undefined);
-    const database = openOpenClawAgentDatabase({
+    const database = openAgent({
       agentId: "main",
       ...(ambient ? {} : { env: owner.env }),
     });
@@ -258,7 +260,7 @@ describe("agent database lease acquisition owner", () => {
       } else if (ambient) {
         closeOpenClawAgentDatabasesForTest();
       } else {
-        expect(closeOpenClawAgentDatabaseByPath(database.path)).toBe(true);
+        expect(closeAgent(database.path)).toBe(true);
       }
       expect(database.db.isOpen).toBe(false);
       expect(owner.leases()).toEqual([]);
@@ -274,30 +276,23 @@ describe("agent database lease acquisition owner", () => {
 
   it("releases a retained failed-open handle in its original store", () => {
     const owner = createOwner();
-    const database = openOpenClawAgentDatabase({ agentId: "main", env: owner.env });
-    expect(closeOpenClawAgentDatabaseByPath(database.path)).toBe(true);
-    const nativeOpen = nodeSqlite.openNodeSqliteDatabase;
-    const open = vi
-      .spyOn(nodeSqlite, "openNodeSqliteDatabase")
-      .mockImplementation((location, options) => {
-        const connection = nativeOpen(location, options);
-        if (location === database.path) {
-          open.mockRestore();
-          vi.spyOn(connection, "close").mockImplementationOnce(() => {
-            // Change the caller's environment after claim, during failed-open cleanup.
-            owner.env.OPENCLAW_STATE_DIR = owner.nextStateDir;
-            throw new Error("fixture close failure");
-          });
-        }
-        return connection;
+    const database = openAgent({ agentId: "main", env: owner.env });
+    expect(closeAgent(database.path)).toBe(true);
+    const open = interceptOpen(database.path, (connection) => {
+      open.mockRestore();
+      vi.spyOn(connection, "close").mockImplementationOnce(() => {
+        // Change the caller's environment after claim, during failed-open cleanup.
+        owner.env.OPENCLAW_STATE_DIR = owner.nextStateDir;
+        throw new Error("fixture close failure");
       });
+    });
     try {
-      expect(() =>
-        openOpenClawAgentDatabase({ agentId: "other", env: owner.env, path: database.path }),
-      ).toThrow("fixture close failure");
+      expect(() => openAgent({ agentId: "other", env: owner.env, path: database.path })).toThrow(
+        "fixture close failure",
+      );
       open.mockRestore();
       expect(owner.leases()).toHaveLength(1);
-      expect(closeOpenClawAgentDatabaseByPath(database.path)).toBe(true);
+      expect(closeAgent(database.path)).toBe(true);
       expect(owner.leases()).toEqual([]);
       expect(fs.readdirSync(owner.nextStateDir)).toEqual([]);
     } finally {
@@ -315,6 +310,9 @@ describe("openclaw agent database handle cache", () => {
     env = { OPENCLAW_STATE_DIR: fs.realpathSync(tempDirs.make("openclaw-agent-db-cache-")) };
   });
 
+  const registrationFor = (pathname: string) =>
+    registeredAgents({ env }).find((entry) => entry.path === pathname);
+
   beforeEach(() => {
     closeOpenClawAgentDatabasesForTest();
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -329,7 +327,7 @@ describe("openclaw agent database handle cache", () => {
 
   it("does not count periodic WAL maintenance as database activity", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
-    const database = openOpenClawAgentDatabase({ agentId: "idle-maintenance", env });
+    const database = openAgent({ agentId: "idle-maintenance", env });
     await vi.advanceTimersByTimeAsync(SQLITE_IDLE_HANDLE_TTL_MS);
     expect(database.db.isOpen).toBe(false);
   });
@@ -341,7 +339,7 @@ describe("openclaw agent database handle cache", () => {
     let operations = 0;
     const admitted = ["adoption-first", "adoption-second"].map((agentId) => {
       const options = { agentId, env };
-      return withOpenClawAgentDatabaseAsync(options, async (database) => {
+      return withAgent(options, async (database) => {
         if (++operations === 2) {
           entered.resolve();
         }
@@ -378,44 +376,39 @@ describe("openclaw agent database handle cache", () => {
   });
 
   it("does not invoke an admitted operation after explicit disposal revokes its handle", async () => {
-    const target = openOpenClawAgentDatabase({ agentId: "revoked-operation", env });
+    const target = openAgent({ agentId: "revoked-operation", env });
     const operation = vi.fn();
-    const result = withOpenClawAgentDatabaseAsync({ agentId: target.agentId, env }, operation);
-    closeOpenClawAgentDatabaseByPath(target.path);
+    const result = withAgent({ agentId: target.agentId, env }, operation);
+    closeAgent(target.path);
     await expect(result).rejects.toThrow(/closed|revoked/);
     expect(operation).not.toHaveBeenCalled();
   });
 
   it("keeps an open transaction through expiry and evicts after it finishes", () => {
-    const database = openOpenClawAgentDatabase({ agentId: "transaction", env });
+    const database = openAgent({ agentId: "transaction", env });
     database.db.exec("BEGIN IMMEDIATE");
     try {
-      vi.advanceTimersByTime(SQLITE_IDLE_HANDLE_TTL_MS);
-      expect(database.db.isOpen).toBe(true);
+      idle(database.db, true);
       expect(database.db.isTransaction).toBe(true);
     } finally {
       database.db.exec("ROLLBACK");
     }
-    vi.advanceTimersByTime(SQLITE_IDLE_HANDLE_TTL_MS);
-    expect(database.db.isOpen).toBe(false);
+    idle(database.db, false);
   });
 
   it("pins a completion's exact database until its final claim is released", () => {
     const options = { agentId: "completion", env };
-    const database = openOpenClawAgentDatabase(options);
+    const database = openAgent(options);
     const retained = retainOpenClawAgentDatabaseReadOnly(options);
     if (!retained.found) {
       throw new Error("expected the cached database");
     }
     try {
-      vi.advanceTimersByTime(SQLITE_IDLE_HANDLE_TTL_MS);
+      idle(database.db, true);
       expect(retained.claim.isCurrent()).toBe(true);
-      expect(database.db.isOpen).toBe(true);
       retained.claim.release();
-      vi.advanceTimersByTime(SQLITE_IDLE_HANDLE_TTL_MS - 1);
-      expect(database.db.isOpen).toBe(true);
-      vi.advanceTimersByTime(1);
-      expect(database.db.isOpen).toBe(false);
+      idle(database.db, true, SQLITE_IDLE_HANDLE_TTL_MS - 1);
+      idle(database.db, false, 1);
       expect(retained.claim.isCurrent()).toBe(false);
     } finally {
       retained.claim.release();
@@ -423,14 +416,12 @@ describe("openclaw agent database handle cache", () => {
   });
 
   it("retries failed lease cleanup without retaining a closed handle forever", () => {
-    const database = openOpenClawAgentDatabase({ agentId: "lease-retry", env });
+    const database = openAgent({ agentId: "lease-retry", env });
     const { db: state } = openOpenClawStateDatabase({ env });
     state.exec(`CREATE TEMP TRIGGER fail_agent_lease_release BEFORE DELETE ON agent_database_leases
       BEGIN SELECT RAISE(ABORT, 'blocked lease release'); END`);
     try {
-      expect(() => closeOpenClawAgentDatabaseByPath(database.path)).toThrow(
-        "blocked lease release",
-      );
+      expect(() => closeAgent(database.path)).toThrow("blocked lease release");
       expect(database.db.isOpen).toBe(false);
       state.exec("DROP TRIGGER fail_agent_lease_release");
       vi.advanceTimersByTime(SQLITE_IDLE_HANDLE_TTL_MS);
@@ -444,38 +435,32 @@ describe("openclaw agent database handle cache", () => {
       if (state.isOpen) {
         state.exec("DROP TRIGGER IF EXISTS fail_agent_lease_release");
       }
-      closeOpenClawAgentDatabaseByPath(database.path);
+      closeAgent(database.path);
     }
   });
 
   it("reuses an evicted database and repairs a replacement while preserving rows and discovery", () => {
     const options = { agentId: "durability", env };
-    const evicted = openOpenClawAgentDatabase(options);
+    const evicted = openAgent(options);
     evicted.db
       .prepare(
         "INSERT INTO auth_profile_state (state_key, state_json, updated_at) VALUES (?, ?, ?)",
       )
       .run("cache-eviction", JSON.stringify({ preserved: true }), 42);
-    const registration = listOpenClawRegisteredAgentDatabases({ env }).find(
-      (entry) => entry.path === evicted.path,
-    );
+    const registration = registrationFor(evicted.path);
     expect(registration).toBeDefined();
-    vi.advanceTimersByTime(SQLITE_IDLE_HANDLE_TTL_MS);
-    expect(evicted.db.isOpen).toBe(false);
-    const cachedReopen = openOpenClawAgentDatabase(options);
+    idle(evicted.db, false);
+    const cachedReopen = openAgent(options);
     expect(cachedReopen).not.toBe(evicted);
-    expect(
-      listOpenClawRegisteredAgentDatabases({ env }).find((entry) => entry.path === evicted.path),
-    ).toEqual(registration);
-    vi.advanceTimersByTime(SQLITE_IDLE_HANDLE_TTL_MS);
-    expect(cachedReopen.db.isOpen).toBe(false);
+    expect(registrationFor(evicted.path)).toEqual(registration);
+    idle(cachedReopen.db, false);
     fs.copyFileSync(evicted.path, `${evicted.path}.replacement`);
     fs.renameSync(`${evicted.path}.replacement`, evicted.path);
     {
       using divergent = new (nodeSqlite.requireNodeSqlite().DatabaseSync)(evicted.path);
       divergent.exec("ALTER TABLE session_nodes DROP COLUMN project_id;");
     }
-    const reopened = openOpenClawAgentDatabase(options);
+    const reopened = openAgent(options);
     expect(reopened).not.toBe(cachedReopen);
     expect(
       reopened.db
@@ -488,9 +473,7 @@ describe("openclaw agent database handle cache", () => {
         .prepare("SELECT state_json, updated_at FROM auth_profile_state WHERE state_key = ?")
         .get("cache-eviction"),
     ).toEqual({ state_json: JSON.stringify({ preserved: true }), updated_at: 42 });
-    expect(
-      listOpenClawRegisteredAgentDatabases({ env }).find((entry) => entry.path === evicted.path),
-    ).toMatchObject({
+    expect(registrationFor(evicted.path)).toMatchObject({
       agentId: options.agentId,
       path: evicted.path,
       schemaVersion: registration!.schemaVersion,
@@ -499,14 +482,14 @@ describe("openclaw agent database handle cache", () => {
 
   it("revokes on quarantine and opens a new native handle after quarantine is cleared", () => {
     const options = { agentId: "quarantine", env };
-    const database = openOpenClawAgentDatabase(options);
+    const database = openAgent(options);
     const open = vi.spyOn(nodeSqlite, "openNodeSqliteDatabase");
     const error = new Error("synthetic quarantine");
     expect(recordOpenClawAgentDatabaseOpenFailure(database.path, error)).toBe(true);
     expect(database.db.isOpen).toBe(false);
-    expect(() => openOpenClawAgentDatabase(options)).toThrow(error);
+    expect(() => openAgent(options)).toThrow(error);
     clearOpenClawAgentDatabaseOpenFailure(database.path, { env });
-    expect(openOpenClawAgentDatabase(options).db.isOpen).toBe(true);
+    expect(openAgent(options).db.isOpen).toBe(true);
     expect(open.mock.calls.filter(([pathname]) => pathname === database.path)).toHaveLength(1);
   });
 });
