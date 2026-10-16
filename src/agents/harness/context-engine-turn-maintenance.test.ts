@@ -1,10 +1,7 @@
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import {
-  appendTranscriptMessage,
-  upsertSessionEntryCore,
-} from "../../config/sessions/session-accessor.js";
+import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import { LegacyContextEngine } from "../../context-engine/legacy.js";
 import { registerContextEngineInRegistry } from "../../context-engine/registry.js";
 import type { ContextEngine } from "../../context-engine/types.js";
@@ -25,30 +22,26 @@ import {
   finalizeAcceptedContextEngineTurn,
   type ContextEngineTurnAttemptFacts,
 } from "./context-engine-turn-attempt.js";
+import { appendTurnMessage, createTurnFacts } from "./context-engine-turn.test-support.js";
 
 const unchanged = { changed: false, bytesFreed: 0, rewrittenEntries: 0 };
 let fixtureSequence = 0;
 
-// Exercise real accepted-turn persistence and scheduling with a supplying resource
-// whose usability proves that engine retirement did not outrun maintenance.
+type TurnOptions = {
+  outcome?: "committed" | "duplicate" | "failed";
+  maintenanceFails?: boolean;
+  maintenanceInfo?: Pick<ContextEngine["info"], "turnMaintenanceMode">;
+  deferAdmission?: boolean;
+};
+
+// The real lease must retain the engine's resource through deferred maintenance.
 async function withAcceptedTurn(
-  outcome: "committed" | "duplicate" | "failed",
-  maintenanceFails: boolean,
   run: (fixture: Awaited<ReturnType<typeof createAcceptedTurn>>) => Promise<void>,
-  maintenanceInfo: Pick<ContextEngine["info"], "turnMaintenanceMode"> = {
-    turnMaintenanceMode: "background",
-  },
-  deferAdmission = false,
+  options: TurnOptions = {},
 ) {
   await withStateDirEnv("openclaw-accepted-turn-maintenance-", async ({ stateDir }) => {
     resetCommandQueueStateForTest();
-    const fixture = await createAcceptedTurn(
-      stateDir,
-      outcome,
-      maintenanceFails,
-      maintenanceInfo,
-      deferAdmission,
-    );
+    const fixture = await createAcceptedTurn(stateDir, options);
     try {
       await run(fixture);
     } finally {
@@ -66,10 +59,12 @@ async function withAcceptedTurn(
 // quarantine cannot change another case's selected engine.
 async function createAcceptedTurn(
   stateDir: string,
-  outcome: "committed" | "duplicate" | "failed",
-  maintenanceFails: boolean,
-  maintenanceInfo: Pick<ContextEngine["info"], "turnMaintenanceMode">,
-  deferAdmission: boolean,
+  {
+    outcome = "committed",
+    maintenanceFails = false,
+    maintenanceInfo = { turnMaintenanceMode: "background" },
+    deferAdmission = false,
+  }: TurnOptions,
 ) {
   const engineId = `accepted-maintenance-${fixtureSequence++}`;
   const target = {
@@ -79,15 +74,14 @@ async function createAcceptedTurn(
     storePath: path.join(stateDir, "sessions.json"),
   };
   await upsertSessionEntryCore(target, { sessionId: target.sessionId, updatedAt: 1 });
-  const admitted = await appendTranscriptMessage(target, {
-    message: { role: "user", content: "Synthetic question" },
-    now: 1_000,
-  });
-  const terminal = await appendTranscriptMessage(target, {
-    message: { role: "assistant", content: "Synthetic answer" },
-    parentId: admitted?.messageId,
-    now: 2_000,
-  });
+  const admitted = await appendTurnMessage(target, "user", "Synthetic question", 1_000);
+  const terminal = await appendTurnMessage(
+    target,
+    "assistant",
+    "Synthetic answer",
+    2_000,
+    admitted?.messageId,
+  );
   if (!admitted?.anchor || !terminal?.anchor) {
     throw new Error("Expected a durable accepted transcript range");
   }
@@ -98,13 +92,7 @@ async function createAcceptedTurn(
   };
   const database = openOpenClawAgentDatabase({ agentId: "main", path: admission.storePath });
   const facts: ContextEngineTurnAttemptFacts = {
-    boundary: { admission, terminal: terminal.anchor },
-    sessionIdUsed: target.sessionId,
-    sessionKey: target.sessionKey,
-    sessionTarget: target,
-    promptError: false,
-    aborted: false,
-    yieldAborted: false,
+    ...createTurnFacts({ admission, terminal: terminal.anchor }, target),
     runtimeContext: { provider: "fixture", modelId: "fixture-model", tokenBudget: 900 },
   };
 
@@ -222,145 +210,127 @@ async function createAcceptedTurn(
 }
 
 describe("durable accepted-turn maintenance handoff", () => {
-  it("settles an admitted turn without terminal facts before disposing its engine", async () => {
-    await withAcceptedTurn("committed", false, async (fixture) => {
-      expect(fixture.pendingTurn()).toEqual({ attempt_count: 0 });
-      await fixture.lease.dispose();
-      await fixture.lease.dispose();
-      expect(fixture.pendingTurn()).toBeUndefined();
-      expect(fixture.commitTurn).not.toHaveBeenCalled();
-      expect(fixture.warn).toHaveBeenCalledExactlyOnceWith(
-        expect.stringContaining("discarded unaccepted turn advancement"),
-      );
-      expect(fixture.dispose).toHaveBeenCalledOnce();
-    });
-  });
-
-  it("allows late transcript fallback without admitting work to a disposed turn", async () => {
+  it.each([false, true])("disposes admission safely (late persistence=%s)", async (late) => {
     await withAcceptedTurn(
-      "committed",
-      false,
       async (fixture) => {
+        if (!late) {
+          expect(fixture.pendingTurn()).toEqual({ attempt_count: 0 });
+        }
         await fixture.lease.dispose();
-        await fixture.persistAdmission();
+        if (late) {
+          await fixture.persistAdmission();
+        } else {
+          await fixture.lease.dispose();
+        }
         expect(fixture.pendingTurn()).toBeUndefined();
         expect(fixture.commitTurn).not.toHaveBeenCalled();
+        if (!late) {
+          expect(fixture.warn).toHaveBeenCalledExactlyOnceWith(
+            expect.stringContaining("discarded unaccepted turn advancement"),
+          );
+          expect(fixture.dispose).toHaveBeenCalledOnce();
+        }
       },
-      {},
-      true,
+      { deferAdmission: late, maintenanceInfo: late ? {} : { turnMaintenanceMode: "background" } },
     );
   });
 
-  it.each(["foreground", undefined] as const)(
-    "awaits %s maintenance with durable runtime capabilities",
-    async (turnMaintenanceMode) => {
+  it.each([
+    { mode: "foreground", outcome: "committed", maintenanceFails: false },
+    { mode: undefined, outcome: "committed", maintenanceFails: false },
+    { mode: "background", outcome: "committed", maintenanceFails: false },
+    { mode: "background", outcome: "duplicate", maintenanceFails: true },
+  ] as const)(
+    "hands off $mode maintenance and retains resources ($outcome, failure=$maintenanceFails)",
+    async ({ mode, outcome, maintenanceFails }) => {
+      const background = mode === "background";
       await withAcceptedTurn(
-        "committed",
-        false,
         async (fixture) => {
           const finalized = finalizeAcceptedContextEngineTurn(fixture).then(() => {
-            fixture.events.push("finalized");
+            if (!background) {
+              fixture.events.push("finalized");
+            }
             return "finalized";
           });
           try {
-            expect(
-              await Promise.race([
-                fixture.maintenanceStarted.promise.then(() => "maintenance"),
-                finalized,
-              ]),
-            ).toBe("maintenance");
+            if (background) {
+              await finalized;
+              expect(
+                await Promise.race([
+                  fixture.maintenanceStarted.promise.then(() => "started"),
+                  waitForDeferredTurnMaintenanceForSession(fixture.facts.sessionKey).then(
+                    () => "settled",
+                  ),
+                ]),
+              ).toBe("started");
+              expect(fixture.maintain).toHaveBeenCalledOnce();
+              expect(fixture.maintain.mock.calls[0]?.[0]).toMatchObject({
+                sessionId: fixture.facts.sessionIdUsed,
+                sessionKey: fixture.facts.sessionKey,
+                runtimeContext: {
+                  ...fixture.facts.runtimeContext,
+                  allowDeferredCompactionExecution: true,
+                },
+              });
+              await fixture.lease.dispose();
+              expect(fixture.dispose).not.toHaveBeenCalled();
+            } else {
+              expect(
+                await Promise.race([
+                  fixture.maintenanceStarted.promise.then(() => "maintenance"),
+                  finalized,
+                ]),
+              ).toBe("maintenance");
+              for (const hook of [fixture.commitTurn, fixture.maintain]) {
+                expect(hook.mock.calls[0]?.[0].runtimeSettings).toMatchObject({
+                  model: { provider: "fixture", resolved: "fixture-model" },
+                  limits: { promptTokenBudget: 900 },
+                });
+              }
+              const runtime = fixture.maintain.mock.calls[0]?.[0].runtimeContext;
+              expect(runtime).toMatchObject({
+                ...fixture.facts.runtimeContext,
+                sessionTarget: {
+                  ...fixture.facts.sessionTarget,
+                  storePath: fixture.facts.boundary.admission.storePath,
+                },
+                llm: { complete: expect.any(Function) },
+                rewriteTranscriptEntries: expect.any(Function),
+              });
+              expect(runtime?.allowDeferredCompactionExecution).toBeUndefined();
+              // This capability reopens the durable target without a live SessionManager.
+              expect(await runtime?.rewriteTranscriptEntries?.({ replacements: [] })).toEqual({
+                ...unchanged,
+                reason: "no replacements requested",
+              });
+            }
+            expect(fixture.commitTurn).toHaveBeenCalledOnce();
             expect(fixture.pendingTurn()).toBeUndefined();
-            expect(fixture.commitTurn.mock.calls[0]?.[0].runtimeSettings).toMatchObject({
-              model: { provider: "fixture", resolved: "fixture-model" },
-              limits: { promptTokenBudget: 900 },
-            });
-            expect(fixture.maintain.mock.calls[0]?.[0].runtimeSettings).toMatchObject({
-              model: { provider: "fixture", resolved: "fixture-model" },
-              limits: { promptTokenBudget: 900 },
-            });
-            const runtimeContext = fixture.maintain.mock.calls[0]?.[0].runtimeContext;
-            expect(runtimeContext).toMatchObject({
-              ...fixture.facts.runtimeContext,
-              sessionTarget: {
-                ...fixture.facts.sessionTarget,
-                storePath: fixture.facts.boundary.admission.storePath,
-              },
-              llm: { complete: expect.any(Function) },
-              rewriteTranscriptEntries: expect.any(Function),
-            });
-            expect(runtimeContext?.allowDeferredCompactionExecution).toBeUndefined();
-            // Reopen the durable target through the supplied capability while the
-            // finalizer is waiting; no live SessionManager or rewrite lock is supplied.
-            expect(await runtimeContext?.rewriteTranscriptEntries?.({ replacements: [] })).toEqual({
-              ...unchanged,
-              reason: "no replacements requested",
-            });
             expect(fixture.events).toEqual(["commit", "maintenance-started"]);
             expect(fixture.probe.isOpen).toBe(true);
           } finally {
             fixture.releaseMaintenance.resolve();
             await finalized;
           }
-          await fixture.lease.dispose();
+          if (!background) {
+            await fixture.lease.dispose();
+          }
+          await waitForDeferredTurnMaintenanceForSession(fixture.facts.sessionKey);
           await fixture.sourceDisposed.promise;
           expect(fixture.events).toEqual([
             "commit",
             "maintenance-started",
             "maintenance-settled",
-            "finalized",
+            ...(!background ? ["finalized"] : []),
             "engine-disposed",
           ]);
           expect(fixture.resourceReads).toEqual([42, 42, 42]);
+          expect(fixture.dispose).toHaveBeenCalledOnce();
+          expect(fixture.probe.isOpen).toBe(false);
+          expect(fixture.pendingTurn()).toBeUndefined();
         },
-        { turnMaintenanceMode },
+        { outcome, maintenanceFails, maintenanceInfo: { turnMaintenanceMode: mode } },
       );
-    },
-  );
-
-  it.each([
-    { outcome: "committed", maintenanceFails: false },
-    { outcome: "duplicate", maintenanceFails: true },
-  ] as const)(
-    "returns before maintenance settles and retains resources ($outcome, failure=$maintenanceFails)",
-    async ({ outcome, maintenanceFails }) => {
-      await withAcceptedTurn(outcome, maintenanceFails, async (fixture) => {
-        await finalizeAcceptedContextEngineTurn(fixture);
-        expect(fixture.commitTurn).toHaveBeenCalledOnce();
-        expect(fixture.pendingTurn()).toBeUndefined();
-        // No second user turn or explicit scheduler invocation starts the work.
-        const maintenanceResult = await Promise.race([
-          fixture.maintenanceStarted.promise.then(() => "started"),
-          waitForDeferredTurnMaintenanceForSession(fixture.facts.sessionKey).then(() => "settled"),
-        ]);
-        expect(maintenanceResult).toBe("started");
-        expect(fixture.maintain).toHaveBeenCalledOnce();
-        expect(fixture.maintain.mock.calls[0]?.[0]).toMatchObject({
-          sessionId: fixture.facts.sessionIdUsed,
-          sessionKey: fixture.facts.sessionKey,
-          runtimeContext: {
-            ...fixture.facts.runtimeContext,
-            allowDeferredCompactionExecution: true,
-          },
-        });
-        await fixture.lease.dispose();
-        expect(fixture.dispose).not.toHaveBeenCalled();
-        expect(fixture.probe.isOpen).toBe(true);
-        expect(fixture.events).toEqual(["commit", "maintenance-started"]);
-
-        fixture.releaseMaintenance.resolve();
-        await waitForDeferredTurnMaintenanceForSession(fixture.facts.sessionKey);
-        await fixture.sourceDisposed.promise;
-        expect(fixture.events).toEqual([
-          "commit",
-          "maintenance-started",
-          "maintenance-settled",
-          "engine-disposed",
-        ]);
-        expect(fixture.resourceReads).toEqual([42, 42, 42]);
-        expect(fixture.dispose).toHaveBeenCalledOnce();
-        expect(fixture.probe.isOpen).toBe(false);
-        expect(fixture.pendingTurn()).toBeUndefined();
-      });
     },
   );
 
@@ -368,8 +338,6 @@ describe("durable accepted-turn maintenance handoff", () => {
     "does not schedule maintenance for %s",
     async (failure) => {
       await withAcceptedTurn(
-        failure === "commit-failed" ? "failed" : "committed",
-        false,
         async (fixture) => {
           const facts =
             failure === "commit-failed" ? fixture.facts : { ...fixture.facts, [failure]: true };
@@ -385,6 +353,7 @@ describe("durable accepted-turn maintenance handoff", () => {
             expect(fixture.pendingTurn()).toBeUndefined();
           }
         },
+        { outcome: failure === "commit-failed" ? "failed" : "committed" },
       );
     },
   );
