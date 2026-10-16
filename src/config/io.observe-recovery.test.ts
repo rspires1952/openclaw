@@ -1,4 +1,3 @@
-// Covers config IO recovery observation after corrupt or missing files.
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -15,15 +14,15 @@ import {
 import * as configAudit from "./io.audit.js";
 import { listConfigAuditRecordsForTests } from "./io.audit.test-support.js";
 import {
-  readConfigHealthStateFromStore,
-  patchConfigHealthEntryToStore,
+  readConfigHealthStateFromStore as readHealth,
+  patchConfigHealthEntryToStore as patchHealth,
 } from "./io.health-state.js";
 import { createConfigIO } from "./io.js";
 import {
-  maybeRecoverSuspiciousConfigRead,
-  maybeRecoverSuspiciousConfigReadSync,
-  promoteConfigSnapshotToLastKnownGoodCore,
-  recoverConfigFromLastKnownGoodCore,
+  maybeRecoverSuspiciousConfigRead as recoverAsync,
+  maybeRecoverSuspiciousConfigReadSync as recoverSync,
+  promoteConfigSnapshotToLastKnownGoodCore as promote,
+  recoverConfigFromLastKnownGoodCore as restoreLastGood,
 } from "./io.observe-recovery.js";
 import {
   clobberedUpdateChannelConfig,
@@ -36,14 +35,43 @@ import * as configObserveState from "./io.observe-state.js";
 import { createConfigIoWorkerFixture } from "./io.worker.test-support.js";
 import type { ConfigFileSnapshot } from "./types.js";
 
-type ObserveRecoveryDeps = Parameters<typeof maybeRecoverSuspiciousConfigRead>[0]["deps"];
+type ObserveRecoveryDeps = Parameters<typeof recoverAsync>[0]["deps"];
 const approveRecoveryCandidate = <T extends { raw: string; parsed: unknown }>(candidate: T) => ({
   ok: true as const,
   candidate,
 });
 
-function resolveLastKnownGoodConfigPath(configPath: string): string {
+function lastGoodPath(configPath: string): string {
   return `${configPath}.last-good`;
+}
+
+function failingRecoveryFs(
+  mode: string,
+  operation: "chmod" | "rename",
+  configPath: string,
+  error: Error,
+) {
+  const method = `${operation}${mode === "async" ? "" : "Sync"}`;
+  function intercept<T extends object>(owner: T): T {
+    return new Proxy(owner, {
+      get(target, key, receiver) {
+        const original: unknown = Reflect.get(target, key, receiver);
+        if (key !== method || typeof original !== "function") {
+          return original;
+        }
+        return (...args: unknown[]) => {
+          if (args[operation === "rename" ? 1 : 0] !== configPath) {
+            return Reflect.apply(original, target, args);
+          }
+          if (mode === "async") {
+            return Promise.reject(error);
+          }
+          throw error;
+        };
+      },
+    });
+  }
+  return mode === "async" ? { ...fs, promises: intercept(fs.promises) } : intercept(fs);
 }
 
 describe("config observe recovery", () => {
@@ -76,14 +104,11 @@ describe("config observe recovery", () => {
     closeOpenClawStateDatabaseForTest();
   });
 
-  async function seedConfig(configPath: string, config: Record<string, unknown>): Promise<void> {
-    await fsp.mkdir(path.dirname(configPath), { recursive: true });
-    await fsp.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
-  }
-
   async function seedConfigBackup(configPath: string, config: Record<string, unknown>) {
-    await seedConfig(configPath, config);
+    await fsp.mkdir(path.dirname(configPath), { recursive: true });
+    const { raw } = await writeConfigRaw(configPath, config);
     await fsp.copyFile(configPath, `${configPath}.bak`);
+    return raw;
   }
 
   async function writeConfigRaw(configPath: string, config: Record<string, unknown>) {
@@ -100,7 +125,7 @@ describe("config observe recovery", () => {
     };
   }
 
-  async function readObserveEvents(auditPath: string): Promise<Record<string, unknown>[]> {
+  async function observeEvents(auditPath: string): Promise<Record<string, unknown>[]> {
     const stateDir = path.dirname(path.dirname(auditPath));
     return listConfigAuditRecordsForTests({
       env: { OPENCLAW_STATE_DIR: stateDir },
@@ -108,7 +133,7 @@ describe("config observe recovery", () => {
     }).filter((event) => event.event === "config.observe");
   }
 
-  async function listClobberFiles(configPath: string) {
+  async function clobbers(configPath: string) {
     const prefix = `${path.basename(configPath)}.clobbered.`;
     return (await fsp.readdir(path.dirname(configPath))).filter((entry) =>
       entry.startsWith(prefix),
@@ -125,20 +150,13 @@ describe("config observe recovery", () => {
 
   async function expectUntouched(configPath: string, raw: string) {
     await expectRaw(configPath, raw);
-    expect(await listClobberFiles(configPath)).toEqual([]);
+    expect(await clobbers(configPath)).toEqual([]);
   }
 
-  async function recover(
-    mode: string,
-    input: Parameters<typeof maybeRecoverSuspiciousConfigRead>[0],
-  ) {
+  async function recover(mode: string, input: Parameters<typeof recoverAsync>[0]) {
     const work = new AsyncWorkScope();
     try {
-      return await work.run(() =>
-        mode === "async"
-          ? maybeRecoverSuspiciousConfigRead(input)
-          : maybeRecoverSuspiciousConfigReadSync(input),
-      );
+      return await work.run(() => (mode === "async" ? recoverAsync(input) : recoverSync(input)));
     } finally {
       await work.drain();
     }
@@ -156,10 +174,8 @@ describe("config observe recovery", () => {
     expect(warnMessages(warn).join("\n")).not.toContain(expected);
   }
 
-  async function readLastObserveEvent(
-    auditPath: string,
-  ): Promise<Record<string, unknown> | undefined> {
-    return (await readObserveEvents(auditPath)).at(-1);
+  async function lastEvent(auditPath: string): Promise<Record<string, unknown> | undefined> {
+    return (await observeEvents(auditPath)).at(-1);
   }
 
   function createTestConfigIO(
@@ -178,19 +194,12 @@ describe("config observe recovery", () => {
     env.OPENCLAW_STATE_DIR ??= path.join(fixtureHome, ".openclaw");
     env.OPENCLAW_DISABLE_BUNDLED_PLUGINS ??= "1";
     env.VITEST ??= "true";
+    const deps = { fs, json5: JSON5, env, homedir: () => fixtureHome, logger: { warn, error } };
     return {
       configPath,
       warn,
-      error,
-      io: createConfigIO({
-        fs,
-        json5: JSON5,
-        env,
-        homedir: () => fixtureHome,
-        configPath,
-        logger: { warn, error },
-        ...(options.observe === false ? { observe: false } : {}),
-      }),
+      deps,
+      io: createConfigIO({ ...deps, configPath, observe: options.observe }),
     };
   }
 
@@ -200,17 +209,33 @@ describe("config observe recovery", () => {
     current: Record<string, unknown> = { meta: { lastTouchedVersion: "2026.5.28" } },
   ) {
     const fixture = createTestConfigIO(home, vi.fn(), options);
-    await seedConfigBackup(fixture.configPath, backup);
-    const backupRaw = await fsp.readFile(`${fixture.configPath}.bak`, "utf8");
+    const backupRaw = await seedConfigBackup(fixture.configPath, backup);
     const clobbered = await writeConfigRaw(fixture.configPath, current);
     return { ...fixture, backupRaw, clobbered };
+  }
+
+  async function clobberedDeps(backup: Record<string, unknown> = recoverableTelegramConfig) {
+    const fixture = makeDeps(home);
+    const backupRaw = await seedConfigBackup(fixture.configPath, backup);
+    const clobbered = await writeClobberedUpdateChannel(fixture.configPath);
+    return {
+      ...fixture,
+      backupRaw,
+      clobbered,
+      input: {
+        deps: fixture.deps,
+        configPath: fixture.configPath,
+        ...clobbered,
+        prepareBackup: approveRecoveryCandidate,
+      },
+    };
   }
 
   async function brokenLastGood(config: Record<string, unknown> = recoverableCoreConfig) {
     const fixture = makeDeps(home);
     const snapshot = await makeSnapshot(fixture.configPath, config);
     await expect(
-      promoteConfigSnapshotToLastKnownGoodCore({
+      promote({
         deps: fixture.deps,
         snapshot,
         logger: fixture.deps.logger,
@@ -232,9 +257,8 @@ describe("config observe recovery", () => {
   }
 
   async function makeSnapshot(configPath: string, config: Record<string, unknown>) {
-    const raw = `${JSON.stringify(config, null, 2)}\n`;
     await fsp.mkdir(path.dirname(configPath), { recursive: true });
-    await fsp.writeFile(configPath, raw, "utf-8");
+    const { raw } = await writeConfigRaw(configPath, config);
     return {
       path: configPath,
       exists: true,
@@ -261,15 +285,7 @@ describe("config observe recovery", () => {
     };
   }
 
-  function makeDeps(
-    fixtureHome: string,
-    warn = vi.fn(),
-  ): {
-    deps: ObserveRecoveryDeps;
-    configPath: string;
-    auditPath: string;
-    warn: ReturnType<typeof vi.fn>;
-  } {
+  function makeDeps(fixtureHome: string, warn = vi.fn()) {
     const configPath = path.join(fixtureHome, ".openclaw", "openclaw.json");
     return {
       deps: {
@@ -285,55 +301,22 @@ describe("config observe recovery", () => {
     };
   }
 
-  it.each(["async", "sync"] as const)(
-    "warns when %s backup restore cannot tighten config permissions",
-    async (mode) => {
-      const { deps, configPath, warn } = makeDeps(home);
-      await seedConfigBackup(configPath, recoverableTelegramConfig);
-      const clobbered = await writeClobberedUpdateChannel(configPath);
-      const error = Object.assign(new Error("EPERM: chmod denied"), { code: "EPERM" });
-      const failingFs: ObserveRecoveryDeps["fs"] =
-        mode === "async"
-          ? {
-              ...fs,
-              promises: {
-                ...fs.promises,
-                chmod: async (target, permissions) => {
-                  if (target === configPath) {
-                    throw error;
-                  }
-                  await fs.promises.chmod(target, permissions);
-                },
-              },
-            }
-          : {
-              ...fs,
-              chmodSync: (target, permissions) => {
-                if (target === configPath) {
-                  throw error;
-                }
-                fs.chmodSync(target, permissions);
-              },
-            };
-      const input = {
-        deps: { ...deps, fs: failingFs },
-        configPath,
-        ...clobbered,
-        prepareBackup: approveRecoveryCandidate,
-      };
-      const recovered = await (mode === "async"
-        ? maybeRecoverSuspiciousConfigRead(input)
-        : maybeRecoverSuspiciousConfigReadSync(input));
-      expect(recovered.parsed).toEqual(recoverableTelegramConfig);
-      expectWarnContaining(
-        warn,
-        `Config permission hardening failed (backup restore): ${configPath}: EPERM: chmod denied`,
-      );
-      expectWarnContaining(warn, `Config auto-restored from backup: ${configPath}`);
-    },
-  );
+  it.each(["async", "sync"] as const)("warns on backup chmod failure (%s)", async (mode) => {
+    const { deps, configPath, warn, input } = await clobberedDeps();
+    const error = Object.assign(new Error("EPERM: chmod denied"), { code: "EPERM" });
+    const recovered = await recover(mode, {
+      ...input,
+      deps: { ...deps, fs: failingRecoveryFs(mode, "chmod", configPath, error) },
+    });
+    expect(recovered.parsed).toEqual(recoverableTelegramConfig);
+    expectWarnContaining(
+      warn,
+      `Config permission hardening failed (backup restore): ${configPath}: EPERM: chmod denied`,
+    );
+    expectWarnContaining(warn, `Config auto-restored from backup: ${configPath}`);
+  });
 
-  it("rereads a committed backup after its audit closes health admission", async () => {
+  it("rereads committed backup after health admission closes", async () => {
     const { io, configPath, warn, backupRaw } = await clobberedIO(largeRecoverableCoreConfig);
     const auditPath = path.join(home, ".openclaw", "logs", "config-audit.jsonl");
     const captureAppender = configAudit.captureConfigAuditAppender;
@@ -358,17 +341,22 @@ describe("config observe recovery", () => {
     try {
       const snapshot = await io.readConfigFileSnapshot({ recoverSuspicious: true });
       expect(closedAfterRestore).toBe(true);
-      expect(snapshot.valid).toBe(true);
-      expect(snapshot.raw).toBe(backupRaw);
-      expect(snapshot.config.gateway?.mode).toBe("local");
+      expect(snapshot).toMatchObject({
+        valid: true,
+        raw: backupRaw,
+        config: {
+          gateway: {
+            mode: "local",
+          },
+        },
+      });
       expect(snapshot.config.gateway?.trustedProxies).toEqual(
         largeRecoverableCoreConfig.gateway.trustedProxies,
       );
       expect(await fsp.readFile(configPath, "utf-8")).toBe(backupRaw);
       expectWarnContaining(warn, "Config health-state write failed:");
-      const events = await readObserveEvents(auditPath);
-      expect(events).toHaveLength(1);
-      expect(events[0]?.restoredFromBackup).toBe(true);
+      const events = await observeEvents(auditPath);
+      expect(events).toEqual([expect.objectContaining({ restoredFromBackup: true })]);
       await closeOpenClawStateDatabaseAsync();
       expect((await io.readConfigFileSnapshot({ recoverSuspicious: true })).raw).toBe(backupRaw);
     } finally {
@@ -376,7 +364,7 @@ describe("config observe recovery", () => {
     }
   });
 
-  it("loadConfig clears env vars from the discarded clobbered config before rereading backup", async () => {
+  it.each(["load", "snapshot"])("%s recovery clears discarded config env", async (mode) => {
     const env = {} as NodeJS.ProcessEnv;
     const { io } = await clobberedIO(
       recoverableCoreConfig,
@@ -387,30 +375,16 @@ describe("config observe recovery", () => {
       },
     );
 
-    const config = io.loadConfig();
+    const config =
+      mode === "load"
+        ? io.loadConfig()
+        : (await io.readConfigFileSnapshot({ recoverSuspicious: true })).config;
 
     expect(config.gateway?.mode).toBe("local");
     expect(env.OPENCLAW_CLOBBER_ONLY).toBeUndefined();
   });
 
-  it("read snapshot recovery clears env vars from the discarded clobbered config", async () => {
-    const env = {} as NodeJS.ProcessEnv;
-    const { io } = await clobberedIO(
-      recoverableCoreConfig,
-      { env },
-      {
-        meta: { lastTouchedVersion: "2026.5.28" },
-        env: { vars: { OPENCLAW_CLOBBER_ONLY: "bad" } },
-      },
-    );
-
-    const snapshot = await io.readConfigFileSnapshot({ recoverSuspicious: true });
-
-    expect(snapshot.config.gateway?.mode).toBe("local");
-    expect(env.OPENCLAW_CLOBBER_ONLY).toBeUndefined();
-  });
-
-  it("does not auto-restore read snapshots when observation is disabled", async () => {
+  it("does not recover with observation disabled", async () => {
     const { io, configPath, clobbered } = await clobberedIO(recoverableCoreConfig, {
       observe: false,
     });
@@ -424,7 +398,7 @@ describe("config observe recovery", () => {
     await expectPathMissing(auditPath);
   });
 
-  it("does not auto-restore include-authored roots from stale full-file backups", async () => {
+  it("does not replace include roots with stale backups", async () => {
     const { io, configPath } = createTestConfigIO(home);
     const auditPath = path.join(home, ".openclaw", "logs", "config-audit.jsonl");
     const includedConfig = largeRecoverableCoreConfig;
@@ -442,48 +416,64 @@ describe("config observe recovery", () => {
     expect(snapshot.valid).toBe(true);
     expect(snapshot.config.gateway?.mode).toBe("local");
     await expect(fsp.readFile(configPath, "utf-8")).resolves.toBe(includeRootRaw);
-    const observe = await readLastObserveEvent(auditPath);
+    const observe = await lastEvent(auditPath);
     expect(observe?.restoredFromBackup).toBe(false);
   });
 
-  it("leaves backup gateway bind aliases for Doctor", async () => {
-    const bind = "localhost";
-    const { io, configPath, warn } = createTestConfigIO(home);
-    await seedConfigBackup(configPath, {
-      gateway: { mode: "local", bind },
-    });
-    const backupRaw = `{\n  // historical bind alias\n  gateway: { mode: "local", bind: "${bind}" }\n}\n`;
-    await fsp.writeFile(`${configPath}.bak`, backupRaw, "utf-8");
-    const clobbered = await writeConfigRaw(configPath, {
-      meta: { lastTouchedVersion: "2026.5.28" },
-    });
-
-    const snapshot = await io.readConfigFileSnapshot({ recoverSuspicious: true });
-
-    expect(snapshot.valid).toBe(true);
-    expect(snapshot.config.gateway?.mode).toBeUndefined();
-    await expect(fsp.readFile(configPath, "utf-8")).resolves.toBe(clobbered.raw);
-    await expect(fsp.readFile(`${configPath}.bak`, "utf-8")).resolves.toBe(backupRaw);
-    await expect(listClobberFiles(configPath)).resolves.toHaveLength(0);
-    expectWarnNotContaining(warn, "Config auto-restored");
-  });
-
-  it("async load leaves directly authored OTel grpc backup repair to Doctor", async () => {
-    const { io, configPath, backupRaw, clobbered } = await clobberedIO({
-      gateway: { mode: "local" },
-      diagnostics: { otel: { enabled: true, protocol: "grpc", traces: true } },
-    });
-
-    const config = await io.loadConfigAsync();
-
+  it.each([
+    { kind: "bind alias", backup: { gateway: { mode: "local", bind: "localhost" } } },
+    {
+      kind: "OTel grpc",
+      backup: {
+        gateway: { mode: "local" },
+        diagnostics: { otel: { enabled: true, protocol: "grpc", traces: true } },
+      },
+    },
+    {
+      kind: "invalid model",
+      backup: {
+        gateway: { mode: "local" },
+        env: { vars: { OPENCLAW_BACKUP_ONLY: "stale" } },
+        agents: { defaults: { model: 123 } },
+      },
+    },
+  ])("leaves $kind backup repair to Doctor without leaking env", async ({ kind, backup }) => {
+    const env: NodeJS.ProcessEnv = {};
+    const {
+      io,
+      configPath,
+      warn,
+      backupRaw: seededRaw,
+      clobbered,
+    } = await clobberedIO(backup, { env });
+    const backupRaw =
+      kind === "bind alias"
+        ? '{\n  // historical bind alias\n  gateway: { mode: "local", bind: "localhost" }\n}\n'
+        : seededRaw;
+    if (kind === "bind alias") {
+      await fsp.writeFile(`${configPath}.bak`, backupRaw);
+    }
+    const snapshot =
+      kind === "OTel grpc"
+        ? undefined
+        : await io.readConfigFileSnapshot({ recoverSuspicious: true });
+    const config = snapshot?.config ?? (await io.loadConfigAsync());
+    if (snapshot) {
+      expect(snapshot.valid).toBe(true);
+    }
     expect(config.gateway?.mode).toBeUndefined();
-    expect(config.diagnostics?.otel).toBeUndefined();
-    await expectRaw(configPath, clobbered.raw);
-    await expect(fsp.readFile(`${configPath}.bak`, "utf-8")).resolves.toBe(backupRaw);
-    await expect(listClobberFiles(configPath)).resolves.toHaveLength(0);
+    if (kind === "OTel grpc") {
+      expect(config.diagnostics?.otel).toBeUndefined();
+    }
+    await expectUntouched(configPath, clobbered.raw);
+    await expectRaw(`${configPath}.bak`, backupRaw);
+    expect(env.OPENCLAW_BACKUP_ONLY).toBeUndefined();
+    if (kind === "bind alias") {
+      expectWarnNotContaining(warn, "Config auto-restored");
+    }
   });
 
-  it("passes the resolved backup candidate to caller recovery policy", async () => {
+  it("passes resolved backups to caller policy", async () => {
     const { io, configPath } = createTestConfigIO(home);
     await fsp.mkdir(path.dirname(configPath), { recursive: true });
     await fsp.writeFile(
@@ -509,7 +499,7 @@ describe("config observe recovery", () => {
     await io.readConfigFileSnapshot({ recoverSuspicious: true, allowSuspiciousRecovery });
     await io.readConfigFileSnapshot({ recoverSuspicious: true, allowSuspiciousRecovery });
     expect(allowSuspiciousRecovery).toHaveBeenCalledTimes(2);
-    expect(await listClobberFiles(configPath)).toHaveLength(0);
+    expect(await clobbers(configPath)).toHaveLength(0);
 
     expect(candidateVersion).toBe("9999.1.1");
     expect(currentConfig).toBeDefined();
@@ -517,29 +507,10 @@ describe("config observe recovery", () => {
     await expect(fsp.readFile(configPath, "utf-8")).resolves.toBe(clobbered.raw);
   });
 
-  it("validates backup candidates without leaking their env into live state", async () => {
-    const env = {} as NodeJS.ProcessEnv;
-    const { io, configPath } = createTestConfigIO(home, vi.fn(), { env });
-    await seedConfigBackup(configPath, {
-      gateway: { mode: "local" },
-      env: { vars: { OPENCLAW_BACKUP_ONLY: "stale" } },
-      agents: { defaults: { model: 123 } },
-    });
-    const clobbered = await writeConfigRaw(configPath, {
-      meta: { lastTouchedVersion: "2026.5.28" },
-    });
-    const snapshot = await io.readConfigFileSnapshot({ recoverSuspicious: true });
-    expect(snapshot.valid).toBe(true);
-    expect(snapshot.config.gateway?.mode).toBeUndefined();
-    expect(await fsp.readFile(configPath, "utf-8")).toBe(clobbered.raw);
-    expect(await listClobberFiles(configPath)).toHaveLength(0);
-    expect(env.OPENCLAW_BACKUP_ONLY).toBeUndefined();
-  });
-
-  it("recovery refuses a backup without gateway mode despite a stale healthy fingerprint", async () => {
+  it("refuses missing gateway mode despite stale health", async () => {
     const { deps, configPath, auditPath } = makeDeps(home);
     const snapshot = await makeSnapshot(configPath, recoverableTelegramConfig);
-    await promoteConfigSnapshotToLastKnownGoodCore({ deps, snapshot, logger: deps.logger });
+    await promote({ deps, snapshot, logger: deps.logger });
     await fsp.writeFile(
       `${configPath}.bak`,
       `${JSON.stringify({ meta: { lastTouchedVersion: "2026.4.22" } })}\n`,
@@ -549,40 +520,34 @@ describe("config observe recovery", () => {
     const prepareBackup = vi.fn(approveRecoveryCandidate);
     const input = { deps, configPath, ...clobbered, prepareBackup };
 
-    const recovered = await maybeRecoverSuspiciousConfigRead(input);
+    const recovered = await recoverAsync(input);
 
     expect(prepareBackup).not.toHaveBeenCalled();
     expect(recovered).toEqual(clobbered);
     await expect(fsp.readFile(configPath, "utf-8")).resolves.toBe(clobbered.raw);
-    await expect(readObserveEvents(auditPath)).resolves.toEqual([]);
+    await expect(observeEvents(auditPath)).resolves.toEqual([]);
   });
 
-  it.each(["async", "sync"] as const)(
-    "%s backup recovery defers while the forensic snapshot lock is held",
-    async (mode) => {
-      const { deps, configPath, auditPath, warn } = makeDeps(home);
-      await seedConfigBackup(configPath, recoverableCoreConfig);
-      const backupRaw = await fsp.readFile(`${configPath}.bak`, "utf-8");
-      const clobbered = await writeClobberedUpdateChannel(configPath);
-      const lockPath = `${configPath}.clobber.lock`;
-      await fsp.mkdir(lockPath);
-      const input = { deps, configPath, ...clobbered, prepareBackup: approveRecoveryCandidate };
-      await recover(mode, input);
+  it.each(["async", "sync"] as const)("defers locked backup recovery (%s)", async (mode) => {
+    const { configPath, auditPath, warn, backupRaw, clobbered, input } =
+      await clobberedDeps(recoverableCoreConfig);
+    const lockPath = `${configPath}.clobber.lock`;
+    await fsp.mkdir(lockPath);
+    await recover(mode, input);
 
-      await expectUntouched(configPath, clobbered.raw);
-      expect(await readObserveEvents(auditPath)).toEqual([]);
-      expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("recovery deferred"));
-      await fsp.rmdir(lockPath);
+    await expectUntouched(configPath, clobbered.raw);
+    expect(await observeEvents(auditPath)).toEqual([]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("recovery deferred"));
+    await fsp.rmdir(lockPath);
 
-      await recover(mode, input);
+    await recover(mode, input);
 
-      expect(await fsp.readFile(configPath, "utf-8")).toBe(backupRaw);
-      expect(await listClobberFiles(configPath)).toHaveLength(1);
-      expect((await readObserveEvents(auditPath)).at(-1)?.restoredFromBackup).toBe(true);
-    },
-  );
+    expect(await fsp.readFile(configPath, "utf-8")).toBe(backupRaw);
+    expect(await clobbers(configPath)).toHaveLength(1);
+    expect((await observeEvents(auditPath)).at(-1)?.restoredFromBackup).toBe(true);
+  });
 
-  it("prefix recovery defers while the forensic snapshot lock is held", async () => {
+  it("defers locked prefix recovery", async () => {
     const { io, configPath, warn } = createTestConfigIO(home, vi.fn(), { observe: false });
     const cleanRaw = `${JSON.stringify({ gateway: { mode: "local" } })}\n`;
     const pollutedRaw = `status output\n${cleanRaw}`;
@@ -601,38 +566,38 @@ describe("config observe recovery", () => {
 
     await expect(io.recoverConfigFromJsonRootSuffix(snapshot)).resolves.toBe(true);
     expect(await fsp.readFile(configPath, "utf-8")).toBe(cleanRaw);
-    const clobbered = await listClobberFiles(configPath);
+    const clobbered = await clobbers(configPath);
     expect(clobbered).toHaveLength(1);
     expect(await fsp.readFile(path.join(path.dirname(configPath), clobbered[0]!), "utf-8")).toBe(
       pollutedRaw,
     );
   });
 
-  it("last-known-good recovery defers while the forensic snapshot lock is held", async () => {
+  it("defers locked last-good recovery", async () => {
     const { deps, configPath, auditPath, warn, snapshot, brokenRaw, input } = await brokenLastGood({
       gateway: { mode: "local", auth: { mode: "token", token: "secret-token" } },
       channels: { discord: { enabled: true, dmPolicy: "pairing" } },
     });
-    await expectRaw(resolveLastKnownGoodConfigPath(configPath), snapshot.raw);
-    const healthBefore = readConfigHealthStateFromStore(deps);
+    await expectRaw(lastGoodPath(configPath), snapshot.raw);
+    const healthBefore = readHealth(deps);
     const lockPath = `${configPath}.clobber.lock`;
     await fsp.mkdir(lockPath);
 
-    await expect(recoverConfigFromLastKnownGoodCore(input)).resolves.toBe(false);
+    await expect(restoreLastGood(input)).resolves.toBe(false);
 
     await expectUntouched(configPath, brokenRaw);
-    expect(await readObserveEvents(auditPath)).toEqual([]);
-    expect(readConfigHealthStateFromStore(deps)).toEqual(healthBefore);
+    expect(await observeEvents(auditPath)).toEqual([]);
+    expect(readHealth(deps)).toEqual(healthBefore);
     expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("recovery deferred"));
     await fsp.rmdir(lockPath);
 
-    await expect(recoverConfigFromLastKnownGoodCore(input)).resolves.toBe(true);
+    await expect(restoreLastGood(input)).resolves.toBe(true);
     await expectRaw(configPath, snapshot.raw);
     expectWarnContaining(warn, "Config auto-restored from last-known-good:");
     expectWarnContaining(warn, "Rejected validation details: gateway.mode: Expected string.");
-    expect(await readLastObserveEvent(auditPath)).toMatchObject({
+    expect(await lastEvent(auditPath)).toMatchObject({
       restoredFromBackup: true,
-      restoredBackupPath: resolveLastKnownGoodConfigPath(configPath),
+      restoredBackupPath: lastGoodPath(configPath),
     });
   });
 
@@ -643,89 +608,58 @@ describe("config observe recovery", () => {
     const clobbered = await writeConfigRaw(configPath, { gateway: { mode: "local" } });
     const input = { deps, configPath, ...clobbered, prepareBackup: approveRecoveryCandidate };
 
-    const recovered = await maybeRecoverSuspiciousConfigRead(input);
+    const recovered = await recoverAsync(input);
 
     expect(recovered.parsed).toEqual(backup);
   });
 
-  it.each(["async", "sync"] as const)(
-    "%s recovery retries on next launch after a failed atomic replace",
-    async (mode) => {
-      const { deps, configPath, auditPath, warn } = makeDeps(home);
-      await seedConfigBackup(configPath, recoverableTelegramConfig);
-      const clobbered = await writeClobberedUpdateChannel(configPath);
-      if (process.platform !== "win32") {
-        await fsp.chmod(configPath, 0o644);
-      }
-      const copyError = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
-      const failingFs: ObserveRecoveryDeps["fs"] =
-        mode === "async"
-          ? {
-              ...deps.fs,
-              promises: {
-                ...deps.fs.promises,
-                rename: (source, target) =>
-                  target === configPath
-                    ? Promise.reject(copyError)
-                    : deps.fs.promises.rename(source, target),
-              },
-            }
-          : {
-              ...deps.fs,
-              renameSync: (source, target) => {
-                if (target === configPath) {
-                  throw copyError;
-                }
-                return deps.fs.renameSync(source, target);
-              },
-            };
-      const retry = (recoveryDeps: ObserveRecoveryDeps) =>
-        recover(mode, {
-          deps: recoveryDeps,
-          configPath,
-          ...clobbered,
-          prepareBackup: approveRecoveryCandidate,
-        });
-      const recovered = await retry({ ...deps, fs: failingFs });
+  it.each(["async", "sync"] as const)("retries failed atomic replacement (%s)", async (mode) => {
+    const { deps, configPath, auditPath, warn, clobbered, input } = await clobberedDeps();
+    if (process.platform !== "win32") {
+      await fsp.chmod(configPath, 0o644);
+    }
+    const copyError = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+    const retry = (recoveryDeps: ObserveRecoveryDeps) =>
+      recover(mode, { ...input, deps: recoveryDeps });
+    const recovered = await retry({
+      ...deps,
+      fs: failingRecoveryFs(mode, "rename", configPath, copyError),
+    });
 
-      expect((recovered.parsed as { gateway?: { mode?: string } }).gateway?.mode).toBe("local");
-      await expect(fsp.readFile(configPath, "utf-8")).resolves.toBe(clobbered.raw);
-      expectWarnContaining(warn, "Config auto-restore from backup failed:");
-      expectWarnNotContaining(warn, "Config auto-restored from backup:");
-      if (mode === "sync") {
-        expectWarnContaining(warn, "EACCES: permission denied");
-      }
+    expect((recovered.parsed as { gateway?: { mode?: string } }).gateway?.mode).toBe("local");
+    await expect(fsp.readFile(configPath, "utf-8")).resolves.toBe(clobbered.raw);
+    expectWarnContaining(warn, "Config auto-restore from backup failed:");
+    expectWarnNotContaining(warn, "Config auto-restored from backup:");
+    if (mode === "sync") {
+      expectWarnContaining(warn, "EACCES: permission denied");
+    }
 
-      const firstEvents = await readObserveEvents(auditPath);
-      expect(firstEvents).toHaveLength(1);
-      expect(firstEvents[0]).toMatchObject({
+    const firstEvents = await observeEvents(auditPath);
+    expect(firstEvents).toEqual([
+      expect.objectContaining({
         restoredFromBackup: false,
         valid: false,
         restoreErrorCode: "EACCES",
         restoreErrorMessage: "EACCES: permission denied",
-      });
-      const retryResult = await retry(deps);
-      expect((retryResult.parsed as { gateway?: { mode?: string } }).gateway?.mode).toBe("local");
-      await expect(fsp.readFile(configPath, "utf-8")).resolves.not.toBe(clobbered.raw);
-      const retryEvents = await readObserveEvents(auditPath);
-      expect(retryEvents).toHaveLength(2);
-      expect(retryEvents[1]?.restoredFromBackup).toBe(true);
-      if (process.platform !== "win32") {
-        expect((await fsp.stat(configPath)).mode & 0o777).toBe(0o600);
-      }
-    },
-  );
+      }),
+    ]);
+    const retryResult = await retry(deps);
+    expect((retryResult.parsed as { gateway?: { mode?: string } }).gateway?.mode).toBe("local");
+    await expect(fsp.readFile(configPath, "utf-8")).resolves.not.toBe(clobbered.raw);
+    const retryEvents = await observeEvents(auditPath);
+    expect(retryEvents).toHaveLength(2);
+    expect(retryEvents[1]?.restoredFromBackup).toBe(true);
+    if (process.platform !== "win32") {
+      expect((await fsp.stat(configPath)).mode & 0o777).toBe(0o600);
+    }
+  });
 
   it("restores the exact backup bytes approved by preparation", async () => {
-    const { deps, configPath } = makeDeps(home);
-    await seedConfigBackup(configPath, recoverableTelegramConfig);
+    const { configPath, input, backupRaw: approvedRaw } = await clobberedDeps();
     const backupPath = `${configPath}.bak`;
-    const approvedRaw = await fsp.readFile(backupPath, "utf-8");
     const replacementRaw = `${JSON.stringify({ gateway: { mode: "remote" } }, null, 2)}\n`;
-    const clobbered = await writeClobberedUpdateChannel(configPath);
-    const input = { deps, configPath, ...clobbered, prepareBackup: approveRecoveryCandidate };
 
-    await maybeRecoverSuspiciousConfigRead({
+    await recoverAsync({
       ...input,
       prepareBackup: (candidate) => {
         fs.writeFileSync(backupPath, replacementRaw, "utf-8");
@@ -746,22 +680,18 @@ describe("config observe recovery", () => {
       const { deps, configPath } = makeDeps(home);
       const snapshot = await makeSnapshot(configPath, recoverableCoreConfig);
       if (operation === "restoration") {
-        await expect(promoteConfigSnapshotToLastKnownGoodCore({ deps, snapshot })).resolves.toBe(
-          true,
-        );
+        await expect(promote({ deps, snapshot })).resolves.toBe(true);
       }
       deps.env[mode] = "1";
       if (operation === "promotion") {
-        await expect(promoteConfigSnapshotToLastKnownGoodCore({ deps, snapshot })).resolves.toBe(
-          false,
-        );
-        await expectPathMissing(resolveLastKnownGoodConfigPath(configPath));
+        await expect(promote({ deps, snapshot })).resolves.toBe(false);
+        await expectPathMissing(lastGoodPath(configPath));
         expect(await fsp.readFile(configPath, "utf-8")).toBe(snapshot.raw);
       } else {
         const brokenRaw = "{ gateway: { mode: 123 } }\n";
         await fsp.writeFile(configPath, brokenRaw, "utf-8");
         await expect(
-          recoverConfigFromLastKnownGoodCore({
+          restoreLastGood({
             deps,
             snapshot: invalidSnapshot(snapshot, brokenRaw),
             reason: "test-readonly-config",
@@ -769,19 +699,17 @@ describe("config observe recovery", () => {
           }),
         ).resolves.toBe(false);
         expect(await fsp.readFile(configPath, "utf-8")).toBe(brokenRaw);
-        expect(await fsp.readFile(resolveLastKnownGoodConfigPath(configPath), "utf-8")).toBe(
-          snapshot.raw,
-        );
+        expect(await fsp.readFile(lastGoodPath(configPath), "utf-8")).toBe(snapshot.raw);
       }
-      await expect(listClobberFiles(configPath)).resolves.toHaveLength(0);
+      await expect(clobbers(configPath)).resolves.toHaveLength(0);
     },
   );
 
-  it("leaves the active config untouched when its owner rejects last-known-good recovery", async () => {
+  it("preserves active config on last-good policy rejection", async () => {
     const { configPath, warn, brokenRaw, input } = await brokenLastGood({
       gateway: { mode: "local" },
     });
-    const restored = await recoverConfigFromLastKnownGoodCore({
+    const restored = await restoreLastGood({
       ...input,
       prepareCandidate: () => ({
         ok: false,
@@ -791,22 +719,20 @@ describe("config observe recovery", () => {
 
     expect(restored).toBe(false);
     await expect(fsp.readFile(configPath, "utf-8")).resolves.toBe(brokenRaw);
-    await expect(listClobberFiles(configPath)).resolves.toHaveLength(0);
+    await expect(clobbers(configPath)).resolves.toHaveLength(0);
     expectWarnContaining(warn, "candidate cannot converge under the current schema");
   });
 
-  it("does not restore stale last-known-good for plugin schema evolution issues", async () => {
+  it("leaves plugin schema evolution to Doctor", async () => {
     const { deps, configPath, warn } = makeDeps(home);
     const staleSnapshot = await makeSnapshot(configPath, recoverableCoreConfig);
-    expect(await promoteConfigSnapshotToLastKnownGoodCore({ deps, snapshot: staleSnapshot })).toBe(
-      true,
-    );
+    expect(await promote({ deps, snapshot: staleSnapshot })).toBe(true);
     const active = await writeConfigRaw(configPath, {
       gateway: { mode: "local" },
       plugins: { entries: { "lossless-claw": { config: { cacheAwareCompaction: true } } } },
     });
     expect(
-      await recoverConfigFromLastKnownGoodCore({
+      await restoreLastGood({
         deps,
         snapshot: {
           ...staleSnapshot,
@@ -834,28 +760,14 @@ describe("config observe recovery", () => {
       gateway: { mode: "local", auth: { mode: "token", token: "***" } },
     });
 
-    await expect(
-      promoteConfigSnapshotToLastKnownGoodCore({ deps, snapshot, logger: deps.logger }),
-    ).resolves.toBe(false);
-    await expectPathMissing(resolveLastKnownGoodConfigPath(configPath));
+    await expect(promote({ deps, snapshot, logger: deps.logger })).resolves.toBe(false);
+    await expectPathMissing(lastGoodPath(configPath));
     expectWarnContaining(warn, "Config last-known-good promotion skipped");
   });
-  it("preserves another config and a later promotion while an async observation is pending", async () => {
-    const env = {
-      HOME: home,
-      OPENCLAW_STATE_DIR: path.join(home, ".openclaw"),
-      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-      VITEST: "true",
-    };
-    const first = createTestConfigIO(home, vi.fn(), { env });
+  it("preserves concurrent promotions across configs", async () => {
+    const first = createTestConfigIO(home);
     const secondPath = path.join(home, ".openclaw", "second.json");
-    const options = {
-      fs,
-      json5: JSON5,
-      env,
-      homedir: () => home,
-      logger: { warn: vi.fn(), error: vi.fn() },
-    };
+    const options = first.deps;
     await fsp.mkdir(path.dirname(first.configPath), { recursive: true });
     const raw = JSON.stringify({
       meta: { lastTouchedVersion: "2026.9.4" },
@@ -863,24 +775,18 @@ describe("config observe recovery", () => {
     });
     await fsp.writeFile(first.configPath, raw);
     await fsp.writeFile(secondPath, raw);
-    const snapshotA = await createConfigIO({
-      ...options,
-      configPath: first.configPath,
-      observe: false,
-    }).readConfigFileSnapshot();
-    const snapshotB = await createConfigIO({
-      ...options,
-      configPath: secondPath,
-      observe: false,
-    }).readConfigFileSnapshot();
+    const readUnobserved = (configPath: string) =>
+      createConfigIO({ ...options, configPath, observe: false }).readConfigFileSnapshot();
+    const snapshotA = await readUnobserved(first.configPath);
+    const snapshotB = await readUnobserved(secondPath);
     const old = configObserveState.createConfigHealthFingerprint({
       raw,
       parsed: snapshotA.parsed,
       stat: fs.statSync(first.configPath),
       observedAt: "2000-01-01T00:00:00.000Z",
     });
-    patchConfigHealthEntryToStore(options, first.configPath, { lastPromotedGood: old });
-    patchConfigHealthEntryToStore(options, secondPath, {
+    patchHealth(options, first.configPath, { lastPromotedGood: old });
+    patchHealth(options, secondPath, {
       lastKnownGood: old,
       lastPromotedGood: old,
     });
@@ -912,12 +818,12 @@ describe("config observe recovery", () => {
           configPath: secondPath,
         }).promoteConfigSnapshotToLastKnownGood(snapshotB),
       ).toBe(true);
-      const promoted = readConfigHealthStateFromStore(options);
+      const promoted = readHealth(options);
       expect(promoted.entries?.[first.configPath]?.lastPromotedGood).not.toEqual(old);
       release.resolve();
       expect((await pending).valid).toBe(true);
       await closeOpenClawStateDatabaseAsync();
-      const settled = readConfigHealthStateFromStore(options);
+      const settled = readHealth(options);
       expect(settled.entries?.[first.configPath]?.lastPromotedGood).toEqual(
         promoted.entries?.[first.configPath]?.lastPromotedGood,
       );
