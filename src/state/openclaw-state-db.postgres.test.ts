@@ -38,7 +38,6 @@ import {
 } from "./openclaw-state-db-engine.js";
 import {
   closeOpenClawStateDatabaseForTest,
-  openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "./openclaw-state-db.js";
 import { statePostgresRuntime } from "./postgres-schema.generated/runtime.js";
