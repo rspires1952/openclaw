@@ -666,6 +666,7 @@ async function verifyResolvedBackupArchive(
 
   return {
     result,
+    manifest,
     hardlinkTargets,
     symbolicLinks: preparedSymbolicLinks,
     regularFileExtractionBytes,

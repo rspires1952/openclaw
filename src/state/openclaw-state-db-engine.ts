@@ -147,6 +147,12 @@ const statePostgresSchema = {
   }),
 };
 
+// v24 through v26 share this PostgreSQL catalog; v27 retires the credential tables.
+const statePostgresV26 = {
+  ...statePostgresSchema,
+  postgres: `${runtime.eagerSql}\n${runtime.clientCredentialSource.sql}`,
+};
+
 export const stateEngineSchema: StoreSchema = {
   id: "state",
   version: OPENCLAW_STATE_SCHEMA_VERSION,
@@ -156,14 +162,14 @@ export const stateEngineSchema: StoreSchema = {
     {
       version: 25,
       sql: runtime.operatorRecoveryV25Sql,
-      fromSchema: statePostgresSchema,
-      schema: statePostgresSchema,
+      fromSchema: statePostgresV26,
+      schema: statePostgresV26,
     },
     {
       version: 26,
       // WITHOUT ROWID only changes SQLite storage; PostgreSQL keeps the same catalog.
-      fromSchema: statePostgresSchema,
-      schema: statePostgresSchema,
+      fromSchema: statePostgresV26,
+      schema: statePostgresV26,
       sql: `UPDATE schema_meta
         SET schema_version = 26,
           app_version = '${VERSION.replaceAll("'", "''")}',
@@ -174,6 +180,12 @@ export const stateEngineSchema: StoreSchema = {
           CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000 AS bigint))
         ON CONFLICT (state_key) DO UPDATE
           SET value_json = EXCLUDED.value_json, updated_at_ms = EXCLUDED.updated_at_ms;`,
+    },
+    {
+      version: 27,
+      sql: runtime.clientCredentialV27Sql,
+      fromSchema: statePostgresV26,
+      schema: statePostgresSchema,
     },
   ],
 };

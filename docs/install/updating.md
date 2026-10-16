@@ -82,6 +82,22 @@ Gateway must still pass runtime admission: Doctor fails if a recovery hold
 leaves a required store unusable. Active databases and pending deletions require
 the candidate schema, and held stores remain part of rollback verification.
 
+The local client credential cutover preserves private identities and cached tokens
+in `client/credentials.sqlite`, separate from shared Gateway state. The preparatory
+release does not create that file. Earlier SQLite drivers capture the shared
+credential tables before the cutover and restore them on automatic rollback; the
+old version ignores the remaining local file. Credentials issued between upgrade
+and rollback are lost, and those clients must pair again. A later upgrade rebuilds
+that stale local file from restored shared state instead of merging it. PostgreSQL
+installations use an engine-aware driver with local-family capture support, so
+rollback restores the shared and local stores together. See
+[credential migration and recovery](/reference/database-schemas/versioning#local-client-credentials).
+
+Independent native credential sources remain unchanged during import and remain
+readable by the previous app after rollback. Reusing the same source preserves
+local refreshes; a changed or restored source rebuilds its local copy while
+retaining consumed legacy-JSON claims.
+
 OpenClaw.app runs plugin convergence through the selected runtime's Doctor while
 the app owns Gateway activation. This aligns managed official npm plugins with the new
 core before plugin migrations, repairs host peer links, and refreshes the plugin

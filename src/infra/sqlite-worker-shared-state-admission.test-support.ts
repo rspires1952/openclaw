@@ -13,14 +13,14 @@ import {
   executeOpenClawStateWorker,
   runOpenClawStateWorkerOperation,
 } from "../state/openclaw-state-worker-store.js";
-import {
-  readDeviceAuthTokenObservationFromDatabase,
-  storeDeviceAuthTokenInDatabase,
-} from "./device-auth-store.kernel.js";
 import { acquireGatewayStateOwner } from "./gateway-state-owner.js";
 import { openNodeSqliteDatabase } from "./node-sqlite.js";
 import { runtimeProcessEntrypoints } from "./runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerUrl } from "./runtime-worker-url.js";
+import {
+  createSqliteAuditRecordKernel,
+  prepareSqliteAuditRecord,
+} from "./sqlite-audit-record.kernel.js";
 import type { SqliteWorkerRequest } from "./sqlite-worker-contract.js";
 import { createSqliteWorkerOperationAdmission } from "./sqlite-worker-operation-admission.js";
 import {
@@ -33,7 +33,10 @@ export function registerSharedStateWorkerAdmissionTests(
 ): void {
   it("requires the exact live maintenance owner through the worker commit grant", async () => {
     const captured = createContext();
-    await executeOpenClawStateWorker(captured, { type: "deviceAuth.prepare", input: undefined });
+    await executeOpenClawStateWorker(captured, {
+      type: "nativeHookRelay.listRecords",
+      input: undefined,
+    });
     const store = await openSharedStateSqliteWorkerStore<OpenClawStateWorkerOperations>(
       {
         moduleUrl: resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.sharedStateStore),
@@ -65,21 +68,28 @@ export function registerSharedStateWorkerAdmissionTests(
       assertOwnerCurrent: owner.assertCurrent,
     });
     const stages: string[] = [];
+    const auditOptions = { scope: "shared-state-admission", maxEntries: 20 };
+    const record = (key: string) =>
+      prepareSqliteAuditRecord(auditOptions.scope, {
+        key,
+        value: "synthetic-owner-value",
+        createdAt: 1,
+      });
     let lateOwner: ReturnType<typeof acquireGatewayStateOwner> | undefined;
-    const write = (deviceId: string, beforeCommit?: () => void) =>
+    const write = (key: string, beforeCommit?: () => void) =>
       runSqliteWorkerStoreOperation(
         store,
         (scope) =>
           scope.execute({
-            type: "deviceAuth.store",
-            input: { deviceId, role: "operator", token: "synthetic-owner-token" },
+            type: "diagnostic.register",
+            input: { ...auditOptions, record: record(key) },
           }),
         captured,
         () => captured.admission.assertCurrent(),
         () => ({
           nativeLocations: [database.path],
           admission: createSqliteWorkerOperationAdmission((request, grant) => {
-            stages.push(`${deviceId}:${request.stage}`);
+            stages.push(`${key}:${request.stage}`);
             if (request.stage === "commit") {
               beforeCommit?.();
             }
@@ -92,11 +102,7 @@ export function registerSharedStateWorkerAdmissionTests(
       expect(() =>
         runOpenClawStateWriteTransaction(
           ({ db }) =>
-            storeDeviceAuthTokenInDatabase(db, {
-              deviceId: "sync-unrelated",
-              role: "operator",
-              token: "must-not-commit",
-            }),
+            createSqliteAuditRecordKernel(db, auditOptions).register(record("sync-unrelated")),
           options,
         ),
       ).toThrow("offline maintenance");
@@ -104,9 +110,7 @@ export function registerSharedStateWorkerAdmissionTests(
       await expect(wrongOwner.run(() => write("wrong-owner"))).rejects.toThrow("does not own");
       await expect(unbound.run(() => write("unbound"))).rejects.toThrow("does not own");
       expect(stages).toEqual([]);
-      await expect(maintenance.run(() => write("accepted"))).resolves.toMatchObject({
-        token: "synthetic-owner-token",
-      });
+      await expect(maintenance.run(() => write("accepted"))).resolves.toBeUndefined();
       await expect(maintenance.run(() => write("revoked", () => owner.release()))).rejects.toThrow(
         "no longer current",
       );
@@ -124,25 +128,9 @@ export function registerSharedStateWorkerAdmissionTests(
         "late-maintenance:transaction",
         "late-maintenance:commit",
       ]);
-      for (const deviceId of [
-        "sync-unrelated",
-        "unrelated",
-        "wrong-owner",
-        "unbound",
-        "revoked",
-        "late-maintenance",
-      ]) {
-        expect(
-          readDeviceAuthTokenObservationFromDatabase(database.db, { deviceId, role: "operator" })
-            .entry,
-        ).toBeNull();
-      }
-      expect(
-        readDeviceAuthTokenObservationFromDatabase(database.db, {
-          deviceId: "accepted",
-          role: "operator",
-        }).entry?.token,
-      ).toBe("synthetic-owner-token");
+      expect(createSqliteAuditRecordKernel(database.db, auditOptions).entries()).toEqual([
+        { key: "accepted", value: "synthetic-owner-value", createdAt: 1 },
+      ]);
     } finally {
       lateOwner?.release();
       owner.release();
@@ -154,7 +142,10 @@ export function registerSharedStateWorkerAdmissionTests(
 
   it("services direct broker commit admission while a native writer waits for its SQLite transaction", async () => {
     const captured = createContext();
-    await executeOpenClawStateWorker(captured, { type: "deviceAuth.prepare", input: undefined });
+    await executeOpenClawStateWorker(captured, {
+      type: "nativeHookRelay.listRecords",
+      input: undefined,
+    });
     const store = await openSharedStateSqliteWorkerStore<OpenClawStateWorkerOperations>(
       {
         moduleUrl: resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.sharedStateStore),
@@ -167,16 +158,21 @@ export function registerSharedStateWorkerAdmissionTests(
     }
     const stages: string[] = [];
     let nativeFailure: unknown;
-    const workerInput = {
-      deviceId: "synthetic-broker-worker",
-      role: "operator",
-      token: "synthetic-worker-token",
-    };
-    const nativeInput = { ...workerInput, deviceId: "synthetic-broker-native" };
+    const auditOptions = { scope: "shared-state-broker", maxEntries: 20 };
+    const workerRecord = prepareSqliteAuditRecord(auditOptions.scope, {
+      key: "synthetic-broker-worker",
+      value: "synthetic-worker-value",
+      createdAt: 1,
+    });
+    const nativeRecord = { ...workerRecord, event_key: "synthetic-broker-native" };
     try {
       await runSqliteWorkerStoreOperation(
         store,
-        (scope) => scope.execute({ type: "deviceAuth.store", input: workerInput }),
+        (scope) =>
+          scope.execute({
+            type: "diagnostic.register",
+            input: { ...auditOptions, record: workerRecord },
+          }),
         captured,
         () => captured.admission.assertCurrent(),
         () => ({
@@ -188,7 +184,8 @@ export function registerSharedStateWorkerAdmissionTests(
               // The worker holds BEGIN IMMEDIATE and next needs its commit grant.
               try {
                 runOpenClawStateWriteTransaction(
-                  ({ db }) => storeDeviceAuthTokenInDatabase(db, nativeInput),
+                  ({ db }) =>
+                    createSqliteAuditRecordKernel(db, auditOptions).register(nativeRecord),
                   { path: captured.admission.databasePath, env: captured.environment },
                 );
               } catch (error) {
@@ -200,20 +197,14 @@ export function registerSharedStateWorkerAdmissionTests(
       );
       expect(nativeFailure).toBeUndefined();
       expect(stages).toEqual(["transaction", "commit"]);
-      for (const input of [workerInput, nativeInput]) {
-        expect(
-          await store.execute({
-            type: "deviceAuth.read",
-            input: {
-              deviceId: input.deviceId,
-              role: input.role,
-              readOnly: true,
-            },
-          }),
-        ).toMatchObject({
-          entry: { token: input.token, role: input.role },
-        });
-      }
+      const database = openOpenClawStateDatabase({
+        path: captured.admission.databasePath,
+        env: captured.environment,
+      });
+      expect(createSqliteAuditRecordKernel(database.db, auditOptions).entries()).toEqual([
+        { key: workerRecord.event_key, value: "synthetic-worker-value", createdAt: 1 },
+        { key: nativeRecord.event_key, value: "synthetic-worker-value", createdAt: 1 },
+      ]);
     } finally {
       await store.close();
     }
@@ -469,7 +460,10 @@ export function registerSharedStateWorkerAdmissionTests(
 async function prepareSharedStateWorker(captured: OpenClawStateWorkerContext): Promise<Worker> {
   const posts = vi.spyOn(Worker.prototype, "postMessage");
   try {
-    await executeOpenClawStateWorker(captured, { type: "deviceAuth.prepare", input: undefined });
+    await executeOpenClawStateWorker(captured, {
+      type: "nativeHookRelay.listRecords",
+      input: undefined,
+    });
     const worker = posts.mock.contexts[0];
     if (!(worker instanceof Worker)) {
       throw new Error("Expected the prepared shared-state worker");

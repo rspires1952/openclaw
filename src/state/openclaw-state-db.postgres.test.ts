@@ -15,6 +15,7 @@ import { withDaemonRuntimePinStore } from "../daemon/runtime-pin-store.js";
 import { withEngineStoreAdmission } from "../infra/database-engine/admission-scope.js";
 import { installDatabaseEngineSelection } from "../infra/database-engine/context.js";
 import { resetDatabaseEngineSelectionForTest } from "../infra/database-engine/context.test-support.js";
+import { openEngineStore } from "../infra/database-engine/open.js";
 import { getPostgresPhysicalFacts } from "../infra/database-engine/physical-facts.js";
 import { resolveDatabaseFamilyEngines } from "../infra/database-engine/registry.js";
 import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
@@ -22,6 +23,7 @@ import {
   resolveRuntimeWorkerThreadExecArgv,
   resolveRuntimeWorkerUrl,
 } from "../infra/runtime-worker-url.js";
+import type { EngineConnection } from "../infra/sql-connection.js";
 import {
   captureSqliteDatabaseAdmissions,
   retireSqliteDatabaseAdmissionForPath,
@@ -30,10 +32,16 @@ import { admitSqliteSchema } from "../infra/sqlite-schema-facts.js";
 import { migrateDaemonRuntimePins } from "../infra/state-migrations.daemon-runtime-pins.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "./openclaw-state-db-contract.js";
 import {
+  admitStatePostgres,
+  inspectStateSqlite,
+  stateEngineSchema,
+} from "./openclaw-state-db-engine.js";
+import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "./openclaw-state-db.js";
+import { statePostgresRuntime } from "./postgres-schema.generated/runtime.js";
 import { ensureUserBackgroundSchema } from "./user-background.store.js";
 
 const configured: unknown = getEnvironmentData("openclaw.test.state.conformance.connection");
@@ -42,7 +50,7 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 type Result = { namespace: string; admissionId: string; catalogReads: number; threadId: number };
 
 describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
-  it("migrates version 25 metadata while preserving heads, lazy fragments and schema admission", async () => {
+  it("migrates version 25 to 26 while preserving heads, lazy fragments and schema admission", async () => {
     const directory = tempDirs.make("state-layout-postgres-");
     const pathname = path.join(directory, "state.sqlite");
     const options = { path: pathname, env: { ...process.env, OPENCLAW_STATE_DIR: directory } };
@@ -53,6 +61,37 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
       postgres: { connection: connection!, schemaPrefix: "state_layout_conformance" },
     });
     let namespace: string | undefined;
+    const withVersion26 = (run: (db: EngineConnection) => void) =>
+      withEngineStoreAdmission(() => {
+        using anchor = openNodeSqliteDatabase(pathname);
+        const selected = openEngineStore({
+          anchor,
+          schema: {
+            ...stateEngineSchema,
+            ...stateEngineSchema.postgresMigrations!.find((step) => step.version === 27)!
+              .fromSchema,
+            version: 26,
+            postgresMigrations: stateEngineSchema.postgresMigrations!.filter(
+              (step) => step.version <= 26,
+            ),
+          },
+          input: { connection: connection!, schemaPrefix: "state_layout_conformance" },
+          inspectSqlite: () => inspectStateSqlite(anchor),
+          prepareAnchor() {},
+          openSqlite() {
+            throw new Error("Expected PostgreSQL state layout fixture");
+          },
+          admitPostgres: admitStatePostgres,
+          existingOnly: true,
+        });
+        try {
+          run(selected);
+        } finally {
+          if (selected !== anchor) {
+            selected.close();
+          }
+        }
+      });
     try {
       const facts = withEngineStoreAdmission(() =>
         runOpenClawStateWriteTransaction(({ db }) => {
@@ -78,29 +117,27 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
       // v25 has the same PostgreSQL catalog; only its published versions differ.
       await client.query(`BEGIN;
         SET LOCAL search_path TO "${namespace}";
+        ${statePostgresRuntime.clientCredentialSource.sql}
         UPDATE schema_meta SET schema_version = 25;
         UPDATE config_machine_state SET value_json = '25'
           WHERE state_key = 'state.schema.contentVersion';
         UPDATE openclaw_schema_meta
           SET version = 25, fingerprint = NULL, ddl_hash = NULL, server_major = NULL;
         COMMIT;`);
-      withEngineStoreAdmission(() => {
-        const upgraded = openOpenClawStateDatabase(options);
-        expect(getPostgresPhysicalFacts(upgraded.db)?.version).toBe(26);
+      withVersion26((db) => {
+        expect(getPostgresPhysicalFacts(db)?.version).toBe(26);
         expect(
-          upgraded.db
-            .prepare("SELECT schema_version FROM schema_meta WHERE meta_key = 'primary'")
-            .get(),
+          db.prepare("SELECT schema_version FROM schema_meta WHERE meta_key = 'primary'").get(),
         ).toEqual({ schema_version: 26 });
         expect(
-          upgraded.db
+          db
             .prepare(
               "SELECT value_json FROM config_machine_state WHERE state_key = 'state.schema.contentVersion'",
             )
             .get(),
         ).toEqual({ value_json: "26" });
         expect(
-          upgraded.db
+          db
             .prepare(
               "SELECT version, fingerprint, ddl_hash, server_major FROM openclaw_schema_meta",
             )
@@ -121,9 +158,8 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
       ).toEqual([]);
       closeOpenClawStateDatabaseForTest();
       retireSqliteDatabaseAdmissionForPath(pathname);
-      withEngineStoreAdmission(() => {
-        const reopened = openOpenClawStateDatabase(options);
-        expect(getPostgresPhysicalFacts(reopened.db)?.version).toBe(26);
+      withVersion26((db) => {
+        expect(getPostgresPhysicalFacts(db)?.version).toBe(26);
       });
     } finally {
       closeOpenClawStateDatabaseForTest();
@@ -139,7 +175,7 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
     }
   });
 
-  it("bootstraps, migrates authority metadata, retains lazy fragments, reuses admission and closes paired handles", async () => {
+  it("bootstraps, retains lazy fragments and admission, and refuses an older schema without captured custody", async () => {
     const pathname = path.join(tempDirs.make("state-postgres-"), "state.sqlite");
     const run = async (mode: "bootstrap" | "restart" | "migrate") => {
       const anchor = openNodeSqliteDatabase(pathname);
@@ -195,8 +231,25 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
       namespace = cold.namespace;
       expect(cold.threadId).not.toBe(0);
       await client.query(`SET search_path = "${namespace}"`);
+      const restart = await run("restart");
+      expect(restart.namespace).toBe(cold.namespace);
+      expect(restart.admissionId).not.toBe(cold.admissionId);
+      await client.query(`UPDATE "${namespace}".schema_meta SET schema_version = $1`, [
+        OPENCLAW_STATE_SCHEMA_VERSION + 1,
+      ]);
+      await expect(run("restart")).rejects.toThrow("PostgreSQL state metadata mismatch");
+      await client.query(`UPDATE "${namespace}".schema_meta SET schema_version = $1`, [
+        OPENCLAW_STATE_SCHEMA_VERSION,
+      ]);
+      await client.query(`DROP TABLE "${namespace}".secret_store_entries`);
+      await expect(run("restart")).rejects.toThrow("PostgreSQL schema drift detected");
+      await client.query(
+        statePostgresRuntime.fragments.find((fragment) => fragment.id === "secret_store_entries")!
+          .sql,
+      );
       await client.query(`BEGIN;
-        UPDATE openclaw_schema_meta SET version = 24 WHERE store = 'state';
+        ${statePostgresRuntime.clientCredentialSource.sql}
+        UPDATE openclaw_schema_meta SET version = 24, fingerprint = NULL, ddl_hash = NULL, server_major = NULL WHERE store = 'state';
         UPDATE schema_meta SET schema_version = 24 WHERE meta_key = 'primary';
         UPDATE config_machine_state SET value_json = '24'
           WHERE state_key = 'state.schema.contentVersion';
@@ -206,7 +259,9 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
             '{"completion":{"resultText":"Interrupted by Gateway restart"}}');
         COMMIT;`);
       const retained = (await client.query("SELECT * FROM subagent_runs")).rows;
-      expect((await run("migrate")).namespace).toBe(namespace);
+      await expect(run("migrate")).rejects.toThrow(
+        "Client credentials require backed-up migration custody",
+      );
       expect((await client.query("SELECT * FROM subagent_runs")).rows).toEqual(retained);
       expect(
         (
@@ -214,16 +269,7 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
             "SELECT version::int AS version FROM openclaw_schema_meta WHERE store = 'state'",
           )
         ).rows,
-      ).toEqual([{ version: OPENCLAW_STATE_SCHEMA_VERSION }]);
-      const restart = await run("restart");
-      expect(restart.namespace).toBe(cold.namespace);
-      expect(restart.admissionId).not.toBe(cold.admissionId);
-      await client.query(`UPDATE "${namespace}".schema_meta SET schema_version = $1`, [
-        OPENCLAW_STATE_SCHEMA_VERSION + 1,
-      ]);
-      await expect(run("restart")).rejects.toThrow("PostgreSQL state metadata mismatch");
-      await client.query(`DROP TABLE "${namespace}".secret_store_entries`);
-      await expect(run("restart")).rejects.toThrow("PostgreSQL schema drift detected");
+      ).toEqual([{ version: 24 }]);
     } finally {
       if (!namespace) {
         const anchor = openNodeSqliteDatabase(pathname);

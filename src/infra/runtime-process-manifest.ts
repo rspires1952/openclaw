@@ -37,6 +37,7 @@ export function createRuntimeProcessEntrypoints(currentModuleUrl: string) {
     gitPackCleanup: runtimeProcessEntrypoint("agents/worktrees/git-pack-cleanup.worker"),
     fsSafeCopy: runtimeProcessEntrypoint("infra/fs-safe-copy.worker"),
     sharedStateStore: runtimeProcessEntrypoint("state/openclaw-state.worker"),
+    clientCredentials: runtimeProcessEntrypoint("infra/client-credential.worker"),
     authProfileInlineUsage: runtimeProcessEntrypoint("agents/auth-profiles/inline-usage.worker"),
     pluginModelCatalogCredentials: runtimeProcessEntrypoint("agents/plugin-model-catalog.worker"),
     pluginGenerationPreparation: runtimeProcessEntrypoint(

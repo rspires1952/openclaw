@@ -9,8 +9,6 @@ import {
 const loaders = {
   githubPublications: () =>
     import("./github-publication.read.worker.js").then((m) => m.publicationReadOperations),
-  deviceIdentity: () =>
-    import("../infra/device-identity.read.worker.js").then((m) => m.deviceIdentityReadOperations),
   stateBootstrap: () =>
     import("./state-bootstrap-read.worker.js").then((m) => m.stateBootstrapReadOperations),
   machineState: () =>
