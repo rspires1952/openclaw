@@ -72,7 +72,14 @@ function fixture() {
     "dist/extensions/demo/cli-metadata.cjs",
     'module.exports = { marker: "metadata", load: (name) => require(name), loadEsm: (name) => import(name) };',
   );
-  return { root, entry, used, unused };
+  const write = (name: string, content: string) => writeFile(root, name, content);
+  const loader = () =>
+    createPluginModuleLoader({ devSourceRoot: root, pluginSdkResolution: "dist" });
+  const privateAlias = (name: string) => {
+    write("scripts/lib/plugin-sdk-private-local-only-subpaths.json", JSON.stringify([name]));
+    write(`dist/plugin-sdk/${name}.js`, "export const privateValue = true;");
+  };
+  return { root, entry, used, unused, write, loader, privateAlias };
 }
 
 afterEach(() => {
@@ -154,15 +161,13 @@ describe("native plugin alias preparation", () => {
     "preserves explicit %s SDK preference without native module hooks in %s",
     async (pluginSdkResolution, environment, expected) => {
       const f = fixture();
-      const source = writeFile(
-        f.root,
+      const source = f.write(
         "external/index.ts",
         'export { value } from "openclaw/plugin-sdk/used";',
       );
       // Native resolver hooks live for the process. A no-hook runtime must not
       // mark this worker's resolver installed before the native-alias cases run.
-      const probe = writeFile(
-        f.root,
+      const probe = f.write(
         "no-native-hooks.mts",
         [
           'import Module from "node:module";',
@@ -198,10 +203,9 @@ describe("native plugin alias preparation", () => {
     "evaluates shared SDK imports before concurrent lazy CJS plugins require them (%s)",
     async (sdkImport) => {
       const f = fixture();
-      writeFile(f.root, "dist/plugin-sdk/leaf.js", 'export const value = "dist";');
-      writeFile(f.root, "dist/plugin-sdk/used.js", 'export { value } from "./leaf.js";');
-      const bundledEntry = writeFile(
-        f.root,
+      f.write("dist/plugin-sdk/leaf.js", 'export const value = "dist";');
+      f.write("dist/plugin-sdk/used.js", 'export { value } from "./leaf.js";');
+      const bundledEntry = f.write(
         "dist/extensions/bundled/index.cjs",
         `module.exports = { start: () => import("${sdkImport === "alias" ? "openclaw/plugin-sdk/used" : "../../plugin-sdk/used.js"}") };`,
       );
@@ -221,7 +225,7 @@ describe("native plugin alias preparation", () => {
       });
       const registry = createEmptyPluginRegistry();
       registry.plugins.push(record);
-      const load = createPluginModuleLoader({ devSourceRoot: f.root, pluginSdkResolution: "dist" });
+      const load = f.loader();
       const bundled = load(bundledEntry) as { start: () => Promise<{ value: string }> };
       const external = load(entry, { record, rootDir: pluginDir, registry }) as {
         start: () => Promise<{ default: { value: string } }>;
@@ -244,24 +248,18 @@ describe("native plugin alias preparation", () => {
 
   it("defers the full map until a workspace alias is demanded", () => {
     const f = fixture();
-    writeFile(f.root, "dist/retry/index.js", 'export const value = "family";');
-    writeFile(
-      f.root,
+    f.write("dist/retry/index.js", 'export const value = "family";');
+    f.write(
       "extensions/fixture-owner/package.json",
       JSON.stringify({ name: "@openclaw/fixture-owner" }),
     );
-    writeFile(
-      f.root,
-      "extensions/fixture-owner/diagnostic-api.ts",
-      'export const value = "source";',
-    );
-    const entry = writeFile(
-      f.root,
+    f.write("extensions/fixture-owner/diagnostic-api.ts", 'export const value = "source";');
+    const entry = f.write(
       "dist/extensions/demo/family.cjs",
       'module.exports = require("@openclaw/retry");',
     );
     const read = vi.spyOn(fs, "readFileSync");
-    const load = createPluginModuleLoader({ devSourceRoot: f.root, pluginSdkResolution: "dist" });
+    const load = f.loader();
     expect(load(f.entry)).toMatchObject({ marker: "metadata" });
     expect(read.mock.calls.filter(([target]) => target === f.unused)).toEqual([]);
     expect(load(entry)).toMatchObject({ value: "family" });
@@ -272,7 +270,7 @@ describe("native plugin alias preparation", () => {
     const f = fixture();
     const outside = fixture();
     const read = vi.spyOn(fs, "readFileSync");
-    const load = createPluginModuleLoader({ devSourceRoot: f.root, pluginSdkResolution: "dist" });
+    const load = f.loader();
     const metadata = load(f.entry) as {
       load: (name: string) => unknown;
       loadEsm: (name: string) => Promise<unknown>;
@@ -314,14 +312,9 @@ describe("native plugin alias preparation", () => {
 
   it("captures private QA denial before late use even if ambient authorization changes", async () => {
     const f = fixture();
-    writeFile(
-      f.root,
-      "scripts/lib/plugin-sdk-private-local-only-subpaths.json",
-      JSON.stringify(["qa-runtime"]),
-    );
-    writeFile(f.root, "dist/plugin-sdk/qa-runtime.js", "export const privateValue = true;");
+    f.privateAlias("qa-runtime");
     vi.stubEnv("OPENCLAW_ENABLE_PRIVATE_QA_CLI", "0");
-    const load = createPluginModuleLoader({ devSourceRoot: f.root, pluginSdkResolution: "dist" });
+    const load = f.loader();
     const metadata = load(f.entry) as {
       load: (name: string) => unknown;
       loadEsm: (name: string) => Promise<unknown>;
@@ -339,14 +332,9 @@ describe("native plugin alias preparation", () => {
   it("does not reuse a bundled private alias grant for an external plugin", () => {
     const f = fixture();
     vi.stubEnv("OPENCLAW_ENABLE_PRIVATE_QA_CLI", "0");
-    writeFile(
-      f.root,
-      "scripts/lib/plugin-sdk-private-local-only-subpaths.json",
-      JSON.stringify(["demoted-helper"]),
-    );
-    writeFile(f.root, "dist/plugin-sdk/demoted-helper.js", "export const privateValue = true;");
-    const external = writeFile(f.root, "external/index.cjs", "module.exports = {};");
-    writeFile(f.root, "external/package.json", JSON.stringify({ name: "external-fixture" }));
+    f.privateAlias("demoted-helper");
+    const external = f.write("external/index.cjs", "module.exports = {};");
+    f.write("external/package.json", JSON.stringify({ name: "external-fixture" }));
     installOpenClawPluginSdkNativeResolver({ pluginModulePath: f.entry, devSourceRoot: f.root });
     expect(createRequire(f.entry)("@openclaw/plugin-sdk/demoted-helper")).toMatchObject({
       privateValue: true,
@@ -366,11 +354,7 @@ describe("native plugin alias preparation", () => {
       JSON.stringify({ name: "external-fixture" }),
     );
     const entry = writeFile(packageRoot, "index.cjs", "module.exports = {};");
-    writeFile(
-      f.root,
-      "dist/plugin-sdk/ssrf-runtime-internal.js",
-      "export const privateValue = true;",
-    );
+    f.write("dist/plugin-sdk/ssrf-runtime-internal.js", "export const privateValue = true;");
     installOpenClawPluginSdkNativeResolver({ pluginModulePath: entry, devSourceRoot: f.root });
     fs.writeFileSync(manifest, JSON.stringify({ name: packageName }));
     const resolve = () =>
@@ -384,8 +368,7 @@ describe("native plugin alias preparation", () => {
     vi.stubEnv("OPENCLAW_DEV_SOURCE_ROOT", a.root);
     vi.stubEnv("NODE_ENV", "production");
     fs.writeFileSync(a.used, 'export { value } from "./missing.js";');
-    const entry = writeFile(
-      a.root,
+    const entry = a.write(
       "extensions/demo/transform.ts",
       'import { value } from "@openclaw/plugin-sdk/used"; export const marker: string = value;',
     );
@@ -564,8 +547,7 @@ describe("native plugin alias preparation", () => {
   it("captures explicit aliases before lazy evaluation", () => {
     const f = fixture();
     const owner = createPluginCache();
-    const target = writeFile(
-      f.root,
+    const target = f.write(
       "target.ts",
       'import { value } from "fixture-alias"; export const marker = value;',
     );
@@ -584,8 +566,7 @@ describe("native plugin alias preparation", () => {
       expect(loaded).toMatchObject({ marker: "dist" });
       expect(same(target)).toBe(loaded);
       const next = getCachedPluginModuleLoader({ ...params, aliasMap: aliases });
-      const nextTarget = writeFile(
-        f.root,
+      const nextTarget = f.write(
         "next-target.ts",
         'import { value } from "fixture-alias"; export const marker = value;',
       );
