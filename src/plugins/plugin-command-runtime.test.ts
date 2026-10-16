@@ -17,7 +17,6 @@ import {
   executePluginCommandDispatch,
   matchPluginCommandInvocation,
   type PluginCommandDispatch,
-  type PluginCommandNativeCandidate,
 } from "./plugin-command-runtime.js";
 import { PluginInstance } from "./plugin-instance.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
@@ -51,10 +50,13 @@ function registerCommand(
   name: string,
   handler: OpenClawPluginCommandDefinition["handler"] = async () => ({ text: "ok" }),
   options: Partial<OpenClawPluginCommandDefinition> & { pluginId?: string } = {},
+  pluginRoot?: string,
 ) {
   const { pluginId = name, ...definition } = options;
   expect(
-    registerPluginCommandInRegistry(registry, pluginId, command(name, handler, definition)),
+    registerPluginCommandInRegistry(registry, pluginId, command(name, handler, definition), {
+      pluginRoot,
+    }),
   ).toEqual({ ok: true });
 }
 
@@ -71,21 +73,21 @@ function pluginRecord(pluginId: string) {
 function createCleanupRegistry(pluginId: string) {
   const registry = createEmptyPluginRegistry();
   const record = pluginRecord(pluginId);
-  record.status = "loaded";
   registry.plugins.push(record);
   const cleanup = vi.fn<() => void | Promise<void>>();
   new PluginInstance(pluginId, { record, registry }).lifecycle.onDispose(cleanup);
   return { registry, cleanup };
 }
 
-function requirePluginDispatch(candidate: PluginCommandNativeCandidate, args?: string) {
-  const dispatch = candidate.prepareDispatch(args);
-  assert.ok(dispatch.kind === "plugin", "expected plugin command dispatch");
-  return dispatch;
+function nativeCandidate(name?: string, channel = "telegram") {
+  const candidates = createPluginCommandRuntime().listNativeCandidates(channel);
+  return (name ? candidates.find((entry) => entry.name === name) : candidates[0])!;
 }
 
-function selectCommand() {
-  return requirePluginDispatch(createPluginCommandRuntime().listNativeCandidates("telegram")[0]!);
+function selectCommand(name?: string, channel?: string) {
+  const dispatch = nativeCandidate(name, channel).prepareDispatch();
+  assert.ok(dispatch.kind === "plugin", "expected plugin command dispatch");
+  return dispatch;
 }
 
 function executeCommand(registry: ReturnType<typeof createEmptyPluginRegistry>) {
@@ -216,21 +218,20 @@ it.each(["provider", "fallback"])(
       ]);
     const ambient = createRegistry("ambient");
     const scoped = createRegistry("scoped");
-    expect(
-      registerPluginCommandInRegistry(
-        scoped,
-        "demo",
-        command("demo", async (ctx) => {
-          await ctx.getCurrentConversationBinding();
-          return { text: ctx.accountId };
-        }),
-        { pluginRoot: "/plugins/demo" },
-      ),
-    ).toEqual({ ok: true });
+    registerCommand(
+      scoped,
+      "demo",
+      async (ctx) => {
+        await ctx.getCurrentConversationBinding();
+        return { text: ctx.accountId };
+      },
+      undefined,
+      "/plugins/demo",
+    );
     setActivePluginRegistry(ambient);
 
     const dispatch = withPluginRuntimeRegistryScope(scoped, () =>
-      requirePluginDispatch(createPluginCommandRuntime().listNativeCandidates("room-chat")[0]!),
+      selectCommand(undefined, "room-chat"),
     );
     await expect(
       dispatch.execute({ ...executionContext, channel: "room-chat", to: "room-chat:opaque" }),
@@ -286,11 +287,8 @@ it("keeps overlapping executions locked until both handlers settle", async () =>
     return { text: "done" };
   });
   setActivePluginRegistry(registry);
-  const candidate = createPluginCommandRuntime().listNativeCandidates("telegram")[0]!;
-  const first = requirePluginDispatch(candidate);
-  const second = requirePluginDispatch(candidate);
-  const firstRun = first.execute(executionContext);
-  const secondRun = second.execute(executionContext);
+  const firstRun = selectCommand().execute(executionContext);
+  const secondRun = selectCommand().execute(executionContext);
   await vi.waitFor(() => expect(getPluginCommandExecutionCount(registry)).toBe(2));
 
   expect(registerPluginCommandInRegistry(registry, "blocked", command("blocked"))).toMatchObject({
@@ -311,8 +309,7 @@ it("does not prepare arguments for commands that reject them", () => {
   const registry = createEmptyPluginRegistry();
   registerCommand(registry, "demo");
   setActivePluginRegistry(registry);
-  const candidate = createPluginCommandRuntime().listNativeCandidates("telegram")[0]!;
-  expect(candidate.prepareDispatch("unexpected")).toEqual({ kind: "non-plugin" });
+  expect(nativeCandidate().prepareDispatch("unexpected")).toEqual({ kind: "non-plugin" });
 });
 
 it("defers full registry cleanup until an admitted command settles", async () => {
@@ -374,23 +371,15 @@ it("does not reuse an outer admission for detached nested handler cleanup", asyn
   const detached = detachedClearCommand(registry, "inner");
   const { promise: outerGate, resolve: releaseOuter } = createDeferred();
   const { promise: outerHoldingGate, resolve: outerHolding } = createDeferred();
-  const innerDispatchRef: { current?: PluginCommandDispatch } = {};
   registerCommand(registry, "outer", async () => {
-    await innerDispatchRef.current!.execute({ ...executionContext, commandBody: "/inner" });
+    await innerDispatch.execute({ ...executionContext, commandBody: "/inner" });
     outerHolding();
     await outerGate;
     return { text: "outer" };
   });
   setActivePluginRegistry(registry);
-  const candidates = createPluginCommandRuntime().listNativeCandidates("telegram");
-  innerDispatchRef.current = requirePluginDispatch(
-    candidates.find((candidate) => candidate.name === "inner")!,
-  );
-  const outerDispatch = requirePluginDispatch(
-    candidates.find((candidate) => candidate.name === "outer")!,
-  );
-
-  const running = outerDispatch.execute({ ...executionContext, commandBody: "/outer" });
+  const innerDispatch = selectCommand("inner");
+  const running = selectCommand("outer").execute({ ...executionContext, commandBody: "/outer" });
   await outerHoldingGate;
   expect(getPluginCommandExecutionCount(registry)).toBe(1);
   const clearSettled = watchSettlement(detached.clearing());
