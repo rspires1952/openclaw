@@ -21,6 +21,7 @@ afterEach(() => {
 
 function mount(onGenerate: AvatarPickerProps["onGenerate"] = vi.fn().mockResolvedValue(generated)) {
   const props: AvatarPickerProps = {
+    agentId: "beta",
     avatar: null,
     disabled: false,
     onSelect: vi.fn(),

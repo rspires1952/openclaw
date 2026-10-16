@@ -7,6 +7,7 @@ import {
   LOBSTER_PALETTE_WEIGHTS,
   LOBSTER_PET_PALETTES,
 } from "../../components/lobster-pet-palettes.ts";
+import { AgentIdentityAvatar } from "../../components/solid/identity-avatar.tsx";
 import { formatUiError } from "../../lib/format-error.ts";
 import { t } from "../../lib/reactive/i18n.ts";
 import {
@@ -22,6 +23,7 @@ type Candidate = { name: string; description: string; dataUrl: string };
 type Mode = "bot" | "generate" | "upload";
 
 export type AvatarPickerProps = {
+  agentId: string;
   avatar: string | null;
   disabled: boolean;
   onSelect: (dataUrl: string) => void;
@@ -131,7 +133,13 @@ export function AvatarPicker(props: AvatarPickerProps) {
           }
         >
           {(source) => (
-            <img src={source()} alt={candidate()?.name ?? t("agents.identity.avatarPreview")} />
+            <AgentIdentityAvatar
+              agent={{
+                id: props.agentId,
+                avatar: source(),
+                name: candidate()?.name ?? t("agents.identity.avatarPreview"),
+              }}
+            />
           )}
         </Show>
       </div>

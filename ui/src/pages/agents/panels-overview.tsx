@@ -336,6 +336,7 @@ export function AgentOverview(
                 <For each={[`${params.agent.id}:${params.identityScope}`]}>
                   {() => (
                     <AvatarPicker
+                      agentId={params.agent.id}
                       avatar={identityAvatarUrl()}
                       disabled={identityBusy()}
                       onSelect={(dataUrl) => params.onIdentityAvatarSet(dataUrl)}

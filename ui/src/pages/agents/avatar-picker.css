@@ -9,9 +9,12 @@
   place-items: center;
 }
 
-.avatar-picker__preview > img {
+.avatar-picker__preview > .identity-avatar--agent {
   width: 100px;
   height: 100px;
+}
+
+.avatar-picker__preview .identity-avatar__image {
   object-fit: contain;
 }
 
@@ -108,6 +111,8 @@
 
 .avatar-picker__body textarea {
   min-height: 150px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   resize: vertical;
   border-radius: 16px;
 }
