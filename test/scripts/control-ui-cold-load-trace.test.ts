@@ -1,7 +1,12 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
+import { transform } from "esbuild";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  compareCpuTables,
+  formatCpuTables,
+  medianCpuTables,
+  readCpuProfileReport,
   mapColdLoadCpuProfile,
   prepareColdLoadTraceEvent,
   summarizeColdLoadTrace,
@@ -167,6 +172,77 @@ describe("cold-load CPU accounting", () => {
       expect(profile.nodes[0]?.callFrame.functionName).toBe("a");
     },
   );
+
+  it("maps a real emitted minified map using zero-based generated positions", async () => {
+    const directory = tempDirs.make("openclaw-cold-load-emitted-map-");
+    const { code, map } = await transform(
+      "export function prepareTimestamp(value: number) {\n  return value + 1;\n}\n",
+      { loader: "ts", sourcefile: "../../src/timestamp.ts", sourcemap: "external", minify: true },
+    );
+    await writeFile(path.join(directory, "app.js.map"), map);
+    const generatedColumn = code.indexOf("+1");
+    expect(generatedColumn).toBeGreaterThan(0);
+    const mapped = await mapColdLoadCpuProfile(
+      {
+        nodes: [
+          {
+            id: 1,
+            callFrame: {
+              functionName: "t",
+              url: "http://localhost/assets/app.js",
+              lineNumber: 0,
+              columnNumber: generatedColumn,
+            },
+          },
+        ],
+      },
+      { assetBaseUrl: "http://localhost/assets/", assetDirectory: directory },
+    );
+    expect(mapped.profile.nodes[0]?.callFrame).toMatchObject({
+      url: "../../src/timestamp.ts",
+      lineNumber: 1,
+      columnNumber: 9,
+    });
+  });
+
+  it("counts recursive functions and same-file ancestors once per inclusive sample", () => {
+    const profile: ColdLoadCpuProfile = {
+      nodes: [
+        { id: 1, callFrame: frame("(root)", ""), children: [2] },
+        { id: 2, callFrame: frame("reconcile"), children: [3] },
+        { id: 3, callFrame: frame("reconcile"), children: [4] },
+        { id: 4, callFrame: frame("render", "view.ts") },
+      ],
+      samples: [3, 4],
+      timeDeltas: [2000, 3000],
+    };
+    const tables = summarizeCpuProfile(profile, { includeTables: true }).tables!;
+    expect(tables.functions).toEqual([
+      { ...frame("reconcile"), selfMs: 2, inclusiveMs: 5 },
+      { ...frame("render", "view.ts"), selfMs: 3, inclusiveMs: 3 },
+    ]);
+    expect(tables.files).toEqual([
+      { url: "app.ts", inclusiveMs: 5 },
+      { url: "view.ts", inclusiveMs: 3 },
+    ]);
+    const median = medianCpuTables([tables, { functions: [], files: [] }]);
+    expect(median.functions[0]).toMatchObject({ selfMs: 1, inclusiveMs: 2.5 });
+    expect(median.files[0]?.inclusiveMs).toBe(2.5);
+    expect(compareCpuTables(tables, median)[0]).toMatchObject({
+      baselineSelfMs: 2,
+      selfMs: -1,
+      inclusiveMs: -2.5,
+    });
+    expect(compareCpuTables(median, { functions: [], files: [] })[0]).toMatchObject({
+      selfMs: -1,
+      inclusiveMs: -2.5,
+    });
+    expect(formatCpuTables("Median", median)).toContain("app.ts:1:1 reconcile");
+    expect(readCpuProfileReport({ reload: median })).toEqual({ reload: median });
+    expect(() =>
+      readCpuProfileReport({ reload: { functions: [{ selfMs: "2" }], files: [] } }),
+    ).toThrow();
+  });
 
   it("retains an unmapped bundler runtime without inventing its source", async () => {
     const profile: ColdLoadCpuProfile = {

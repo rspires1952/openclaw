@@ -1,4 +1,7 @@
 // Opt-in production-bundle benchmark; real delays model wire delivery, not test synchronization.
+// --cpu-profile: source-mapped reload/live/streaming tables and per-run/median cpu-profile.json.
+// --cpu-profile-compare <baseline cpu-profile.json>: profile and diff against that report.
+// Sampling inflates timings: never compare profiled runs with unprofiled runs.
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -25,6 +28,11 @@ import {
 } from "../ui/src/test-helpers/control-ui-streaming-reply.ts";
 import { createControlUiTeamScaleFixture } from "../ui/src/test-helpers/control-ui-team-scale-fixture.ts";
 import {
+  compareCpuTables,
+  formatCpuTables,
+  medianCpuTables,
+  readCpuProfileReport,
+  type ColdLoadCpuTables,
   mapColdLoadCpuProfile,
   prepareColdLoadTraceEvent,
   summarizeColdLoadTrace,
@@ -204,6 +212,8 @@ function summarizeSidebarWindows(
 
 const { values } = parseArgs({
   options: {
+    "cpu-profile": { type: "boolean", default: false },
+    "cpu-profile-compare": { type: "string" },
     "warm-reload": { type: "boolean", default: false },
     "overlay-probe": { type: "boolean", default: false },
     untraced: { type: "boolean", default: false },
@@ -252,6 +262,11 @@ const sidebarView = values["sidebar-view"];
 if (sidebarView !== "sessions" && sidebarView !== "online") {
   throw new Error("Expected sidebar-view sessions or online");
 }
+const cpuProfile = values["cpu-profile"] || Boolean(values["cpu-profile-compare"]);
+const baselineCpu = values["cpu-profile-compare"]
+  ? readCpuProfileReport(JSON.parse(await readFile(values["cpu-profile-compare"], "utf8")))
+  : undefined;
+const cpuRuns: Record<string, ColdLoadCpuTables[]> = {};
 const runs = Number(values.runs);
 const latencyMs = Number(values["latency-ms"]);
 const frameGapMs = Number(values["frame-gap-ms"]);
@@ -514,6 +529,28 @@ try {
   await settle();
   await page.locator('aside.sidebar[data-snapshot-saved="true"]').waitFor();
   for (let run = 0; run < runs; run++) {
+    const cpuPhases: Record<string, ColdLoadCpuTables> = {};
+    async function recordCpu(phase: string, profile: Parameters<typeof mapColdLoadCpuProfile>[0]) {
+      const mapped = await mapColdLoadCpuProfile(profile, {
+        assetBaseUrl: new URL("assets/", server.baseUrl).href,
+        assetDirectory: path.join(bundleDir, "assets"),
+      });
+      const summary = summarizeCpuProfile(mapped.profile, { includeTables: true });
+      const tables = summary.tables!;
+      cpuPhases[phase] = tables;
+      (cpuRuns[phase] ??= []).push(tables);
+      console.log(
+        formatCpuTables(`Run ${run + 1} ${phase} CPU (profiled; timings inflated)`, tables),
+      );
+      console.log(
+        `Mapped frames: ${mapped.mappedFrames}; unmapped asset frames: ${mapped.unmappedFrames}; sampled: ${summary.sampledMs.toFixed(1)} ms; idle: ${summary.idleMs.toFixed(1)} ms`,
+      );
+      await writeFile(
+        path.join(artifactDir, `run-${run + 1}.${phase}.cpuprofile`),
+        JSON.stringify(profile),
+      );
+      return { ...mapped, summary };
+    }
     if (values["warm-reload"]) {
       await page.locator(".chat-pane-cache__pane--active").evaluate(async (element, sessionKey) => {
         const store = Reflect.get(element, "sessionSnapshotStore");
@@ -564,10 +601,12 @@ try {
     const rawTrace: unknown[] = [];
     let collectedTrace = rawTrace;
     cdp.on("Tracing.dataCollected", (data) => collectedTrace.push(...data.value));
-    if (!values.untraced) {
+    if (!values.untraced || cpuProfile) {
       await cdp.send("Profiler.enable");
       await cdp.send("Profiler.setSamplingInterval", { interval: 1000 });
       await cdp.send("Profiler.start");
+    }
+    if (!values.untraced) {
       await cdp.send("Tracing.start", {
         categories:
           "toplevel,loading,blink.user_timing,devtools.timeline,disabled-by-default-devtools.timeline,disabled-by-default-devtools.timeline.stack,disabled-by-default-devtools.screenshot,v8",
@@ -590,7 +629,7 @@ try {
       ? await page.evaluate(() => Reflect.get(window, "__warmReload").read())
       : undefined;
     await writeFile(path.join(artifactDir, `run-${run + 1}.metrics.json`), JSON.stringify(metrics));
-    const profile = values.untraced ? undefined : await cdp.send("Profiler.stop");
+    const profile = values.untraced && !cpuProfile ? undefined : await cdp.send("Profiler.stop");
     if (!values.untraced) {
       const complete = new Promise<void>((resolve) => {
         cdp.once("Tracing.tracingComplete", () => resolve());
@@ -677,16 +716,18 @@ try {
     }, screenshots);
     const mapped = !profile
       ? undefined
-      : values["sidebar-list-churn"]
-        ? {
-            profile: profile.profile,
-            mappedFrames: 0,
-            unmappedFrames: profile.profile.nodes.length,
-          }
-        : await mapColdLoadCpuProfile(profile.profile, {
-            assetBaseUrl: new URL("assets/", server.baseUrl).href,
-            assetDirectory: path.join(bundleDir, "assets"),
-          });
+      : cpuProfile
+        ? await recordCpu("reload", profile.profile)
+        : values["sidebar-list-churn"]
+          ? {
+              profile: profile.profile,
+              mappedFrames: 0,
+              unmappedFrames: profile.profile.nodes.length,
+            }
+          : await mapColdLoadCpuProfile(profile.profile, {
+              assetBaseUrl: new URL("assets/", server.baseUrl).href,
+              assetDirectory: path.join(bundleDir, "assets"),
+            });
     let streaming;
     if (streamingReply) {
       const composer = page.locator(".agent-chat__composer-combobox textarea").last();
@@ -699,6 +740,7 @@ try {
         deltas: number;
         milliseconds: Record<string, number>;
       }> = [];
+      if (cpuProfile) await cdp.send("Profiler.start");
       await page.evaluate((input) => Reflect.get(window, "__streamingReply").start(input), {
         ...streamingReply,
         sessionKey: fixture.selectedSessionKey,
@@ -751,6 +793,7 @@ try {
         streamingInput.abort();
         await nativeInput;
       }
+      if (cpuProfile) await recordCpu("streaming", (await cdp.send("Profiler.stop")).profile);
       streaming = {
         ...(await page.evaluate(() => Reflect.get(window, "__streamingReply").finish())),
         cpu,
@@ -823,6 +866,7 @@ try {
           transferMode: "ReportEvents",
         });
       }
+      if (cpuProfile) await cdp.send("Profiler.start");
       const listOffset = sidebarLists?.stats().length ?? 0;
       await page.evaluate((captureProbes) => {
         if (captureProbes) {
@@ -864,6 +908,7 @@ try {
         }
       }
       await page.evaluate(() => Reflect.get(window, "__coldLoad").finishLive());
+      if (cpuProfile) await recordCpu("live", (await cdp.send("Profiler.stop")).profile);
       if (!values.untraced) {
         const liveProfile = await cdp.send("Profiler.stop");
         await writeFile(
@@ -946,6 +991,12 @@ try {
         );
       }
     }
+    if (cpuProfile) {
+      await writeFile(
+        path.join(artifactDir, `run-${run + 1}.cpu-profile.json`),
+        JSON.stringify(cpuPhases, null, 2),
+      );
+    }
     const overlays = values["overlay-probe"]
       ? await probeColdLoadOverlays(
           page,
@@ -982,6 +1033,38 @@ try {
   if (errors.length) {
     throw new Error(`Browser errors: ${errors.join("\n")}`);
   }
+  if (cpuProfile) {
+    const median = Object.fromEntries(
+      Object.entries(cpuRuns).map(([phase, tables]) => [phase, medianCpuTables(tables)]),
+    );
+    await writeFile(path.join(artifactDir, "cpu-profile.json"), JSON.stringify(median, null, 2));
+    const comparisons: Record<string, ReturnType<typeof compareCpuTables>> = {};
+    for (const [phase, tables] of Object.entries(median)) {
+      console.log(
+        formatCpuTables(
+          `Median ${phase} CPU (${runs} profiled runs; missing functions count as zero)`,
+          tables,
+        ),
+      );
+      if (baselineCpu) {
+        const before = baselineCpu[phase];
+        if (!before) throw new Error(`Baseline CPU report is missing the ${phase} phase`);
+        comparisons[phase] = compareCpuTables(before, tables);
+        console.log(
+          formatCpuTables(
+            `${phase} CPU delta (candidate minus baseline)`,
+            { functions: comparisons[phase], files: [] },
+            true,
+          ),
+        );
+      }
+    }
+    if (baselineCpu)
+      await writeFile(
+        path.join(artifactDir, "cpu-profile-compare.json"),
+        JSON.stringify(comparisons, null, 2),
+      );
+  }
   await context.close();
 } finally {
   await browser?.close();
@@ -1004,6 +1087,8 @@ try {
         sidebarLiveChurn: fixture.sidebarLiveChurn,
         duplicateBootReads: values["duplicate-boot-reads"],
         traced: !values.untraced,
+        cpuProfile,
+        cpuProfileCompare: values["cpu-profile-compare"],
         sidebarRowTransfer,
         sidebarComparison: values["sidebar-list-churn"]
           ? "Same final client bundle; full/delta wire response A/B using the production presenter and one synthetic query/history owner. This does not measure real Gateway selection, history reset/fallback lifecycle, or server projection CPU. Node IPC is outside the measured application response task."
