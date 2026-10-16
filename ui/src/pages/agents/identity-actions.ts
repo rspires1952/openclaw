@@ -58,8 +58,7 @@ export function selectIdentityAvatar(
         return;
       }
       if (result.ok) {
-        host.identityDraft = { ...host.identityDraft, avatar: result.dataUrl };
-        host.identityError = null;
+        setIdentityAvatar(host, result.dataUrl, config);
       } else {
         host.identityError = t(AVATAR_REJECTION_MESSAGE_KEYS[result.reason]);
       }
@@ -69,6 +68,18 @@ export function selectIdentityAvatar(
         host.identityError = formatUiError(error);
       }
     });
+}
+
+/** A rendered preset or accepted generated candidate is already size-bounded. */
+export function setIdentityAvatar(
+  host: AgentIdentityEditorHost,
+  dataUrl: string,
+  config?: ApplicationConfigCapability,
+) {
+  avatarSelections.delete(host);
+  assertUploadsEnabled(config);
+  host.identityDraft = { ...host.identityDraft, avatar: dataUrl };
+  host.identityError = null;
 }
 
 /** Persist the draft via agents.update, then refresh the roster and the

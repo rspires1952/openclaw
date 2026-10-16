@@ -10,6 +10,8 @@ it("opens agent avatar selection from the keyboard and respects the busy state",
   const props = createAgentViewTestProps();
   const mounted = mountSolid(Agents, props, container);
   try {
+    await page.getByRole("button", { name: "Choose avatar…", exact: true }).click();
+    await page.getByRole("button", { name: "Upload", exact: true }).click();
     const input = container.querySelector<HTMLInputElement>('input[type="file"]');
     if (!input) {
       throw new Error("Missing avatar file input");

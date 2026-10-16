@@ -56,6 +56,7 @@ import {
   SubscriptionsController,
   viewState,
 } from "../../lib/subscriptions-controller.ts";
+import type { GeneratedAvatar } from "./avatar-picker.tsx";
 import {
   loadAgentFileContent,
   overwriteAgentFile,
@@ -70,6 +71,7 @@ import {
   saveIdentityDraft,
   selectIdentityAvatar,
   setIdentityDraftField,
+  setIdentityAvatar,
 } from "./identity-actions.ts";
 import { createAgentModelActions } from "./model-config.ts";
 import type { AgentIdentityDraft } from "./panels-overview.tsx";
@@ -1031,6 +1033,7 @@ export class AgentsPageState
       overview: {
         applicationConfig: this.context.config,
         identityDraft: this.identityDraft,
+        identityScope: this.requestGeneration,
         identitySaving: this.identitySaving,
         identityError: this.identityError,
         modelCatalog: modelCatalog.models,
@@ -1047,6 +1050,31 @@ export class AgentsPageState
           if (canEditIdentity()) {
             selectIdentityAvatar(this, file, this.context.config);
           }
+        },
+        onIdentityAvatarSet: (dataUrl) => {
+          if (canEditIdentity()) {
+            setIdentityAvatar(this, dataUrl, this.context.config);
+          }
+        },
+        onIdentityAvatarGenerate: async (prompt) => {
+          const client = this.client;
+          const generation = this.requestGeneration;
+          if (
+            !client ||
+            !canEditIdentity() ||
+            !this.canCall("agents.avatar.generate", "operator.admin")
+          ) {
+            throw new Error(t("agents.identity.avatarPermission"));
+          }
+          const result = await client.request<GeneratedAvatar>(
+            "agents.avatar.generate",
+            { prompt },
+            { timeoutMs: 100_000 },
+          );
+          if (!this.isCurrentRequest(client, generation, selectedAgentId ?? undefined, {})) {
+            throw new Error(t("agents.identity.avatarContextChanged"));
+          }
+          return result;
         },
         onIdentitySave: () => this.saveIdentityDraft(),
         ...createAgentModelActions({

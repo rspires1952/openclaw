@@ -1,5 +1,4 @@
-import type { JSX } from "@solidjs/web";
-import { createMemo, onCleanup } from "solid-js";
+import { createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import { normalizeAgentModelRefForConfig } from "../../../../src/config/model-input.js";
 import type {
   AgentIdentityResult,
@@ -37,6 +36,7 @@ import { t } from "../../lib/reactive/i18n.ts";
 import { projectSource } from "../../lib/reactive/projection.ts";
 import { ControllerHost } from "../../lib/subscriptions-controller.ts";
 import { uploadsEnabled } from "../../lib/uploads.ts";
+import { AvatarPicker, type GeneratedAvatar } from "./avatar-picker.tsx";
 import { AgentConfigButtons, type AgentConfigActions } from "./config-actions.tsx";
 import { renderAgentPanelFacts } from "./panel-ui.tsx";
 
@@ -55,6 +55,7 @@ export function AgentOverview(
     agentFilesList: AgentsFilesListResult | null;
     agentIdentity: AgentIdentityResult | null;
     identityDraft: AgentIdentityDraft;
+    identityScope: number;
     identitySaving: boolean;
     identityError: string | null;
     canUpdateIdentity: boolean;
@@ -65,6 +66,8 @@ export function AgentOverview(
     modelCatalogStatus: PanelRefreshStatus;
     onIdentityFieldChange: (field: "name" | "emoji", value: string) => void;
     onIdentityAvatarSelect: (file: File) => void;
+    onIdentityAvatarSet: (dataUrl: string) => void;
+    onIdentityAvatarGenerate: (prompt: string) => Promise<GeneratedAvatar>;
     onIdentitySave: () => void;
     onModelChange: (agentId: string, modelId: string | null) => void;
     onDecisionModelChange: (agentId: string, modelId: string | null) => void;
@@ -225,14 +228,7 @@ export function AgentOverview(
     return result;
   };
 
-  const handleAvatarFileSelect: JSX.EventHandler<HTMLInputElement, Event> = (event) => {
-    const input = event.currentTarget;
-    const file = input.files?.[0];
-    input.value = "";
-    if (file && uploadsEnabled(params.applicationConfig)) {
-      params.onIdentityAvatarSelect(file);
-    }
-  };
+  const [avatarPickerOpen, setAvatarPickerOpen] = createSignal(false);
 
   // Same catalog the primary picker offers; the field hides the effective
   // primary and current chain itself. Order is preserved: a pick appends.
@@ -312,35 +308,15 @@ export function AgentOverview(
               ) : undefined}
               <div class="agent-identity-editor__actions">
                 {uploadsEnabled(params.applicationConfig) ? (
-                  <>
-                    <button
-                      type="button"
-                      class="btn btn--sm"
-                      disabled={identityBusy()}
-                      onClick={(event: Event) => {
-                        const button = event.currentTarget;
-                        const input =
-                          button instanceof HTMLButtonElement ? button.nextElementSibling : null;
-                        if (
-                          uploadsEnabled(params.applicationConfig) &&
-                          input instanceof HTMLInputElement
-                        ) {
-                          input.click();
-                        }
-                      }}
-                    >
-                      {identityAvatarUrl()
-                        ? t("agents.identity.replaceImage")
-                        : t("agents.identity.chooseImage")}
-                    </button>
-                    <input
-                      type="file"
-                      accept="image/*"
-                      hidden
-                      disabled={identityBusy()}
-                      onChange={handleAvatarFileSelect}
-                    />
-                  </>
+                  <button
+                    type="button"
+                    class="btn btn--sm"
+                    aria-expanded={avatarPickerOpen() ? "true" : "false"}
+                    disabled={identityBusy()}
+                    onClick={() => setAvatarPickerOpen((open) => !open)}
+                  >
+                    {t("agents.identity.chooseAvatar")}
+                  </button>
                 ) : undefined}
                 <button
                   type="button"
@@ -356,6 +332,19 @@ export function AgentOverview(
                   {params.identitySaving ? t("common.saving") : t("common.save")}
                 </button>
               </div>
+              <Show when={avatarPickerOpen() && uploadsEnabled(params.applicationConfig)}>
+                <For each={[`${params.agent.id}:${params.identityScope}`]}>
+                  {() => (
+                    <AvatarPicker
+                      avatar={identityAvatarUrl()}
+                      disabled={identityBusy()}
+                      onSelect={(dataUrl) => params.onIdentityAvatarSet(dataUrl)}
+                      onUpload={(file) => params.onIdentityAvatarSelect(file)}
+                      onGenerate={(prompt) => params.onIdentityAvatarGenerate(prompt)}
+                    />
+                  )}
+                </For>
+              </Show>
               <div class="settings-row__desc agent-identity-editor__hint">
                 {uploadsEnabled(params.applicationConfig)
                   ? t("agents.identity.fileHint")
