@@ -6,6 +6,7 @@ import { Agents } from "./view.tsx";
 
 it("opens agent avatar selection from the keyboard and respects the busy state", async () => {
   const container = document.createElement("div");
+  container.style.cssText = "position:fixed;inset:0;overflow:auto";
   document.body.append(container);
   const props = createAgentViewTestProps();
   const mounted = mountSolid(Agents, props, container);

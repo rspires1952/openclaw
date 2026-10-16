@@ -109,7 +109,7 @@
   min-width: 0;
 }
 
-.avatar-picker__body textarea {
+.avatar-picker__body .field textarea {
   min-height: 150px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
