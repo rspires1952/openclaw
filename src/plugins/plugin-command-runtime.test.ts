@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { afterEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
@@ -16,6 +17,7 @@ import {
   executePluginCommandDispatch,
   matchPluginCommandInvocation,
   type PluginCommandDispatch,
+  type PluginCommandNativeCandidate,
 } from "./plugin-command-runtime.js";
 import { PluginInstance } from "./plugin-instance.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
@@ -26,6 +28,7 @@ import {
   setActivePluginRegistry,
 } from "./runtime.js";
 import { withPluginRuntimeRegistryScope } from "./runtime/gateway-request-scope.js";
+import type { OpenClawPluginCommandDefinition } from "./types.js";
 
 const executionContext = {
   senderId: "user-1",
@@ -35,37 +38,39 @@ const executionContext = {
   config: {},
 } as const;
 
+function command(
+  name: string,
+  handler: OpenClawPluginCommandDefinition["handler"] = async () => ({ text: "ok" }),
+  options: Partial<OpenClawPluginCommandDefinition> = {},
+): OpenClawPluginCommandDefinition {
+  return { name, description: `${name} command`, handler, ...options };
+}
+
 function registerCommand(
   registry: ReturnType<typeof createEmptyPluginRegistry>,
   name: string,
-  handler: (args?: string) => Promise<{ text: string }>,
-  options: {
-    pluginId?: string;
-    channels?: string[];
-    nativeNames?: Record<string, string>;
-    acceptsArgs?: boolean;
-  } = {},
+  handler: OpenClawPluginCommandDefinition["handler"] = async () => ({ text: "ok" }),
+  options: Partial<OpenClawPluginCommandDefinition> & { pluginId?: string } = {},
 ) {
-  const { pluginId = name, ...command } = options;
+  const { pluginId = name, ...definition } = options;
   expect(
-    registerPluginCommandInRegistry(registry, pluginId, {
-      ...command,
-      name,
-      description: `${pluginId} command`,
-      handler: async (ctx) => await handler(ctx.args),
-    }),
+    registerPluginCommandInRegistry(registry, pluginId, command(name, handler, definition)),
   ).toEqual({ ok: true });
 }
 
-function createCleanupRegistry(pluginId: string) {
-  const registry = createEmptyPluginRegistry();
-  const record = createPluginRecord({
+function pluginRecord(pluginId: string) {
+  return createPluginRecord({
     id: pluginId,
     source: `/plugins/${pluginId}/index.js`,
     origin: "config",
     enabled: true,
     configSchema: true,
   });
+}
+
+function createCleanupRegistry(pluginId: string) {
+  const registry = createEmptyPluginRegistry();
+  const record = pluginRecord(pluginId);
   record.status = "loaded";
   registry.plugins.push(record);
   const cleanup = vi.fn<() => void | Promise<void>>();
@@ -73,22 +78,38 @@ function createCleanupRegistry(pluginId: string) {
   return { registry, cleanup };
 }
 
-function requirePluginDispatch(
-  candidate: ReturnType<
-    ReturnType<typeof createPluginCommandRuntime>["listNativeCandidates"]
-  >[number],
-  args?: string,
-) {
+function requirePluginDispatch(candidate: PluginCommandNativeCandidate, args?: string) {
   const dispatch = candidate.prepareDispatch(args);
-  expect(dispatch.kind).toBe("plugin");
-  if (dispatch.kind !== "plugin") {
-    throw new Error("expected plugin command dispatch");
-  }
+  assert.ok(dispatch.kind === "plugin", "expected plugin command dispatch");
   return dispatch;
 }
 
 function selectCommand() {
   return requirePluginDispatch(createPluginCommandRuntime().listNativeCandidates("telegram")[0]!);
+}
+
+function executeCommand(registry: ReturnType<typeof createEmptyPluginRegistry>) {
+  setActivePluginRegistry(registry);
+  return selectCommand().execute(executionContext);
+}
+
+function watchSettlement(promise: Promise<void>) {
+  const settled = vi.fn();
+  void promise.then(settled);
+  return settled;
+}
+
+function detachedClearCommand(
+  registry: ReturnType<typeof createEmptyPluginRegistry>,
+  name: string,
+) {
+  const gate = createDeferred();
+  let clearing!: Promise<void>;
+  registerCommand(registry, name, async () => {
+    clearing = gate.promise.then(() => clearActivePluginRegistry());
+    return { text: name };
+  });
+  return { gate, clearing: () => clearing };
 }
 function matchCommand(body: string, channel = "telegram", runtime = createPluginCommandRuntime()) {
   return matchPluginCommandInvocation(runtime, body, { channel });
@@ -102,13 +123,7 @@ afterEach(() => {
 it("keeps failed command diagnostics scoped, authorized, redacted, and bounded", async () => {
   const registry = createEmptyPluginRegistry();
   registry.plugins.push({
-    ...createPluginRecord({
-      id: "recovery",
-      source: "/plugins/recovery/index.js",
-      origin: "config",
-      enabled: true,
-      configSchema: true,
-    }),
+    ...pluginRecord("recovery"),
     status: "error",
     failurePhase: "validation",
     error: `missing payload token=fixture-secret-value private-detail ${"x".repeat(400)}\n    at loader`,
@@ -124,10 +139,7 @@ it("keeps failed command diagnostics scoped, authorized, redacted, and bounded",
     expect(matchCommand("/recover stop")).toBeNull();
   });
   const match = matchCommand("/recover stop");
-  expect(match).not.toBeNull();
-  if (!match) {
-    throw new Error("expected failed command diagnostic");
-  }
+  assert.ok(match, "expected failed command diagnostic");
   await expect(
     match.dispatch.execute({ ...executionContext, isAuthorizedSender: false }),
   ).resolves.toEqual({ text: "⚠️ This command requires authorization." });
@@ -145,7 +157,9 @@ it("binds the request-scoped registry and scopes provider aliases", async () => 
   const ambient = createEmptyPluginRegistry();
   const scoped = createEmptyPluginRegistry();
   const ambientHandler = vi.fn(async () => ({ text: "ambient" }));
-  const scopedHandler = vi.fn(async (args?: string) => ({ text: `scoped:${args}` }));
+  const scopedHandler = vi.fn<OpenClawPluginCommandDefinition["handler"]>(async ({ args }) => ({
+    text: `scoped:${args}`,
+  }));
   const nativeNames = { discord: "discord-demo" };
   registerCommand(ambient, "demo", ambientHandler, { pluginId: "ambient" });
   registerCommand(scoped, "demo", scopedHandler, {
@@ -166,10 +180,8 @@ it("binds the request-scoped registry and scopes provider aliases", async () => 
     nativeNames.discord = "renamed-demo";
     expect(matchCommand("/discord-demo hi", "discord", runtime)).toBeNull();
     const match = matchCommand("/renamed-demo hi", "discord", runtime);
-    expect(match?.dispatch.kind).toBe("plugin");
-    if (!match) {
-      throw new Error("expected scoped command match");
-    }
+    assert.ok(match, "expected scoped command match");
+    expect(match.dispatch.kind).toBe("plugin");
     const result = await match.dispatch.execute({
       ...executionContext,
       channel: "discord",
@@ -208,14 +220,10 @@ it.each(["provider", "fallback"])(
       registerPluginCommandInRegistry(
         scoped,
         "demo",
-        {
-          name: "demo",
-          description: "Inspect this conversation",
-          handler: async (ctx) => {
-            await ctx.getCurrentConversationBinding();
-            return { text: ctx.accountId };
-          },
-        },
+        command("demo", async (ctx) => {
+          await ctx.getCurrentConversationBinding();
+          return { text: ctx.accountId };
+        }),
         { pluginRoot: "/plugins/demo" },
       ),
     ).toEqual({ ok: true });
@@ -243,27 +251,23 @@ it("rejects forged, cross-runtime, wrong-channel, and retired selections", async
   const handler = vi.fn(async () => ({ text: "ok" }));
   registerCommand(registry, "demo", handler);
   setActivePluginRegistry(registry);
-  const firstRuntime = createPluginCommandRuntime();
-  const secondRuntime = createPluginCommandRuntime();
-  const dispatch = requirePluginDispatch(firstRuntime.listNativeCandidates("telegram")[0]!);
-  const secondDispatch = requirePluginDispatch(secondRuntime.listNativeCandidates("telegram")[0]!);
+  const dispatch = selectCommand();
+  const secondDispatch = selectCommand();
   const forged = Object.freeze({
     kind: "plugin",
     execute: dispatch.execute,
   }) as PluginCommandDispatch;
 
-  await expect(executePluginCommandDispatch(forged, executionContext)).resolves.toMatchObject({
-    text: expect.stringContaining("no longer valid"),
-  });
-  await expect(dispatch.execute.call(secondDispatch, executionContext)).resolves.toMatchObject({
-    text: expect.stringContaining("no longer valid"),
-  });
+  const invalidReply = { text: expect.stringContaining("no longer valid") };
+  await expect(executePluginCommandDispatch(forged, executionContext)).resolves.toMatchObject(
+    invalidReply,
+  );
+  await expect(dispatch.execute.call(secondDispatch, executionContext)).resolves.toMatchObject(
+    invalidReply,
+  );
   await expect(
-    dispatch.execute({
-      ...executionContext,
-      channel: "discord",
-    }),
-  ).resolves.toMatchObject({ text: expect.stringContaining("no longer valid") });
+    dispatch.execute({ ...executionContext, channel: "discord" }),
+  ).resolves.toMatchObject(invalidReply);
 
   markPluginRegistryRetired(registry);
   await expect(dispatch.execute(executionContext)).resolves.toMatchObject({
@@ -282,45 +286,30 @@ it("keeps overlapping executions locked until both handlers settle", async () =>
     return { text: "done" };
   });
   setActivePluginRegistry(registry);
-  const runtime = createPluginCommandRuntime();
-  const candidate = runtime.listNativeCandidates("telegram")[0]!;
+  const candidate = createPluginCommandRuntime().listNativeCandidates("telegram")[0]!;
   const first = requirePluginDispatch(candidate);
   const second = requirePluginDispatch(candidate);
   const firstRun = first.execute(executionContext);
   const secondRun = second.execute(executionContext);
   await vi.waitFor(() => expect(getPluginCommandExecutionCount(registry)).toBe(2));
 
-  expect(
-    registerPluginCommandInRegistry(registry, "blocked", {
-      name: "blocked",
-      description: "blocked",
-      handler: async () => ({ text: "blocked" }),
-    }),
-  ).toMatchObject({ ok: false });
+  expect(registerPluginCommandInRegistry(registry, "blocked", command("blocked"))).toMatchObject({
+    ok: false,
+  });
   releases.shift()?.();
   await vi.waitFor(() => expect(getPluginCommandExecutionCount(registry)).toBe(1));
   expect(
-    registerPluginCommandInRegistry(registry, "still-blocked", {
-      name: "still-blocked",
-      description: "still blocked",
-      handler: async () => ({ text: "blocked" }),
-    }),
+    registerPluginCommandInRegistry(registry, "still-blocked", command("still-blocked")),
   ).toMatchObject({ ok: false });
   releases.shift()?.();
   await Promise.all([firstRun, secondRun]);
   expect(getPluginCommandExecutionCount(registry)).toBe(0);
-  expect(
-    registerPluginCommandInRegistry(registry, "ready", {
-      name: "ready",
-      description: "ready",
-      handler: async () => ({ text: "ready" }),
-    }),
-  ).toEqual({ ok: true });
+  registerCommand(registry, "ready");
 });
 
 it("does not prepare arguments for commands that reject them", () => {
   const registry = createEmptyPluginRegistry();
-  registerCommand(registry, "demo", async () => ({ text: "ok" }));
+  registerCommand(registry, "demo");
   setActivePluginRegistry(registry);
   const candidate = createPluginCommandRuntime().listNativeCandidates("telegram")[0]!;
   expect(candidate.prepareDispatch("unexpected")).toEqual({ kind: "non-plugin" });
@@ -328,27 +317,21 @@ it("does not prepare arguments for commands that reject them", () => {
 
 it("defers full registry cleanup until an admitted command settles", async () => {
   const { registry, cleanup } = createCleanupRegistry("slow");
-  let release!: () => void;
+  const gate = createDeferred();
   const { promise: started, resolve: entered } = createDeferred();
   registerCommand(registry, "slow", async () => {
     entered();
-    await new Promise<void>((resolve) => {
-      release = resolve;
-    });
+    await gate.promise;
     return { text: "done" };
   });
-  setActivePluginRegistry(registry);
-  const dispatch = selectCommand();
-  const running = dispatch.execute(executionContext);
+  const running = executeCommand(registry);
   await started;
-  let clearSettled = false;
-  const clearing = clearActivePluginRegistry().then(() => {
-    clearSettled = true;
-  });
+  const clearing = clearActivePluginRegistry();
+  const clearSettled = watchSettlement(clearing);
   await Promise.resolve();
-  expect(clearSettled).toBe(false);
+  expect(clearSettled).not.toHaveBeenCalled();
   expect(cleanup).not.toHaveBeenCalled();
-  release();
+  gate.resolve();
   await expect(running).resolves.toEqual({ text: "done" });
   await clearing;
   expect(cleanup).toHaveBeenCalledOnce();
@@ -364,60 +347,31 @@ it.each([false, true])("lets command-triggered clears finish (replaced: %s)", as
     await clearActivePluginRegistry();
     return { text: "cleared" };
   });
-  setActivePluginRegistry(registry);
-  const dispatch = selectCommand();
-  await expect(dispatch.execute(executionContext)).resolves.toEqual({ text: "cleared" });
+  await expect(executeCommand(registry)).resolves.toEqual({ text: "cleared" });
   await clearActivePluginRegistry();
   expect(cleanup).toHaveBeenCalledOnce();
 });
 
 it("awaits cleanup from detached handler context after execution settles", async () => {
-  const { registry, cleanup } = createCleanupRegistry("detached");
-  const { promise: detachedGate, resolve: releaseDetached } = createDeferred();
-  let releaseCleanup!: () => void;
-  cleanup.mockImplementationOnce(
-    async () =>
-      await new Promise<void>((resolve) => {
-        releaseCleanup = resolve;
-      }),
-  );
-  let detachedClear!: Promise<void>;
-  registerCommand(registry, "detached", () => {
-    detachedClear = (async () => {
-      await detachedGate;
-      await clearActivePluginRegistry();
-    })();
-    return Promise.resolve({ text: "scheduled" });
-  });
-  setActivePluginRegistry(registry);
-  const dispatch = selectCommand();
-
-  await expect(dispatch.execute(executionContext)).resolves.toEqual({ text: "scheduled" });
+  const { registry, cleanup } = createCleanupRegistry("scheduled");
+  const detached = detachedClearCommand(registry, "scheduled");
+  const cleanupGate = createDeferred();
+  cleanup.mockImplementationOnce(() => cleanupGate.promise);
+  await expect(executeCommand(registry)).resolves.toEqual({ text: "scheduled" });
   expect(getPluginCommandExecutionCount(registry)).toBe(0);
-  releaseDetached();
+  detached.gate.resolve();
   await vi.waitFor(() => expect(cleanup).toHaveBeenCalledOnce());
-  let clearSettled = false;
-  void detachedClear.then(() => {
-    clearSettled = true;
-  });
+  const clearSettled = watchSettlement(detached.clearing());
   await Promise.resolve();
-  expect(clearSettled).toBe(false);
-  releaseCleanup();
-  await detachedClear;
-  expect(clearSettled).toBe(true);
+  expect(clearSettled).not.toHaveBeenCalled();
+  cleanupGate.resolve();
+  await detached.clearing();
+  expect(clearSettled).toHaveBeenCalledOnce();
 });
 
 it("does not reuse an outer admission for detached nested handler cleanup", async () => {
   const { registry } = createCleanupRegistry("nested");
-  const { promise: detachedGate, resolve: releaseDetached } = createDeferred();
-  let detachedClear!: Promise<void>;
-  registerCommand(registry, "inner", () => {
-    detachedClear = (async () => {
-      await detachedGate;
-      await clearActivePluginRegistry();
-    })();
-    return Promise.resolve({ text: "inner" });
-  });
+  const detached = detachedClearCommand(registry, "inner");
   const { promise: outerGate, resolve: releaseOuter } = createDeferred();
   const { promise: outerHoldingGate, resolve: outerHolding } = createDeferred();
   const innerDispatchRef: { current?: PluginCommandDispatch } = {};
@@ -439,19 +393,16 @@ it("does not reuse an outer admission for detached nested handler cleanup", asyn
   const running = outerDispatch.execute({ ...executionContext, commandBody: "/outer" });
   await outerHoldingGate;
   expect(getPluginCommandExecutionCount(registry)).toBe(1);
-  let clearSettled = false;
-  void detachedClear.then(() => {
-    clearSettled = true;
-  });
-  releaseDetached();
+  const clearSettled = watchSettlement(detached.clearing());
+  detached.gate.resolve();
   await new Promise<void>((resolve) => {
     setTimeout(resolve, 0);
   });
-  expect(clearSettled).toBe(false);
+  expect(clearSettled).not.toHaveBeenCalled();
   releaseOuter();
   await expect(running).resolves.toEqual({ text: "outer" });
-  await detachedClear;
-  expect(clearSettled).toBe(true);
+  await detached.clearing();
+  expect(clearSettled).toHaveBeenCalledOnce();
 });
 
 it("fails factory creation when no registry generation exists", () => {
