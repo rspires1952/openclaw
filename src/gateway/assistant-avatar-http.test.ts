@@ -14,7 +14,10 @@ import * as imageOps from "../media/image-ops.js";
 import { readImageMetadataFromHeader } from "../media/image-ops.js";
 import { encodePngRgba } from "../media/png-encode.js";
 import { AVATAR_MAX_BYTES } from "../shared/avatar-limits.js";
-import { readGatewayAvatarThumbnail } from "./assistant-avatar-thumbnail.runtime.js";
+import {
+  readGatewayAvatarNotificationIcon,
+  readGatewayAvatarThumbnail,
+} from "./assistant-avatar-thumbnail.runtime.js";
 import { resolveGatewayAssistantAvatar } from "./assistant-avatar.js";
 import { resolveAssistantIdentity } from "./assistant-identity.js";
 import { handleControlUiAvatarRequest } from "./control-ui.js";
@@ -76,6 +79,19 @@ it("retries failed thumbnail preparation without retaining the rejected result",
   await expect(readGatewayAvatarThumbnail(source)).rejects.toThrow("decode failed");
   const recovered = await readGatewayAvatarThumbnail(source);
   expect(await readGatewayAvatarThumbnail(source)).toBe(recovered);
+  expect(fetch).toHaveBeenCalledTimes(2);
+});
+
+it("retries a failed notification image on the next delivery", async () => {
+  const source = {
+    dataUrl: `data:image/png;base64,${encodePngRgba(Buffer.from([255, 150, 0, 255]), 1, 1).toString("base64")}`,
+    revision: "retry-notification-icon",
+  };
+  const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("decode failed"));
+  expect(await readGatewayAvatarNotificationIcon(source)).toBeUndefined();
+  const icon = await readGatewayAvatarNotificationIcon(source);
+  expect(icon).toMatch(/^data:image\/png;base64,/);
+  expect(await readGatewayAvatarNotificationIcon(source)).toBe(icon);
   expect(fetch).toHaveBeenCalledTimes(2);
 });
 
