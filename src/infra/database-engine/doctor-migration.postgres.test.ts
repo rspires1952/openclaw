@@ -40,6 +40,7 @@ import { restoreUpdateDatabaseBackup } from "../update-database-restore.js";
 import { createUpdateDoctorDatabaseWriteCapture } from "../update-doctor-result.js";
 import { createUpdateRun, recordUpdateRunPhase } from "../update-run-ledger.js";
 import { withEngineStoreAdmission } from "./admission-scope.js";
+import { createUpdateDatabaseBackupWithFixtureTransport } from "./backup-capture.test-support.js";
 import { installDatabaseEngineSelection } from "./context.js";
 import { resetDatabaseEngineSelectionForTest } from "./context.test-support.js";
 import type { StoreSchema } from "./contract.js";
@@ -264,9 +265,9 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
   it.each([24, 25])(
     "backs up and restores the real version %s before the registered migration",
     async (sourceVersion) => {
-      closeOpenClawStateDatabaseForTest();
+      await prepare();
       stateEngineSchema.postgresMigrations = originalMigrations;
-      const sourceSchema = { ...stateEngineSchema, version: sourceVersion };
+      const sourceSchema = { ...predecessor, version: sourceVersion };
       await client.query(`
         UPDATE "${namespace}".openclaw_schema_meta
           SET version = ${sourceVersion}, fingerprint = NULL, ddl_hash = NULL, server_major = NULL;
@@ -446,7 +447,7 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
       try {
         try {
           saved = await lock!.run(() =>
-            createUpdateDatabaseBackup({
+            createUpdateDatabaseBackupWithFixtureTransport({
               backupRoot: path.join(env.OPENCLAW_STATE_DIR!, `update-capture-${foreignWrite}`),
               stateDir: env.OPENCLAW_STATE_DIR!,
               config,
@@ -705,7 +706,7 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
       try {
         try {
           saved = await lock!.run(() =>
-            createUpdateDatabaseBackup({
+            createUpdateDatabaseBackupWithFixtureTransport({
               backupRoot: path.join(env.OPENCLAW_STATE_DIR!, `agent-capture-${foreignWrite}`),
               stateDir: env.OPENCLAW_STATE_DIR!,
               config,
