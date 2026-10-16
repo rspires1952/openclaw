@@ -220,11 +220,13 @@ describe("cold-load CPU accounting", () => {
   });
 
   it("counts recursive functions and same-file ancestors once per inclusive sample", () => {
+    const outer = { ...frame("reconcile"), scriptId: "1" };
+    const inner = { ...frame("reconcile"), scriptId: "2" };
     const profile: ColdLoadCpuProfile = {
       nodes: [
         { id: 1, callFrame: frame("(root)", ""), children: [2] },
-        { id: 2, callFrame: frame("reconcile"), children: [3] },
-        { id: 3, callFrame: frame("reconcile"), children: [4] },
+        { id: 2, callFrame: outer, children: [3] },
+        { id: 3, callFrame: inner, children: [4] },
         { id: 4, callFrame: frame("render", "view.ts") },
       ],
       samples: [3, 4],

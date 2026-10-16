@@ -347,8 +347,15 @@ export function summarizeCpuProfile(
       while (current !== undefined) {
         const entry = nodes.get(current)!;
         if (entry.functionName !== "(root)" && entry.functionName !== "(idle)") {
-          const key = JSON.stringify(entry);
-          const row = functions.get(key) ?? { ...entry, selfMs: 0, inclusiveMs: 0 };
+          const key = functionKey(entry);
+          const row = functions.get(key) ?? {
+            functionName: entry.functionName,
+            url: entry.url,
+            lineNumber: entry.lineNumber,
+            columnNumber: entry.columnNumber,
+            selfMs: 0,
+            inclusiveMs: 0,
+          };
           if (current === sample.id) {
             row.selfMs += selfMs;
           }
@@ -441,11 +448,12 @@ export function medianCpuTables(tables: ColdLoadCpuTables[]): ColdLoadCpuTables 
       ...new Map(
         tables.flatMap((table) => table.functions.map((row) => [functionKey(row), row])),
       ).entries(),
-    ].map(([key, row]) => ({
-      ...row,
-      selfMs: median(functions.map((rows) => rows.get(key)?.selfMs ?? 0)),
-      inclusiveMs: median(functions.map((rows) => rows.get(key)?.inclusiveMs ?? 0)),
-    })),
+    ].map(([key, row]) =>
+      Object.assign({}, row, {
+        selfMs: median(functions.map((rows) => rows.get(key)?.selfMs ?? 0)),
+        inclusiveMs: median(functions.map((rows) => rows.get(key)?.inclusiveMs ?? 0)),
+      }),
+    ),
     files: [...new Set(tables.flatMap((table) => table.files.map((row) => row.url)))].map(
       (url) => ({
         url,
@@ -458,13 +466,14 @@ export function medianCpuTables(tables: ColdLoadCpuTables[]): ColdLoadCpuTables 
 export function compareCpuTables(baseline: ColdLoadCpuTables, candidate: ColdLoadCpuTables) {
   const before = new Map(baseline.functions.map((row) => [functionKey(row), row]));
   const after = new Map(candidate.functions.map((row) => [functionKey(row), row]));
-  return [...new Map([...before, ...after])].map(([key, row]) => ({
-    ...row,
-    baselineSelfMs: before.get(key)?.selfMs ?? 0,
-    baselineInclusiveMs: before.get(key)?.inclusiveMs ?? 0,
-    selfMs: (after.get(key)?.selfMs ?? 0) - (before.get(key)?.selfMs ?? 0),
-    inclusiveMs: (after.get(key)?.inclusiveMs ?? 0) - (before.get(key)?.inclusiveMs ?? 0),
-  }));
+  return [...new Map([...before, ...after])].map(([key, row]) =>
+    Object.assign({}, row, {
+      baselineSelfMs: before.get(key)?.selfMs ?? 0,
+      baselineInclusiveMs: before.get(key)?.inclusiveMs ?? 0,
+      selfMs: (after.get(key)?.selfMs ?? 0) - (before.get(key)?.selfMs ?? 0),
+      inclusiveMs: (after.get(key)?.inclusiveMs ?? 0) - (before.get(key)?.inclusiveMs ?? 0),
+    }),
+  );
 }
 
 export function formatCpuTables(title: string, tables: ColdLoadCpuTables, comparison = false) {
