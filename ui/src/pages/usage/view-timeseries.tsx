@@ -16,7 +16,7 @@ const CHART_MAX_BAR_WIDTH = 8; // Max bar width in SVG viewBox units
 const CHART_SELECTION_OPACITY = 0.06;
 const HANDLE_WIDTH = 5; // Width of drag handle in SVG units
 const HANDLE_HEIGHT = 12;
-const HANDLE_GRIP_OFFSET = 0.7; // Offset of grip lines inside handle
+const HANDLE_GRIP_OFFSET = 0.7;
 
 function dateBoundaryMs(date: string, timeZone: "local" | "utc", dayOffset: 0 | 1): number {
   const year = Number(date.slice(0, 4));
@@ -146,7 +146,7 @@ function deriveTimeSeries(detail: TimeSeriesProps["detail"], range: TimeSeriesPr
     0,
   );
   const maxValue = Math.max(...points.map((p) => p.value), 1);
-  const slotWidth = chartWidth / points.length; // space per bar including gap
+  const slotWidth = chartWidth / points.length;
   const barWidth = Math.min(CHART_MAX_BAR_WIDTH, Math.max(1, slotWidth * CHART_BAR_WIDTH_RATIO));
   const barGap = slotWidth - barWidth;
 

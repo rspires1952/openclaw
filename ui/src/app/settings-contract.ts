@@ -115,7 +115,7 @@ export type UiSettings = {
   boardSessionViews?: BoardSessionViews; // Per-device active dashboard tab and dock state
   sidebarSessionLayouts?: SidebarSessionLayouts; // Sidebar columns and widths per session
   sidebarSessionActivePanels?: SidebarSessionActivePanels; // Collapsed active panel per session
-  navCollapsed: boolean; // Collapsible sidebar state
+  navCollapsed: boolean;
   navWidth: number; // Sidebar width when expanded (240–400px)
   sidebarAgentsMode?: "chip" | "roster";
   sidebarPreTeamScope?: string | null; // null remembers All agents; undefined means unset.

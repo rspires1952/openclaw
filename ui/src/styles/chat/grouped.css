@@ -1,7 +1,3 @@
-/* =============================================
-   GROUPED CHAT LAYOUT (Slack-style)
-   ============================================= */
-
 .chat-group.user.chat-group--peer {
   --chat-user-content-align: start;
   /* The left-aligned identity owns the leading edge while hidden details
@@ -674,7 +670,6 @@
   text-decoration: underline;
 }
 
-/* Chat divider (e.g., compaction marker) */
 .chat-divider {
   display: grid;
   gap: 7px;
@@ -926,7 +921,6 @@ img.chat-avatar.user {
   color: var(--muted);
 }
 
-/* Image avatar support */
 img.chat-avatar {
   object-fit: cover;
   object-position: center;
@@ -1374,7 +1368,6 @@ button.chat-reply-attribution__target:disabled {
   box-shadow: none;
 }
 
-/* User bubbles have different styling */
 .chat-group.user .chat-bubble {
   --chat-bubble-background: var(--accent-subtle);
   background: var(--chat-bubble-background);

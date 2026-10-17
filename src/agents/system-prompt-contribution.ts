@@ -1,5 +1,4 @@
 /**
- * Provider-owned system prompt contribution types.
  * Separates cache-stable prefixes, dynamic suffixes, and section overrides for
  * runtime prompt assembly.
  */

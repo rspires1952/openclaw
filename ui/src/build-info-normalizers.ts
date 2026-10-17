@@ -1,4 +1,3 @@
-// Shared build identity normalization for the runtime artifact and Vite config.
 // Vite and native Node need explicit source paths before source-package aliases exist.
 import { asRecord } from "../../packages/normalization-core/src/record-coerce.ts";
 import { normalizeNullableString } from "../../packages/normalization-core/src/string-coerce.ts";

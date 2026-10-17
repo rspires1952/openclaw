@@ -18,8 +18,6 @@ import { SessionTitlePlaceholder } from "./solid/session-title-placeholder.tsx";
 import "./elapsed-time.tsx";
 import "./tooltip.ts";
 
-/** Compose independently owned session state and context indicators. */
-
 type RecentSessionParams = {
   host: SessionListHost;
   session: SidebarRecentSession;

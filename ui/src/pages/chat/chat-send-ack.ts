@@ -1,4 +1,3 @@
-// Leaf contract for chat.send acknowledgment shapes and timing records.
 // Kept import-free of chat-page modules so lifecycle and history layers
 // can consume ack types without forming import cycles.
 import {

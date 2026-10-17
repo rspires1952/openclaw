@@ -1,6 +1,4 @@
 /**
- * Curated automation ideas for the Automations page.
- *
  * Pure UI data: each idea prefills the inline create form. Nothing here talks
  * to the gateway or adds config surface.
  */
@@ -21,7 +19,6 @@ type CronSuggestion = {
   schedule: Partial<CronFormState>;
 };
 
-// Schedule shapes ported from the retired quick-create presets.
 const WEEKDAY_MORNINGS: Partial<CronFormState> = {
   scheduleKind: "cron",
   cronExpr: "0 9 * * 1-5",

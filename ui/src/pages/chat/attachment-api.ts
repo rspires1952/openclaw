@@ -21,7 +21,6 @@ function dataUrlToBase64(dataUrl: string): { content: string; mimeType: string }
   return content && !/[\r\n\u2028\u2029]/.test(content) ? { mimeType, content } : null;
 }
 
-/** Converts composer attachments into the base64 payload accepted by chat.send. */
 export function buildChatApiAttachments(attachments?: readonly ChatAttachment[]) {
   return attachments?.length
     ? attachments.map((attachment) => {

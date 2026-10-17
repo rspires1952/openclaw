@@ -335,7 +335,6 @@ select.settings-select:focus-visible {
   stroke-linejoin: round;
 }
 
-/* Quiet count badge used by settings pages and the Skill Workshop. */
 .settings-count {
   display: inline-flex;
   align-items: center;

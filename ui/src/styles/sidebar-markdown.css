@@ -1,5 +1,3 @@
-/* Shared rich Markdown used by Chat, Skills, and agent file previews. */
-
 .sidebar-markdown {
   color: var(--text);
   font-size: var(--control-ui-text-md);

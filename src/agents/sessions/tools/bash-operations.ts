@@ -1,7 +1,3 @@
-/**
- * Minimal shell execution interface injected into bash session tools.
- */
-
 export interface BashOperations {
   exec: (
     command: string,

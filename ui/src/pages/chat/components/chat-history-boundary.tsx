@@ -1,4 +1,3 @@
-// In-flow "earlier history" boundary rendered above the virtualized transcript.
 import { t } from "../../../lib/reactive/i18n.ts";
 
 export type ChatHistoryBoundaryProps = {

@@ -1,4 +1,3 @@
-// Control UI response helpers own bounded browser body consumption.
 import { consumeResponseBytes } from "@openclaw/normalization-core";
 
 type ResponseTextLimitOptions = {

@@ -1,8 +1,3 @@
-/**
- * Aggregate summaries for a run of consecutive tool calls, e.g.
- * "Ran 13 commands, read 6 files, edited 9 files, created a file".
- */
-
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { Value } from "typebox/value";
 import {
