@@ -74,7 +74,6 @@ function runLint(
   timeout = 10_000,
 ) {
   return runTool(root, [oxlintBin, "--threads=1", "--format=json", ...args, ...files], {
-    encoding: "utf8",
     timeout,
     env: { ...process.env, OXLINT_TSGOLINT_PATH: tsgolint, ...env },
   });
@@ -85,7 +84,6 @@ function runFocused(root: string, files: string[], env: NodeJS.ProcessEnv) {
     root,
     [oxlintRunner, "--openclaw-focused-config", "--threads=1", "--format=json", ...files],
     {
-      encoding: "utf8",
       env: { ...process.env, ...env },
     },
   );
@@ -635,7 +633,6 @@ describe("oxlint config", () => {
         { github: false, changedPaths: ["src/changed.ts"] },
       ]) {
         const result = runTool(root, [oxlintRunner, "--openclaw-focused-config", "fixture.ts"], {
-          encoding: "utf8",
           env: {
             ...process.env,
             GITHUB_ACTIONS: github ? "true" : "false",

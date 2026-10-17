@@ -478,45 +478,60 @@ afterEach(() => {
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 describe("systemd availability", () => {
-  it("uses the default private runtime socket despite a stale session address", async () => {
-    versionFixture.useScenarioResponse = true;
-    const runtimeDir = "/run/user/1002";
-    mockEffectiveUid(1002);
-    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
-    existsSyncMock.mockImplementation((file) => file === `${runtimeDir}/systemd/private`);
-    vi.spyOn(await import("./systemd-peer-native.js"), "openSystemdUserManager").mockResolvedValue({
-      query: async (args) => {
-        expect(args.at(-1)).toBe("Version");
-        return ["252.39"];
-      },
-      close: async () => {},
-      verify: () => {},
-    });
-    execFileMock.mockImplementation((_cmd, args, opts, cb) => {
-      if (args.includes("Version")) {
-        expect(args).toContain("--auto-start=no");
-        cb(createExecFileError("Failed to connect to bus"), "", "Failed to connect to bus");
-        return;
-      }
-      assertUserSystemctlArgs(args, "status");
-      if (!opts.env) {
-        throw new Error("expected systemctl env");
-      }
-      expect(opts.env).toMatchObject({
-        XDG_RUNTIME_DIR: runtimeDir,
-        DBUS_SESSION_BUS_ADDRESS: `unix:path=${runtimeDir}/systemd/private`,
+  it.each([
+    { socket: "bus", runtime: "/run/user/1000", sessionAddress: "unix:path=/tmp/dbus-stale" },
+    { socket: "systemd/private", runtime: undefined, sessionAddress: "unix:path=/tmp/dbus-stale" },
+  ])(
+    "uses runtime $socket despite session address $sessionAddress",
+    async ({ socket, runtime, sessionAddress }) => {
+      versionFixture.useScenarioResponse = true;
+      const uid = socket === "bus" ? 1000 : 1002;
+      const runtimeDir = `/run/user/${uid}`;
+      mockEffectiveUid(uid);
+      vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+      existsSyncMock.mockImplementation((file) => file === `${runtimeDir}/${socket}`);
+      vi.spyOn(
+        await import("./systemd-peer-native.js"),
+        "openSystemdUserManager",
+      ).mockResolvedValue({
+        query: async (args) => {
+          expect(args.at(-1)).toBe("Version");
+          return ["252.39"];
+        },
+        close: async () => {},
+        verify: () => {},
       });
-      cb(null, "", "");
-    });
+      execFileMock.mockImplementation((_cmd, args, opts, cb) => {
+        if (args.includes("Version")) {
+          expect(args).toContain("--auto-start=no");
+          if (
+            socket === "bus" &&
+            opts.env?.DBUS_SESSION_BUS_ADDRESS === `unix:path=${runtimeDir}/bus`
+          ) {
+            cb(null, 's "252.39"', "");
+          } else {
+            cb(createExecFileError("Failed to connect to bus"), "", "Failed to connect to bus");
+          }
+          return;
+        }
+        assertUserSystemctlArgs(args, "status");
+        if (!opts.env) {
+          throw new Error("expected systemctl env");
+        }
+        expect(opts.env.XDG_RUNTIME_DIR).toBe(socket === "bus" ? undefined : runtimeDir);
+        expect(opts.env.DBUS_SESSION_BUS_ADDRESS).toBe(`unix:path=${runtimeDir}/${socket}`);
+        cb(null, "", "");
+      });
 
-    await expect(
-      isSystemdUserServiceAvailable({
-        USER: "debian",
-        XDG_RUNTIME_DIR: undefined,
-        DBUS_SESSION_BUS_ADDRESS: "unix:path=/tmp/dbus-stale",
-      }),
-    ).resolves.toBe(true);
-  });
+      await expect(
+        isSystemdUserServiceAvailable({
+          USER: "debian",
+          XDG_RUNTIME_DIR: runtime === undefined ? undefined : runtimeDir,
+          DBUS_SESSION_BUS_ADDRESS: sessionAddress,
+        }),
+      ).resolves.toBe(true);
+    },
+  );
 
   it("does not fall back to machine scope when --user fails with permission denied", async () => {
     execFileMock.mockImplementationOnce(

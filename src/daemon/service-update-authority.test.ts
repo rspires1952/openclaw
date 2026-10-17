@@ -27,7 +27,7 @@ function asDoctor<T>(operation: () => Promise<T>, originalRoot?: string) {
 }
 const owner = {
   current: true,
-  assertCurrent(): void {
+  assertCurrent: (): void => {
     if (!owner.current) {
       throw new Error(retired);
     }

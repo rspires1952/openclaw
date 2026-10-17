@@ -67,15 +67,16 @@ function capture(
   if (typeof factory !== "function") {
     throw new Error("local_image factory was not registered");
   }
-  const tool = factory({
+  const registered = factory({
     agentDir: "/agent",
     workspaceDir: "/workspace",
     fsPolicy: { workspaceOnly: true },
     ...ctx,
   });
-  if (Array.isArray(tool)) {
+  if (Array.isArray(registered)) {
     throw new Error("local_image must register one tool");
   }
+  const tool = registered;
   async function run(input: unknown = "fixture.png", signal?: AbortSignal) {
     if (!tool) {
       throw new Error("Expected the configured local_image tool");

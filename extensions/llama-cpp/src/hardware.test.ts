@@ -31,6 +31,7 @@ const readStat = fs.stat;
 const disk = {
   type: 0xef53,
   bsize: 4096,
+  frsize: 4096,
   blocks: 100,
   bfree: 50,
   bavail: 40,
