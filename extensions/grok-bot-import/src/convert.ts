@@ -2,9 +2,8 @@ import { lstat, mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/p
 import { dirname, join, resolve } from "node:path";
 import { stringify } from "yaml";
 import { renderGrokBotAvatar } from "./avatar.js";
-import type { GrokBotRecipe } from "./recipe.js";
+import type { GrokBotImportWarning, GrokBotRecipe } from "./recipe.js";
 
-export type GrokBotImportWarning = { code: string; message: string };
 export type GrokBotConversionResult = {
   packageRoot: string;
   manifestPath: string;
@@ -40,8 +39,8 @@ function uniqueSlug(value: string, kind: "skill" | "routine", used: Set<string>)
 }
 
 async function assertEmptyDestination(destination: string): Promise<void> {
-  const existing = await lstat(destination).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") {
+  const existing = await lstat(destination).catch((error: unknown) => {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       return undefined;
     }
     throw error;

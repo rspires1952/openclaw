@@ -24,6 +24,7 @@ function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Invalid Claws gateway response.");
   }
+  // SAFETY: The guard excludes null, arrays, and primitives; property values remain unknown.
   return value as Record<string, unknown>;
 }
 

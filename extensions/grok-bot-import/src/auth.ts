@@ -15,9 +15,11 @@ const SIGN_IN =
   "Sign in to Grok Bot on this Mac, then retry, or provide GROK_BOT_ACCESS_TOKEN in the environment.";
 
 function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  // SAFETY: The guard excludes null, arrays, and primitives; property values remain unknown.
+  return value as Record<string, unknown>;
 }
 
 async function readActiveToken(homeDir: string): Promise<Buffer> {

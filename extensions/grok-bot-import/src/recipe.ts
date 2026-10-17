@@ -1,5 +1,7 @@
 export const MAX_GROK_BOT_RECIPE_BYTES = 25 * 1024 * 1024;
 
+export type GrokBotImportWarning = { code: string; message: string };
+
 export type GrokBotSourceLimitation = {
   code: "source_memory_unavailable" | "source_integration_requirements_unavailable";
   message: string;
@@ -30,6 +32,7 @@ function record(value: unknown, path: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`Invalid Grok Bot recipe: ${path} must be an object.`);
   }
+  // SAFETY: The guard excludes null, arrays, and primitives; property values remain unknown.
   return value as Record<string, unknown>;
 }
 

@@ -1,4 +1,4 @@
-import type { GrokBotImportWarning } from "./convert.js";
+import type { GrokBotImportWarning } from "./recipe.js";
 
 // Named colors and static geometry from Grok Bot 0.18.0 renderer assets/index-UbX-y3il.js.
 // Captured from its pure rOt/_Ne SVG renderer; no application code or runtime dependency is imported.
