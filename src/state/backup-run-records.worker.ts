@@ -2,12 +2,8 @@ import {
   recordBackupRunInDatabase,
   type PreparedBackupRunRecord,
 } from "./backup-run-records.kernel.js";
-import { isStatePostgres } from "./openclaw-state-db-engine.js";
 import { assertOpenClawStateDatabaseOwner } from "./openclaw-state-db-maintenance.js";
-import {
-  withExistingOpenClawStateDatabaseArtifactPreservingReadOnly,
-  withExistingOpenClawStateDatabaseCurrentReadOnly,
-} from "./openclaw-state-db-readonly.js";
+import { withExistingOpenClawStateDatabaseArtifactPreservingReadOnly } from "./openclaw-state-db-readonly.js";
 import { isOpenClawStateDatabaseOpen } from "./openclaw-state-db.js";
 import type { WorkerWriteOperationContext } from "./worker-operation-registry.js";
 
@@ -20,10 +16,7 @@ export const backupRunOperations = {
     // A best-effort ledger must not initialize or change a refused backup source.
     // An already-admitted writer carries ownership; cold admission stays read-only.
     if (!isOpenClawStateDatabaseOpen(options.path)) {
-      const readExisting = isStatePostgres()
-        ? withExistingOpenClawStateDatabaseCurrentReadOnly
-        : withExistingOpenClawStateDatabaseArtifactPreservingReadOnly;
-      const existing = readExisting(({ db }) => {
+      const existing = withExistingOpenClawStateDatabaseArtifactPreservingReadOnly(({ db }) => {
         assertOpenClawStateDatabaseOwner(db, { pathname: options.path });
         return true;
       }, options);

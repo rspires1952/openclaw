@@ -1,8 +1,5 @@
 import { existsSync } from "node:fs";
 import { runWithLocalStateOwner } from "../cli/local-state-owner.js";
-import { createConfigIO } from "../config/io.js";
-import { resolveDatabaseEngineSelection } from "../infra/database-engine/config.js";
-import { withDatabaseEngineSelection } from "../infra/database-engine/context.js";
 import { recordBackupRunOutcome } from "../state/backup-run-records.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 
@@ -30,14 +27,7 @@ export async function recordBackupRunOutcomeWithOwner(
         throw new Error("The state database disappeared; the backup outcome was not recorded.");
       }
     },
-    runLocal: async ({ env, assertCurrent, signal }) => {
-      const config = await createConfigIO({ env, observe: false }).readSourceConfigBestEffort();
-      assertCurrent();
-      const selection = await resolveDatabaseEngineSelection(config, env);
-      assertCurrent();
-      return withDatabaseEngineSelection(selection, () =>
-        recordBackupRunOutcome({ ...outcome, env }, { assertCurrent, signal }),
-      );
-    },
+    runLocal: ({ env, assertCurrent, signal }) =>
+      recordBackupRunOutcome({ ...outcome, env }, { assertCurrent, signal }),
   });
 }

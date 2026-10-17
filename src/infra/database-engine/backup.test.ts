@@ -10,12 +10,9 @@ import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import "./backup-worker.test-support.js";
 import { createBackupResourcePlan } from "../../commands/backup-resource-inventory.js";
-import { backupRestoreCommand } from "../../commands/backup-restore.js";
-import { createTestRuntime } from "../../commands/test-runtime-config-helpers.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveActivatedPluginBackupInventory } from "../../plugins/manifest-backup-resources.js";
 import { createPluginCache, withPluginCache } from "../../plugins/plugin-cache.js";
-import { restorePostgresBackup } from "../../snapshot/database-backup-core.worker.js";
 import {
   capturePostgresBackup,
   preparePostgresRestore,
@@ -30,9 +27,7 @@ import {
   closeOpenClawStateDatabaseAsync,
   openOpenClawStateDatabase,
 } from "../../state/openclaw-state-db.js";
-import { withEnvAsync } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import { createBackupArchive } from "../backup-create.js";
 import { createBackupSqliteSnapshotPlan } from "../backup-sqlite-snapshot.js";
 import { CLIENT_CREDENTIAL_SCHEMA_SQL } from "../client-credential-schema.js";
 import { resolveClientCredentialStorePath } from "../client-credential-store.js";
@@ -81,7 +76,7 @@ async function expectRestored(client: Client, namespace: string) {
 }
 
 describe.skipIf(!connection)("matched PostgreSQL backup and update recovery", () => {
-  it("restores full archives, Git exports, and exact updater state without changing sources", async () => {
+  it("restores user and Git exports and exact updater state while preserving source data and sidecars", async () => {
     assert(connection);
     await withOpenClawTestState({ scenario: "minimal", prefix: "pg-backup-" }, async (state) => {
       const client = new Client({ connectionString: connection });
@@ -234,73 +229,23 @@ describe.skipIf(!connection)("matched PostgreSQL backup and update recovery", ()
           await expect(verifyMatchedPostgresBackup(directory, "user-backup")).resolves.toEqual(
             manifest,
           );
-          // A copy collision happens after server materialization, before a fresh anchor exists.
-          const queries = vi.spyOn(client, "query");
-          try {
-            await expect(
-              restorePostgresBackup({
-                client,
-                descriptor,
-                manifest,
-                directory,
-                anchorPath,
-                profile: "user-backup",
-                assertCurrent() {},
-              }),
-            ).rejects.toMatchObject({ code: "EEXIST" });
-            const created = queries.mock.calls.flatMap(([query]) => {
-              const match =
-                typeof query === "string" && /^CREATE SCHEMA "(restore_[a-f0-9]+)"$/.exec(query);
-              return match ? [match[1]!] : [];
-            });
-            expect(created).toHaveLength(1);
-            for (const name of created) {
-              namespaces.add(name);
-            }
-            expect(
-              (
-                await client.query("SELECT nspname FROM pg_namespace WHERE nspname = ANY($1)", [
-                  created,
-                ])
-              ).rows,
-            ).toEqual([]);
-          } finally {
-            queries.mockRestore();
-          }
-          for (const failure of ["worker-admission", "host-custody"] as const) {
-            const failedPath = state.path(`${failure}.sqlite`);
-            await expect(
-              preparePostgresRestore({
-                directory,
-                anchorPath: failedPath,
-                config,
-                profile: "user-backup",
-                ...(failure === "worker-admission"
-                  ? { preserveUpdateHistory: true, expectedSource: { storeId, namespace } }
-                  : {}),
-                assertCurrent() {
-                  if (failure === "host-custody" && fsSync.existsSync(failedPath)) {
-                    throw new Error("Lost restore custody");
-                  }
-                },
-              }),
-            ).rejects.toThrow(
-              failure === "worker-admission" ? /update history contract/ : /Lost restore custody/,
-            );
-            const failedAnchor = readBackupEngine(failedPath);
-            assert(failedAnchor.engine === "postgres");
-            namespaces.add(failedAnchor.namespace);
-            expect(failedAnchor.namespace).not.toBe(namespace);
-            expect(
-              (
-                await client.query("SELECT nspname FROM pg_namespace WHERE nspname = $1", [
-                  failedAnchor.namespace,
-                ])
-              ).rows,
-            ).toEqual([]);
-          }
+          const restoredAnchor = state.path("restored.sqlite");
+          const restored = await preparePostgresRestore({
+            directory,
+            anchorPath: restoredAnchor,
+            config,
+            profile: "user-backup",
+            assertCurrent() {},
+          });
+          namespaces.add(restored.namespace);
+          expect(restored.namespace).not.toBe(namespace);
+          expect(readBackupEngine(restoredAnchor)).toEqual({
+            engine: "postgres",
+            namespace: restored.namespace,
+            storeId,
+          });
+          await expectRestored(client, restored.namespace);
           await expectRestored(client, namespace);
-          expect(await fs.readFile(anchorPath)).toEqual(originalAnchor);
           {
             using wrong = openNodeSqliteDatabase(path.join(directory, "anchor.sqlite"));
             wrong.prepare("UPDATE openclaw_engine_anchor SET store_id = ?").run(randomUUID());
@@ -517,122 +462,6 @@ describe.skipIf(!connection)("matched PostgreSQL backup and update recovery", ()
               (asset) => asset.archiveSourcePath === `${sharedPath}.postgres/manifest.json`,
             ),
           ).toBe(true);
-          {
-            const sourceRef = "OPENCLAW_BACKUP_SOURCE_DSN";
-            const destinationRef = "OPENCLAW_BACKUP_DESTINATION_DSN";
-            const configuredConnection = (id: string): OpenClawConfig => ({
-              ...config,
-              database: {
-                ...config.database,
-                postgres: { connection: { source: "env", provider: "default", id } },
-              },
-            });
-            await state.writeConfig(configuredConnection(sourceRef));
-            const opaqueRelativePath = path.join("unrelated.postgres", "manifest.json");
-            const neighboringRelativePath = path.join(
-              "plugins",
-              "workboard",
-              "workboard.sqlite.postgres",
-              "operator-note.txt",
-            );
-            for (const relativePath of [opaqueRelativePath, neighboringRelativePath]) {
-              await state.writeText(relativePath, "Preserved operator file\n");
-            }
-            const archive = await withEnvAsync({ [sourceRef]: connection }, () =>
-              createBackupArchive({
-                output: state.path("full-backup.tar.gz"),
-                includeWorkspace: false,
-                verify: true,
-              }),
-            );
-            const target = state.path("full-restored");
-            await state.writeConfig(configuredConnection(destinationRef));
-            const failedTarget = state.path("failed-full-restored");
-            const failedNamespaces: string[] = [];
-            const rename = fs.rename;
-            const publication = vi
-              .spyOn(fs, "rename")
-              .mockImplementation(async (source, destination) => {
-                if (typeof source === "string" && source.includes(".restore-")) {
-                  const prepared = readBackupEngine(source);
-                  assert(prepared.engine === "postgres");
-                  namespaces.add(prepared.namespace);
-                  failedNamespaces.push(prepared.namespace);
-                  if (failedNamespaces.length === 2) {
-                    throw new Error("Restore publication denied");
-                  }
-                }
-                await rename(source, destination);
-              });
-            try {
-              await expect(
-                withEnvAsync({ [sourceRef]: undefined, [destinationRef]: connection }, () =>
-                  backupRestoreCommand(createTestRuntime(), {
-                    archive: archive.archivePath,
-                    target: failedTarget,
-                  }),
-                ),
-              ).rejects.toMatchObject({ cause: { message: "Restore publication denied" } });
-            } finally {
-              publication.mockRestore();
-            }
-            expect(failedNamespaces).toHaveLength(2);
-            expect(
-              (
-                await client.query("SELECT nspname FROM pg_namespace WHERE nspname = ANY($1)", [
-                  failedNamespaces,
-                ])
-              ).rows,
-            ).toEqual([]);
-            await expect(fs.access(failedTarget)).rejects.toMatchObject({ code: "ENOENT" });
-            await withEnvAsync({ [sourceRef]: undefined, [destinationRef]: connection }, () =>
-              backupRestoreCommand(createTestRuntime(), {
-                archive: archive.archivePath,
-                target,
-              }),
-            );
-            await state.writeConfig(config);
-            const asset = archive.assets.find((entry) => entry.kind === "state");
-            assert(asset);
-            const restoredRoot = path.join(target, asset.archivePath);
-            const restoredWorkboard = readBackupEngine(
-              path.join(restoredRoot, path.relative(state.stateDir, anchorPath)),
-            );
-            const restoredShared = readBackupEngine(
-              path.join(restoredRoot, "state/openclaw.sqlite"),
-            );
-            assert(restoredWorkboard.engine === "postgres" && restoredShared.engine === "postgres");
-            namespaces.add(restoredWorkboard.namespace);
-            namespaces.add(restoredShared.namespace);
-            expect(restoredWorkboard.storeId).toBe(storeId);
-            expect(restoredShared.storeId).toBe(sharedStoreId);
-            expect(restoredWorkboard.namespace).not.toBe(namespace);
-            expect(restoredShared.namespace).not.toBe(sharedNamespace);
-            await expectRestored(client, restoredWorkboard.namespace);
-            await expectRestored(client, namespace);
-            for (const relativePath of [opaqueRelativePath, neighboringRelativePath]) {
-              expect(await fs.readFile(path.join(restoredRoot, relativePath), "utf8")).toBe(
-                "Preserved operator file\n",
-              );
-            }
-            await withEnvAsync(
-              {
-                OPENCLAW_STATE_DIR: restoredRoot,
-                OPENCLAW_CONFIG_PATH: path.join(
-                  restoredRoot,
-                  path.relative(state.stateDir, state.configPath),
-                ),
-                [sourceRef]: connection,
-              },
-              async () => {
-                await createBackupArchive({
-                  output: state.path("restored-backup.tar.gz"),
-                  includeWorkspace: false,
-                  verify: true,
-                });
-              },
-            );
-          }
           const input = {
             backupRoot: state.path("candidate"),
             stateDir: state.stateDir,

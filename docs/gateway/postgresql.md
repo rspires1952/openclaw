@@ -17,9 +17,9 @@ for coverage; selecting PostgreSQL does not move every local file into the serve
 
 <Warning>
   PostgreSQL and mixed-engine operation remain experimental. Native credential
-  and execution-approval work is not fully cut over. Full-archive restore needs
-  an active destination connection; read [Backup and restore](#backup-and-restore)
-  before starting recovery.
+  and execution-approval work is not fully cut over. Full-archive extraction also
+  does not recreate PostgreSQL namespaces;
+  read [Backup and restore](#backup-and-restore) before relying on it for recovery.
 </Warning>
 
 ## When to use PostgreSQL
@@ -359,27 +359,21 @@ backup. Neither a server dump alone nor a copied anchor covers the installation.
 ### Current restore limits
 
 `openclaw backup restore <archive> --target <directory>` verifies and extracts
-into a fresh staging directory and restores each matched PostgreSQL export into
-a fresh owned namespace. It publishes the matching anchors only inside that
-staged tree; existing server namespaces and live anchors stay unchanged.
+into a fresh staging directory. It **does not import PostgreSQL rows or recreate
+namespaces**. Moving the extracted anchor into place cannot recover a lost server.
+`openclaw backup sqlite restore` is SQLite-only.
 
-Before restoring, stop all writers, select `database.engine: "postgres"` in the
-active config, and supply its destination connection SecretRef. Provision that
-database's required extensions and make the matching plugins available. Restore
-uses this active connection, not a connection recovered from the archive. After
-restore, activate the staged files and configure their state and agent paths as
-described in the [archive restore workflow](/install/backups#restore-a-full-archive).
-
-Standalone `openclaw backup verify <archive>` validates the matched anchors,
-exports, and application database roles locally without connecting to PostgreSQL.
-Verification alone does not prove the destination can restore or run the data.
-`openclaw backup sqlite restore` remains SQLite-only. Git backup restore supports
-shared state and individually selected agents; it has no plugin-store selector.
+The engine supports verified restore into a fresh owned PostgreSQL namespace,
+with anchor publication after verification. Current Git backup CLI exposes this
+for **shared state and individually selected agents**. It has no plugin-store
+restore selector. Complete archive-to-PostgreSQL rehydration and plugin-store CLI
+restore remain gaps; do not treat full-archive verification as proof of complete
+disaster recovery. Keep a tested PostgreSQL-native recovery procedure for stores
+outside the CLI restore scopes, preserving their matching local anchors.
 
 ### Disaster recovery for shared state and agents
 
-For separately selected shared-state and agent recovery points, create Git
-backups while offline alongside the full archive:
+Prepare explicit Git recovery points while offline, alongside the full archive:
 
 ```bash
 openclaw backup git init --repository ~/Backups/openclaw-git
@@ -394,19 +388,18 @@ private. Git database backups do not replace file/config backups.
 
 `openclaw backup git verify` currently exercises restore for PostgreSQL: it needs
 the configured database and offline custody, and creates a new server namespace.
-It is not a files-only verification command.
+It is not a files-only verification command. `openclaw backup verify <archive>`
+checks archive structure and layout without proving PostgreSQL rehydration.
 
-To recover these scopes from a recorded Git backup:
+To recover these scopes:
 
 1. Keep all writers stopped. Provision a compatible PostgreSQL server, a fresh
    database, runtime role, and required extensions as above.
-2. Configure the active recovery installation with matching `database.engine`
-   and `database.families` selections and its external connection secret pointing
-   at the recovery database. Use a compatible OpenClaw version and matching
-   plugins. Stage the backed-up config and files using the
-   [archive restore workflow](/install/backups#restore-a-full-archive), which also
-   restores matched PostgreSQL stores. Set the recovery installation's
-   state/config paths and agent directories, keeping its destination connection.
+2. Stage the backed-up config and files using the [archive restore workflow](/install/backups#restore-a-full-archive).
+   Set the recovery installation's state/config paths and agent directories;
+   supply its external connection secret separately, pointing at the recovery
+   database. Preserve the matching `database.engine` and `database.families`
+   selections, and use a compatible OpenClaw version and matching plugins.
 3. Restore each Git scope from the **same recorded commit** to a nonexistent
    local target, outside the backup repository:
 
@@ -422,8 +415,8 @@ To recover these scopes from a recorded Git backup:
 4. Put those verified anchors at the recovery installation's corresponding
    shared-state and agent database paths, replacing only staged historical
    anchors while offline. Preserve the old installation and namespaces until
-   recovery is confirmed. Other matched PostgreSQL stores remain at the state
-   restored from the full archive.
+   recovery is confirmed. Recover any other PostgreSQL store through its tested
+   server recovery procedure before starting the installation.
 5. Run `openclaw doctor`, start through the service owner, then check
    `openclaw health`, `openclaw status`, representative sessions, search, and
    enabled plugins. Review pending approvals and channel relinking needs after

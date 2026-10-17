@@ -6,7 +6,9 @@ import {
   replacePersistedPluginModelCatalogs,
 } from "../../agents/plugin-model-catalog.js";
 import { CronService } from "../../cron/service.js";
+import { createWorkerSessionPlacementStore } from "../../gateway/worker-environments/placement-store.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { withEngineStoreAdmission } from "./admission-scope.js";
 import { mixedAgentConnection, useMixedAgentPair } from "./mixed-agent.conformance.test-support.js";
@@ -15,6 +17,36 @@ describe.skipIf(!mixedAgentConnection).each(["sqlite", "postgres"] as const)(
   "%s post-ready storage consumers",
   (engine) => {
     const fixture = useMixedAgentPair(engine, engine);
+
+    it("reads cold placement projections and committed turn claims", async () => {
+      withEngineStoreAdmission(() => openOpenClawStateDatabase());
+      const store = createWorkerSessionPlacementStore();
+      const session = {
+        agentId: "main",
+        sessionKey: "agent:main:placement-projection",
+        sessionId: "placement-projection",
+      };
+      expect((await store.readProjection([session.sessionId])).placements.size).toBe(0);
+      const claimInput = {
+        ...session,
+        owner: { kind: "local" as const },
+        runId: "projection-run",
+        claimId: "projection-claim",
+      };
+      const claim = await store.claimTurn(claimInput);
+      try {
+        expect(await store.claimTurn(claimInput)).toEqual(claim);
+        const projection = await store.readProjection([session.sessionId], { current: true });
+        expect(projection.placements.get(session.sessionId)).toMatchObject({
+          state: "local",
+          turnClaim: { claimId: "projection-claim", runId: "projection-run" },
+        });
+        expect(projection.environments.size).toBe(0);
+        expect(projection.pendingResults.size).toBe(0);
+      } finally {
+        await store.releaseTurn(claim);
+      }
+    });
 
     it("reads refreshed provider catalogs through the selected agent owner", async () => {
       const database = withEngineStoreAdmission(() =>

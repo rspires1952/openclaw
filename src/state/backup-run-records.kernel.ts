@@ -5,6 +5,7 @@ import {
   sqliteStringSet,
 } from "../infra/kysely-sync.js";
 import type { EngineConnection } from "../infra/sql-connection.js";
+import { getAdmittedSqliteSchemaFacts } from "../infra/sqlite-schema-facts.js";
 import {
   BACKUP_RUN_WINDOW,
   parseBackupRun,
@@ -12,7 +13,6 @@ import {
   resolveBackupRunTarget,
   type BackupRunRecord,
 } from "./backup-run-records.contract.js";
-import { tableExists } from "./openclaw-state-db-schema-helpers.js";
 import type { DB as OpenClawStateDatabase } from "./openclaw-state-db.generated.js";
 
 type BackupRunDatabase = Pick<OpenClawStateDatabase, "backup_runs">;
@@ -53,7 +53,7 @@ export function recordBackupRunInDatabase(
 
 /** Reads only the bounded ledger, using facts captured by database admission. */
 export function readBackupRunsInDatabase(db: EngineConnection): BackupRunRecord[] {
-  if (!tableExists(db, "backup_runs")) {
+  if (!getAdmittedSqliteSchemaFacts(db)?.tables.has("backup_runs")) {
     return [];
   }
   return executeSqliteQuerySync(

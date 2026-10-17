@@ -37,7 +37,6 @@ import {
   exportPostgresBackup,
   restorePostgresBackup,
   fingerprintPostgresDatabase,
-  discardPostgresNamespace,
 } from "./database-backup-core.worker.js";
 import {
   readSnapshotExportEnvelope,
@@ -203,59 +202,45 @@ async function preparePostgresRestoreInWorker(params: {
       pluginOwners: params.pluginOwners,
     });
     const { namespace } = await restorePostgresBackup({ ...params, client, descriptor, manifest });
-    try {
-      const input = getScopedDatabaseEngineSelection()?.postgres;
-      params.assertCurrent();
-      await descriptor.admit?.(params.anchorPath, input);
-      if (params.preserveUpdateHistory) {
-        if (!params.expectedSource) {
-          throw new Error("PostgreSQL update rollback requires its captured source identity.");
-        }
-        const source = params.expectedSource.namespace;
-        const historySchema = [descriptor, ...(descriptor.fragments ?? [])].find((schema) =>
-          schema.tables.some((entry) => entry.name === "update_runs"),
-        );
-        const table = historySchema?.tables.find((entry) => entry.name === "update_runs");
-        if (!historySchema || !table) {
-          throw new Error(
-            "PostgreSQL rollback cannot preserve the current update history contract.",
-          );
-        }
-        const expected = historySchema.expectedCatalog.filter((fact) => fact.table === table.name);
-        const catalog = readPostgresCatalog(
-          (await client.query(postgresCatalogQuery(source))).rows[0].catalog,
-        );
-        assertPostgresCatalog(
-          catalog.filter((fact) => fact.table === table.name),
-          expected,
-        );
-        const columns = table.columns.map(({ name }) => quote(name)).join(", ");
-        await client.query("BEGIN; SET LOCAL synchronous_commit = on");
-        try {
-          await client.query(`DELETE FROM ${quote(namespace)}.update_runs`);
-          await client.query(
-            `INSERT INTO ${quote(namespace)}.update_runs (${columns}) SELECT ${columns} FROM ${quote(source)}.update_runs`,
-          );
-          await client.query("COMMIT");
-        } catch (error) {
-          await client.query("ROLLBACK");
-          throw error;
-        }
+    const input = getScopedDatabaseEngineSelection()?.postgres;
+    params.assertCurrent();
+    await descriptor.admit?.(params.anchorPath, input);
+    if (params.preserveUpdateHistory) {
+      if (!params.expectedSource) {
+        throw new Error("PostgreSQL update rollback requires its captured source identity.");
       }
-      // Owner admission can change anchor journal mode; bind the final bytes for publication.
-      const { sha256, size: sizeBytes } = await captureDatabaseArtifact(params.anchorPath);
-      return { namespace, sha256, sizeBytes };
-    } catch (error) {
+      const source = params.expectedSource.namespace;
+      const historySchema = [descriptor, ...(descriptor.fragments ?? [])].find((schema) =>
+        schema.tables.some((entry) => entry.name === "update_runs"),
+      );
+      const table = historySchema?.tables.find((entry) => entry.name === "update_runs");
+      if (!historySchema || !table) {
+        throw new Error("PostgreSQL rollback cannot preserve the current update history contract.");
+      }
+      const expected = historySchema.expectedCatalog.filter((fact) => fact.table === table.name);
+      const catalog = readPostgresCatalog(
+        (await client.query(postgresCatalogQuery(source))).rows[0].catalog,
+      );
+      assertPostgresCatalog(
+        catalog.filter((fact) => fact.table === table.name),
+        expected,
+      );
+      const columns = table.columns.map(({ name }) => quote(name)).join(", ");
+      await client.query("BEGIN; SET LOCAL synchronous_commit = on");
       try {
-        await discardPostgresNamespace(client, namespace);
-      } catch (cleanupError) {
-        // oxlint-disable-next-line preserve-caught-error -- AggregateError.errors retains cleanup failure.
-        throw new AggregateError([error, cleanupError], "PostgreSQL restore and cleanup failed.", {
-          cause: error,
-        });
+        await client.query(`DELETE FROM ${quote(namespace)}.update_runs`);
+        await client.query(
+          `INSERT INTO ${quote(namespace)}.update_runs (${columns}) SELECT ${columns} FROM ${quote(source)}.update_runs`,
+        );
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
       }
-      throw error;
     }
+    // Owner admission can change anchor journal mode; bind the final bytes for publication.
+    const { sha256, size: sizeBytes } = await captureDatabaseArtifact(params.anchorPath);
+    return { namespace, sha256, sizeBytes };
   });
 }
 
@@ -355,47 +340,11 @@ export async function captureGitPostgresBackup(params: {
   return manifest;
 }
 
-/** Cleanup is limited to fresh namespaces returned by this restore invocation. */
-export async function discardPostgresRestores(config: OpenClawConfig, namespaces: string[]) {
-  if (namespaces.length === 0) {
-    return;
-  }
-  await withDatabasePortConnection(config, async (client) => {
-    const errors: unknown[] = [];
-    for (const namespace of namespaces) {
-      try {
-        await discardPostgresNamespace(client, namespace);
-      } catch (error) {
-        errors.push(error);
-      }
-    }
-    if (errors.length > 0) {
-      throw new AggregateError(errors, "Could not remove newly restored PostgreSQL namespaces.");
-    }
-  });
-}
-
-export async function preparePostgresRestore({ assertCurrent, ...params }: Restore) {
-  // Retain the worker result before the host custody check so rejection can discard its namespace.
-  assertCurrent();
-  const restored = await runBackupTask<Awaited<ReturnType<typeof preparePostgresRestoreInWorker>>>(
+export function preparePostgresRestore({ assertCurrent, ...params }: Restore) {
+  return runBackupTask<Awaited<ReturnType<typeof preparePostgresRestoreInWorker>>>(
     { operation: "restore", params },
-    () => {},
+    assertCurrent,
   );
-  try {
-    assertCurrent();
-    return restored;
-  } catch (error) {
-    try {
-      await discardPostgresRestores(params.config, [restored.namespace]);
-    } catch (cleanupError) {
-      // oxlint-disable-next-line preserve-caught-error -- AggregateError.errors retains cleanup failure.
-      throw new AggregateError([error, cleanupError], "PostgreSQL restore and cleanup failed.", {
-        cause: error,
-      });
-    }
-    throw error;
-  }
 }
 
 /** Resolve physical family identity through the same provider admission as capture. */

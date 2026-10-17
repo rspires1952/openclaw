@@ -109,11 +109,8 @@ prefer snapshots or continuous replication below.
 
 On ephemeral container hosts, keep the archive outside the container and use
 `openclaw backup restore` as the disaster-recovery primitive for rebuilding a
-fresh persistent state tree. SQLite restore stages files only; activation remains
-an explicit offline deployment step. For PostgreSQL, restore also prepares fresh
-namespaces using the active configuration's destination connection and writes
-their anchors into the staging tree. Stop the Gateway before this operation;
-existing PostgreSQL namespaces remain unchanged.
+fresh persistent state tree. Restore stages files only; activation remains an
+explicit offline deployment step.
 
 ## Per-database snapshots
 
@@ -512,9 +509,7 @@ The target must not exist or must be empty, and it must not be inside the live
 state directory or any configured live agent directory. OpenClaw verifies
 archive structure, the manifest, hardlinks, symbolic-link entries, and the root
 SQLite snapshot and its durably registered agent snapshots before it writes the
-target. Matched PostgreSQL exports are checked locally, then restored into fresh
-namespaces through the active configuration's destination connection. Other
-payload remains opaque. A non-empty target is refused,
+target. Other payload remains opaque. A non-empty target is refused,
 and a failed extraction cleans its incomplete output. The command never writes
 into live state or agent roots and has no force or in-place mode. Treat the
 restored directory as sensitive: it can contain credentials, auth profiles,

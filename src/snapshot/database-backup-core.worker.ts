@@ -156,45 +156,23 @@ export async function restorePostgresBackup(params: {
     activeFragments: manifest.activeFragments,
     assertCurrent: params.assertCurrent,
   });
-  try {
-    if (params.profile === "exact" && !isDeepStrictEqual(verified, manifest.verification)) {
-      throw new Error("Exact PostgreSQL export verification differs from its manifest.");
-    }
-    params.assertCurrent();
-    await fs.copyFile(
-      path.join(params.directory, "anchor.sqlite"),
-      params.anchorPath,
-      fs.constants.COPYFILE_EXCL,
-    );
-    if (
-      !isDeepStrictEqual(await artifact(params.anchorPath), manifest.artifacts["anchor.sqlite"])
-    ) {
-      throw new Error("PostgreSQL restore anchor changed during preparation.");
-    }
-    {
-      using anchor = openNodeSqliteDatabase(params.anchorPath);
-      anchor.prepare("UPDATE openclaw_engine_anchor SET schema = ?").run(namespace);
-    }
-    return { namespace };
-  } catch (error) {
-    try {
-      await discardPostgresNamespace(client, namespace);
-    } catch (cleanupError) {
-      // oxlint-disable-next-line preserve-caught-error -- AggregateError.errors retains cleanup failure.
-      throw new AggregateError([error, cleanupError], "PostgreSQL restore and cleanup failed.", {
-        cause: error,
-      });
-    }
-    throw error;
+  if (params.profile === "exact" && !isDeepStrictEqual(verified, manifest.verification)) {
+    throw new Error("Exact PostgreSQL export verification differs from its manifest.");
   }
-}
-
-/** Only freshly materialized namespaces owned by this restore may be discarded. */
-export async function discardPostgresNamespace(client: Client, namespace: string) {
-  if (!/^restore_[a-f0-9]{32}$/.test(namespace)) {
-    throw new Error("Refusing to discard a namespace not allocated by PostgreSQL restore.");
+  params.assertCurrent();
+  await fs.copyFile(
+    path.join(params.directory, "anchor.sqlite"),
+    params.anchorPath,
+    fs.constants.COPYFILE_EXCL,
+  );
+  if (!isDeepStrictEqual(await artifact(params.anchorPath), manifest.artifacts["anchor.sqlite"])) {
+    throw new Error("PostgreSQL restore anchor changed during preparation.");
   }
-  await client.query(`DROP SCHEMA IF EXISTS "${namespace}" CASCADE`);
+  {
+    using anchor = openNodeSqliteDatabase(params.anchorPath);
+    anchor.prepare("UPDATE openclaw_engine_anchor SET schema = ?").run(namespace);
+  }
+  return { namespace };
 }
 
 export async function fingerprintPostgresDatabase(params: { client: Client; anchor: Anchor }) {

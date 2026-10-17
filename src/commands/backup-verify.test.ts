@@ -230,65 +230,6 @@ describe("backupVerifyCommand", () => {
     vi.mocked(tar.x).mockReset().mockImplementation(actualTar.x);
   });
 
-  it.each(["text", "sqlite", "missing"] as const)(
-    "keeps an unrelated .postgres directory opaque with a %s companion",
-    async (companion) => {
-      const asset = buildBackupArchivePath(TEST_ARCHIVE_ROOT, "/tmp/.openclaw");
-      const anchor = `${asset}/workspace/project.db`;
-      const contents =
-        companion === "sqlite"
-          ? await createSqlitePayload((db) => db.exec("CREATE TABLE user_data (value TEXT)"))
-          : "ordinary workspace file";
-      await withBrokenArchiveFixture(
-        {
-          tempPrefix: "openclaw-backup-opaque-postgres-",
-          manifestAssetArchivePath: asset,
-          payloads: [
-            ...(companion === "missing"
-              ? []
-              : [{ fileName: "project.db", archivePath: anchor, contents }]),
-            {
-              fileName: "unrelated-manifest.json",
-              archivePath: `${anchor}.postgres/manifest.json`,
-              contents: "",
-            },
-          ],
-        },
-        async (archivePath) => {
-          await expect(verifyBackupArchive(archivePath)).resolves.toMatchObject({ ok: true });
-        },
-      );
-    },
-  );
-
-  it("rejects a PostgreSQL state anchor without its matched export", async () => {
-    const asset = buildBackupArchivePath(TEST_ARCHIVE_ROOT, "/tmp/.openclaw");
-    const anchor = await createSqlitePayload((db) => {
-      db.exec(`
-        CREATE TABLE openclaw_engine_anchor (store_id TEXT, engine TEXT, schema TEXT);
-        INSERT INTO openclaw_engine_anchor VALUES ('sample', 'postgres', 'sample');
-      `);
-    });
-    await withBrokenArchiveFixture(
-      {
-        tempPrefix: "openclaw-backup-missing-postgres-export-",
-        manifestAssetArchivePath: asset,
-        payloads: [
-          {
-            fileName: "anchor.sqlite",
-            archivePath: `${asset}/state/openclaw.sqlite`,
-            contents: anchor,
-          },
-        ],
-      },
-      async (archivePath) => {
-        await expect(verifyBackupArchive(archivePath)).rejects.toThrow(
-          "PostgreSQL anchor is missing its matched export",
-        );
-      },
-    );
-  });
-
   it.each([
     {
       name: "missing archive",
@@ -1035,11 +976,6 @@ describe("backupVerifyCommand", () => {
       {
         tempPrefix: "openclaw-backup-traversal-",
         archivePath: `${TEST_ARCHIVE_ROOT}/payload/../escaped.txt`,
-        error: /path traversal segments/i,
-      },
-      {
-        tempPrefix: "openclaw-backup-dot-segment-",
-        archivePath: `./${TEST_ARCHIVE_ROOT}/payload/anchor.sqlite.postgres/manifest.json`,
         error: /path traversal segments/i,
       },
       {

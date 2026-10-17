@@ -174,6 +174,7 @@ it.skipIf(!connection)(
           ),
         ).toBe(true);
         const promoted = readHealthBasis();
+        assert(promoted);
         expect(promoted).toEqual({
           lastKnownGoodJson: observedJson,
           lastPromotedGoodJson: promotedJson,

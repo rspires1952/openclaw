@@ -9,7 +9,10 @@ import {
   type SqliteDatabaseAdmissionKey,
 } from "../sqlite-database-admission.js";
 import { stageSqliteTransactionState } from "../sqlite-post-commit.js";
-import { runSqliteImmediateTransactionSync } from "../sqlite-transaction.js";
+import {
+  runSqliteDeferredTransactionSync,
+  runSqliteImmediateTransactionSync,
+} from "../sqlite-transaction.js";
 import { beginUpdatePostgresMigration } from "../update-doctor-migration-attribution.js";
 import { databaseEngineAdapters } from "./adapters.js";
 import type { AdmittedStore, EngineConnection, StoreSchema } from "./contract.js";
@@ -130,10 +133,14 @@ export function openEngineStore(ref: {
     );
   }
   ref.prepareAnchor();
+  // Existing-only readers inspect identity without competing for the anchor's writer lock.
+  const runAnchorTransaction = ref.existingOnly
+    ? runSqliteDeferredTransactionSync
+    : runSqliteImmediateTransactionSync;
   const identity =
     known?.engine === "postgres"
       ? known
-      : runSqliteImmediateTransactionSync(anchor, () => {
+      : runAnchorTransaction(anchor, () => {
           const inspection = ref.inspectSqlite();
           if (inspection.hasExistingData) {
             throw new Error(

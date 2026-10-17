@@ -8,7 +8,6 @@ import { formatDiskSpaceBytes, tryReadDiskSpace } from "../infra/disk-space.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
 import { shortenHomePath } from "../utils.js";
-import { restoreBackupPostgresSnapshots } from "./backup-postgres.js";
 import {
   BACKUP_MAX_DECOMPRESSION_RATIO,
   canonicalizePathForContainment,
@@ -164,7 +163,6 @@ export async function backupRestoreCommand(
     hardlinkTargets,
     symbolicLinks,
     regularFileExtractionBytes,
-    postgresSnapshots,
   } = await prepareBackupArchive(options.archive);
   assertRestoreCapacity(targetPath, regularFileExtractionBytes);
   const target = await prepareRestoreTarget(targetPath);
@@ -184,7 +182,6 @@ export async function backupRestoreCommand(
     for (const { entryPath, linkpath } of symbolicLinks) {
       await fs.symlink(linkpath, path.join(targetPath, entryPath));
     }
-    await restoreBackupPostgresSnapshots(targetPath, postgresSnapshots);
   } catch (extractionError) {
     try {
       await cleanupFailedRestore(targetPath, target.created);

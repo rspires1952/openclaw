@@ -15,18 +15,13 @@ import {
 import { loadSqliteVecExtension } from "../infra/database-engine/sqlite-vec.js";
 import { formatDiskSpaceBytes, tryReadDiskSpace } from "../infra/disk-space.js";
 import { formatErrorMessage, hasErrnoCode } from "../infra/errors.js";
+import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import { SQLITE_SIDECAR_SUFFIXES } from "../infra/sqlite-files.js";
 import { assertSqliteIntegrity } from "../infra/sqlite-integrity.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
 import { assertOpenClawAgentDatabaseOwner } from "../state/openclaw-agent-db-maintenance.js";
 import { readOpenClawAgentDatabaseRegistryRows } from "../state/openclaw-agent-db-registry.read.js";
 import { resolveUserPath } from "../utils.js";
-import {
-  resolveBackupPostgresSnapshots,
-  prepareBackupPostgresSnapshots,
-  openBackupSnapshotImage,
-  type BackupPostgresSnapshot,
-} from "./backup-postgres.js";
 import type { BackupSqliteSnapshotFact } from "./backup-resource-inventory.js";
 import { BACKUP_MAX_DECOMPRESSION_RATIO, buildBackupArchivePath } from "./backup-shared.js";
 import {
@@ -263,12 +258,11 @@ function readArchivedAgentDatabaseOwners(
 }
 
 function assertSqliteExtractionBudget(params: {
-  entries: NormalizedArchiveEntry[];
+  entries: SqliteSnapshotEntry[];
   tempRoot: string;
   extractedBytes?: number;
-  allowEmpty?: boolean;
 }): void {
-  const totalBytes = resolveExtractionBytes(params.entries, !params.allowEmpty);
+  const totalBytes = resolveExtractionBytes(params.entries, true);
   if (totalBytes > MAX_SQLITE_SNAPSHOT_EXTRACT_BYTES) {
     throw new Error(
       `SQLite snapshots require ${formatDiskSpaceBytes(totalBytes)} of extraction space; the verification limit is ${formatDiskSpaceBytes(MAX_SQLITE_SNAPSHOT_EXTRACT_BYTES)}.`,
@@ -349,18 +343,13 @@ async function verifySqliteSnapshots(params: {
   archivePath: string;
   entries: NormalizedArchiveEntry[];
   manifest: BackupManifest;
-  postgresSnapshots: BackupPostgresSnapshot[];
-}): Promise<{
-  verifiedOwners: SqliteSnapshotOwner[];
-  postgresSnapshots: BackupPostgresSnapshot[];
-}> {
+}): Promise<SqliteSnapshotOwner[]> {
   const verifiedOwners: SqliteSnapshotOwner[] = [];
-  const postgresSnapshots: BackupPostgresSnapshot[] = [];
   const stateDir =
     params.manifest.paths?.stateDir ??
     params.manifest.assets.find((asset) => asset.kind === "state")?.sourcePath;
   if (!stateDir) {
-    return { verifiedOwners, postgresSnapshots };
+    return verifiedOwners;
   }
   const stateAssetRoot = buildBackupArchivePath(params.manifest.archiveRoot, stateDir);
   const portableStateRoot = resolvePortableArchivePathKey(stateAssetRoot);
@@ -387,39 +376,21 @@ async function verifySqliteSnapshots(params: {
       })),
   ];
   const initialEntries = listSqliteSnapshotEntries(params.entries, declaredOwners);
-  if (initialEntries.length === 0 && params.postgresSnapshots.length === 0) {
-    return { verifiedOwners, postgresSnapshots };
+  if (initialEntries.length === 0) {
+    return verifiedOwners;
   }
   assertCanonicalStateAssetRoot(params.manifest);
   const tempRoot = os.tmpdir();
   assertSqliteExtractionBudget({ entries: initialEntries, tempRoot });
   const tempDir = await fs.mkdtemp(path.join(tempRoot, "openclaw-backup-verify-sqlite-"));
   try {
-    const postgres = await prepareBackupPostgresSnapshots({
-      archivePath: params.archivePath,
-      tempDir,
-      entries: params.entries,
-      candidates: params.postgresSnapshots,
-      assertCapacity: (entries) =>
-        assertSqliteExtractionBudget({
-          entries: [...entries, ...initialEntries],
-          tempRoot,
-          allowEmpty: true,
-        }),
-    });
-    postgresSnapshots.push(...postgres.snapshots);
     const batches = [initialEntries];
-    const extractedEntries: NormalizedArchiveEntry[] = [...postgres.entries];
+    const extractedEntries: SqliteSnapshotEntry[] = [];
     for (const sqliteEntries of batches) {
-      const extractedBytes = resolveExtractionBytes(extractedEntries);
+      const extractedBytes = resolveExtractionBytes(extractedEntries, true);
       extractedEntries.push(...sqliteEntries);
       if (extractedBytes > 0) {
-        assertSqliteExtractionBudget({
-          entries: extractedEntries,
-          tempRoot,
-          extractedBytes,
-          allowEmpty: true,
-        });
+        assertSqliteExtractionBudget({ entries: extractedEntries, tempRoot, extractedBytes });
       }
       const sqliteEntriesByRawPath = new Map(sqliteEntries.map((entry) => [entry.raw, entry]));
       await tar.x({
@@ -437,7 +408,7 @@ async function verifySqliteSnapshots(params: {
           if (archiveEntry.size !== expected.size) {
             throw new Error(`SQLite snapshot size changed during verification: ${entryPath}`);
           }
-          return !postgres.members.has(entryPath);
+          return true;
         },
       });
 
@@ -456,7 +427,11 @@ async function verifySqliteSnapshots(params: {
         let database: DatabaseSync | undefined;
         try {
           await assertSqliteSnapshotFileShape(extractedPath, entry.normalized, extractedStat.size);
-          database = openBackupSnapshotImage(tempDir, entry.normalized, postgres.byAnchor);
+          database = openNodeSqliteDatabase(extractedPath, {
+            allowExtension: true,
+            readOnly: true,
+          });
+          database.exec("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;");
           await loadSqliteVecExtension({ db: database });
           assertSqliteIntegrity(database, entry.normalized);
           if (entry.role === "agent") {
@@ -517,7 +492,7 @@ async function verifySqliteSnapshots(params: {
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
-  return { verifiedOwners, postgresSnapshots };
+  return verifiedOwners;
 }
 
 async function verifyResolvedBackupArchive(
@@ -672,13 +647,8 @@ async function verifyResolvedBackupArchive(
   ) {
     throw new Error("Backup manifest external symbolic links do not match archive entries.");
   }
-  const { verifiedOwners, postgresSnapshots } = await verifySqliteSnapshots({
-    archivePath,
-    entries,
-    manifest,
-    postgresSnapshots: resolveBackupPostgresSnapshots(entries),
-  });
-  verifyBackupSqliteCoverage(manifest, requiredSnapshots, verifiedOwners);
+  const verifiedSnapshots = await verifySqliteSnapshots({ archivePath, entries, manifest });
+  verifyBackupSqliteCoverage(manifest, requiredSnapshots, verifiedSnapshots);
   const regularFileExtractionBytes = resolveExtractionBytes(entries);
 
   const result = {
@@ -699,7 +669,6 @@ async function verifyResolvedBackupArchive(
     hardlinkTargets,
     symbolicLinks: preparedSymbolicLinks,
     regularFileExtractionBytes,
-    postgresSnapshots,
   };
 }
 
