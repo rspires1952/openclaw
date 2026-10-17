@@ -23,7 +23,6 @@ import {
 } from "./update-global.js";
 import { resolvePnpmGlobalDirFromGlobalRoot } from "./update-native-package-owner.js";
 import { resolveUpdateInstallSurface } from "./update-runner-install-surface.js";
-import { createGatewayUpdateCheck } from "./update-startup.js";
 
 const runHostCommandBuffered = exec.runCommandBuffered;
 beforeEach(() => {
@@ -717,13 +716,7 @@ describe("FreeBSD package-manager admission", () => {
       vi.spyOn(openclawRoot, "resolveOpenClawPackageRoot").mockResolvedValue(root);
       vi.spyOn(restartSentinel, "readVerifiedGitUpdateReceipt").mockResolvedValue(null);
       await withMockedPlatform("freebsd", async () => {
-        const startup = createGatewayUpdateCheck({
-          lifecycle: createGatewayUpdateLifecycle(createTestGatewayScheduler()),
-          getConfig: () => ({}),
-          applyRemoteCatalogUpdate: async () => "unchanged",
-          log: { info: vi.fn() },
-          isNixMode: false,
-        });
+        const startup = createGatewayUpdateLifecycle(createTestGatewayScheduler());
         try {
           const first = await startup.initialize();
           expect(first.status).toMatchObject({

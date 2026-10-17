@@ -206,7 +206,9 @@ export function startComputerHostProcess(params: {
       const cancel = () => {
         try {
           send({ type: "cancel", id });
-        } catch {}
+        } catch {
+          // Abort/timeout settles locally and joins close() even when cancel cannot be sent.
+        }
       };
       const abort = () => {
         cancel();

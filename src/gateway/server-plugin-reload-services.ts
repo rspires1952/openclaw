@@ -13,7 +13,7 @@ export function createPluginReloadServices(
   >,
   stopServices: ReturnType<typeof createPluginReloadCleanup>["stopPreviousServices"],
 ) {
-  const generation = runtime.kernel.pluginRuntimeGeneration;
+  const state = runtime.kernel.pluginRuntimeState;
   const start = (
     registry: PluginRegistry,
     config: OpenClawConfig,
@@ -28,7 +28,7 @@ export function createPluginReloadServices(
         workspaceDir: runtime.pluginWorkspaceDir,
         broadcastPluginEvent: runtime.broadcastPluginEvent,
         getCronService: runtime.kernel.getCronService,
-        previous: generation.currentServices(),
+        previous: state.currentServices(),
         onHandle,
         throwOnStartError: true,
         deferStartForPluginIds,
@@ -53,13 +53,11 @@ export function createPluginReloadServices(
       }
       // Early rollback may have drained managers before reaching service stop.
       if (rollback) {
-        await stopServices(generation.currentServices(), true, restartPluginIds);
+        await stopServices(state.currentServices(), true, restartPluginIds);
       }
       // A retained instance must reacquire managers only after registry adoption
       // and memory admission resume; startup is part of this reload's completion.
-      await start(runtime.pluginRuntime.registry, config, (handle) =>
-        generation.publishServices(generation.currentClaim(), handle),
-      );
+      await start(runtime.pluginRuntime.registry, config, (handle) => state.setServices(handle));
     },
   };
 }

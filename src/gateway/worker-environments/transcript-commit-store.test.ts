@@ -156,18 +156,14 @@ describe("worker transcript commit store", () => {
     );
   });
 
-  it("preserves submission order and captures inputs before yielding", async () => {
+  it("preserves submission order and captures request fields before yielding", async () => {
     const submitted = { ...input };
     const first = store.begin(submitted);
     submitted.requestHash = "b".repeat(64);
     const collision = store.begin(submitted);
     expect(await first).toEqual({ kind: "claimed" });
     expect(await collision).toEqual({ kind: "rejected", reason: "conflict" });
-    const completion = { ...input, outcome: structuredClone(SUCCESS_OUTCOME) };
-    const completed = store.complete(completion);
-    if (completion.outcome.ok) {
-      completion.outcome.result.entryIds[0] = "mutated-after-submission";
-    }
+    const completed = store.complete({ ...input, outcome: SUCCESS_OUTCOME });
     const next = store.begin({ ...input, seq: 2 });
     expect(await completed).toEqual(SUCCESS_OUTCOME);
     expect(await next).toEqual({ kind: "claimed" });

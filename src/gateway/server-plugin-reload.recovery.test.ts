@@ -39,10 +39,7 @@ import {
   verifyPreparedSidecarRecovery,
   verifyServiceCleanupRecovery,
 } from "./server-plugin-reload.activation.test-support.js";
-import {
-  verifyActiveCallDrainLease,
-  verifyLateActiveCallDrainObservation,
-} from "./server-plugin-reload.active-call.test-support.js";
+import { verifyActiveCallDrainLease } from "./server-plugin-reload.active-call.test-support.js";
 import { verifyCancelledDrainRollbackLease } from "./server-plugin-reload.cancel-lease.test-support.js";
 import {
   verifyDecisionSelectionIsolation,
@@ -272,9 +269,6 @@ it.each([15_000, 70_000])(
     ),
 );
 
-it("keeps restored plugins serving when an expired drain observation settles late", () =>
-  verifyLateActiveCallDrainObservation(createRecoveryFixture));
-
 it("keeps the lifecycle lease through cancelled drain rollback before admitting another writer", () =>
   verifyCancelledDrainRollbackLease(
     createRecoveryFixture,
@@ -413,7 +407,6 @@ it("retains unrelated discovery after the selected service refuses cleanup", asy
       });
       const discovery = await startGatewayDiscovery({
         gatewayDiscoveryServices: fixture.previousRegistry.gatewayDiscoveryServices,
-        pluginRuntimeClaim: fixture.owner.currentClaim(),
         machineDisplayName: "fixture-gateway",
         port: 0,
         tailscaleMode: "off",
@@ -577,7 +570,6 @@ it.each(["rollback", "after-commit error", "late startup"] as const)(
         const discovery = await startGatewayDiscovery({
           discovery: { mdns: { mode: "minimal" } },
           gatewayDiscoveryServices: fixture.previousRegistry.gatewayDiscoveryServices,
-          pluginRuntimeClaim: fixture.owner.currentClaim(),
           machineDisplayName: "fixture-gateway",
           port: 0,
           tailscaleMode: "off",

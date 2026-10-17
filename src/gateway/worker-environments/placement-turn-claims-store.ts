@@ -117,8 +117,6 @@ export function createPlacementTurnClaimWorkerOps(runtime: {
         const { placementGeneration } = command.input.claim;
         command.input = { ...command.input, claim: { ...claim, placementGeneration } };
       }
-    } else {
-      command.input = structuredClone(command.input);
     }
     if (
       command.type === "placementTurns.recordStagedResult" ||

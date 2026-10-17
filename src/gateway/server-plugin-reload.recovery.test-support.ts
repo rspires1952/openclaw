@@ -45,7 +45,7 @@ import {
   probeHttpRoute,
 } from "./server-plugin-reload.fixture-tools.test-support.js";
 import { reloadGatewayPlugins } from "./server-plugin-reload.js";
-import { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
+import { createGatewayPluginRuntimeState } from "./server-plugin-runtime-state.js";
 import { GatewayRequestEntryLifetime } from "./server-request-entry.js";
 import { createGatewaySidecarStopOwner } from "./server-sidecar-owners.js";
 
@@ -136,7 +136,7 @@ export async function createPluginReloadRecoveryFixture(
   const registryOwner = createPluginRegistryOwner(previous.registry);
   const initial = await startPluginServices({ registry: previous.registry, config });
   let currentServices: PluginServicesHandle | null = initial;
-  const owner = createGatewayPluginRuntimeGeneration({
+  const owner = createGatewayPluginRuntimeState({
     getServices: () => currentServices,
     setServices: (handle) => {
       currentServices = handle;
@@ -226,7 +226,7 @@ export async function createPluginReloadRecoveryFixture(
     pluginMetadataSnapshot: snapshot,
     pluginRuntime: registryOwner,
     kernel: {
-      pluginRuntimeGeneration: owner,
+      pluginRuntimeState: owner,
       pluginMetadata: metadata,
       getCronService: () => runtime.runtimeState.cronState.cron,
     },

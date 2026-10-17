@@ -7263,7 +7263,6 @@
 ["src/gateway/server-startup-post-attach.test.ts","../hooks/gmail-watcher-lifecycle.js","67d59de9024a5e1f2abdadfccdb76c5d8cbc95650b42f9caeb3f7e502a119249",1]
 ["src/gateway/server-startup-post-attach.test.ts","../hooks/internal-hooks.js","f863290b3df1ce48e0e29548a055b43b65205d2662be929565646966df3e4bbc",1]
 ["src/gateway/server-startup-post-attach.test.ts","../hooks/loader.js","06669c24ceacc90f3655746a49bb4a69e24660e8514ba512fb55e366874887d1",1]
-["src/gateway/server-startup-post-attach.test.ts","../infra/update-startup.js","7ccf7731f188c56e91aecff782e3f07a670849344d674a11ca9a9846c2e691ac",1]
 ["src/gateway/server-startup-post-attach.test.ts","../plugins/services.js","3db3c188fce6cfba7e6e0f9307f13fc18162e7ffbc5a1eab4d2298e6741df2d8",1]
 ["src/gateway/server-startup-post-attach.test.ts","./server-startup-log.js","b8bc73d34ea7bd1ab20c328a107a0d56a4474dcb82cd5be8ea4b79fd3f1f0710",1]
 ["src/gateway/server-startup-schema-refusal.test.ts","../daemon/launchd.js","3b3168a7d07d0f6bfd7820a1f44120fbc19c3edbe92752c03e581fed71d03a8d",1]

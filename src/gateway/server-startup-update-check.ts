@@ -4,7 +4,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { GatewayActiveWorkInspectors } from "../infra/gateway-active-work.js";
 import type { GatewayScheduler } from "../infra/gateway-scheduler.js";
 import { createGatewayUpdateLifecycle } from "../infra/update-check-lifecycle.js";
-import type { createGatewayUpdateCheck } from "../infra/update-startup.js";
+import type { startGatewayUpdateChecks } from "../infra/update-startup.js";
 import type { PluginRegistry } from "../plugins/registry.js";
 import { withPluginRuntimeRegistryScope } from "../plugins/runtime/gateway-request-scope.js";
 import { runWithGatewayIndependentRootWorkAdmission } from "../process/gateway-work-admission.js";
@@ -22,11 +22,9 @@ import { startUpdateRunWatcher, wakeUpdateRunWatcher } from "./update-run-watche
 export function createDeferredGatewayUpdateCheck(params: {
   scheduler: GatewayScheduler;
   startupTrace?: GatewayStartupTrace;
-  createUpdateCheck: (
-    ...args: Parameters<typeof createGatewayUpdateCheck>
-  ) =>
-    | ReturnType<typeof createGatewayUpdateCheck>
-    | Promise<ReturnType<typeof createGatewayUpdateCheck>>;
+  loadUpdateChecks: () =>
+    | typeof startGatewayUpdateChecks
+    | Promise<typeof startGatewayUpdateChecks>;
   getConfig: () => OpenClawConfig;
   /** Catalog republication borrows unchanged plugin instances from this live Gateway registry. */
   getPluginRegistry: () => PluginRegistry | undefined;
@@ -44,9 +42,6 @@ export function createDeferredGatewayUpdateCheck(params: {
   let stopped = false;
   let started = false;
   let runWatcher: ReturnType<typeof startUpdateRunWatcher> | undefined;
-  let owner: ReturnType<typeof createGatewayUpdateCheck> | undefined;
-  let ownerReady: Promise<void> | undefined;
-  let initialization: Promise<unknown> | undefined;
   let stopPromise: Promise<void> | undefined;
   let latestUpdateAvailable: GatewayUpdateAvailableEventPayload["updateAvailable"] = null;
   let latestSchedule: GatewayUpdateAvailableEventPayload["schedule"];
@@ -74,7 +69,7 @@ export function createDeferredGatewayUpdateCheck(params: {
   };
 
   // Early RPC discovery shares the same cancellation and publication owner,
-  // even before the post-ready background factory has been admitted.
+  // even before the post-ready background checks have been admitted.
   const lifecycle = createGatewayUpdateLifecycle(params.scheduler, {
     onUpdateAvailableChange: (updateAvailable) => {
       latestUpdateAvailable = updateAvailable;
@@ -97,12 +92,7 @@ export function createDeferredGatewayUpdateCheck(params: {
   const stop = () => {
     stopped = true;
     return (stopPromise ??= (async () => {
-      // Fence immediately; a lazy factory that finishes later stops its own
-      // owner below. Never join the post-ready barrier during failed startup.
-      const cleanup = Promise.all([lifecycle.stop(), runWatcher?.stop(), owner?.stop()]);
-      await ownerReady;
-      await cleanup;
-      await initialization;
+      await Promise.all([lifecycle.stop(), runWatcher?.stop()]);
     })());
   };
 
@@ -125,58 +115,63 @@ export function createDeferredGatewayUpdateCheck(params: {
       if (stopped || params.isClosing?.()) {
         return;
       }
-      ownerReady = (async () => {
+      // Own admitted module loading and startup, but never the unreleased ready barrier.
+      await lifecycle.run(async (signal) => {
+        let startUpdateChecks: typeof startGatewayUpdateChecks;
         try {
-          owner = await params.createUpdateCheck({
-            lifecycle,
-            getConfig: params.getConfig,
-            applyRemoteCatalogUpdate: (signal) =>
-              withPluginRuntimeRegistryScope(params.getPluginRegistry(), () =>
-                applyRemoteModelCatalogUpdate(params.getConfig, signal),
-              ),
-            onUpdateRunCreated: wakeUpdateRunWatcher,
-            log: params.log,
-            isNixMode: params.isNixMode,
-            ...(params.activeWorkInspectors
-              ? { activeWorkInspectors: params.activeWorkInspectors }
-              : {}),
-            onUpdateAvailableChange: lifecycle.onUpdateAvailableChange,
-            onUpdateScheduleChange: lifecycle.onUpdateScheduleChange,
-          });
+          startUpdateChecks = await params.loadUpdateChecks();
         } catch (err) {
           if (!stopped) {
             params.log.warn(`gateway update check failed to initialize: ${String(err)}`);
           }
           return;
         }
-        if (stopped || params.isClosing?.()) {
-          await owner.stop();
+        if (signal.aborted || params.isClosing?.()) {
           return;
         }
-        const updateCheck = owner;
-        initialization = (async () => {
-          const result = await updateCheck.initialize();
-          if (result.status.error) {
-            throw new Error(result.status.error.message);
-          }
-        })().catch((err: unknown) => {
-          if (!stopped) {
-            params.log.warn(`gateway update status failed to initialize: ${String(err)}`);
-          }
-        });
-      })();
-      await ownerReady;
-      await nextTurn();
-      if (!stopped && !params.isClosing?.()) {
-        await runWithGatewayIndependentRootWorkAdmission(async () => {
-          if (stopped || params.isClosing?.()) {
-            return;
-          }
-          await measureStartup(params.startupTrace, "post-attach.update-check", () =>
-            owner?.start(),
+        void lifecycle
+          .initialize()
+          .then((result) => {
+            if (result.status.error) {
+              throw new Error(result.status.error.message);
+            }
+          })
+          .catch((err: unknown) => {
+            if (!stopped) {
+              params.log.warn(`gateway update status failed to initialize: ${String(err)}`);
+            }
+          });
+        await nextTurn();
+        if (!stopped && !params.isClosing?.()) {
+          await runWithGatewayIndependentRootWorkAdmission(
+            async () => {
+              if (signal.aborted || params.isClosing?.()) {
+                return;
+              }
+              await measureStartup(params.startupTrace, "post-attach.update-check", () =>
+                startUpdateChecks({
+                  lifecycle,
+                  getConfig: params.getConfig,
+                  applyRemoteCatalogUpdate: (updateSignal) =>
+                    withPluginRuntimeRegistryScope(params.getPluginRegistry(), () =>
+                      applyRemoteModelCatalogUpdate(params.getConfig, updateSignal),
+                    ),
+                  onUpdateRunCreated: wakeUpdateRunWatcher,
+                  log: params.log,
+                  isNixMode: params.isNixMode,
+                  ...(params.activeWorkInspectors
+                    ? { activeWorkInspectors: params.activeWorkInspectors }
+                    : {}),
+                  onUpdateAvailableChange: lifecycle.onUpdateAvailableChange,
+                  onUpdateScheduleChange: lifecycle.onUpdateScheduleChange,
+                }),
+              );
+            },
+            "startup:update-check",
+            signal,
           );
-        }, "startup:update-check");
-      }
+        }
+      });
     })().catch((err: unknown) => {
       if (!stopped) {
         params.log.warn(`gateway update check readiness wait failed: ${String(err)}`);

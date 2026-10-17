@@ -1,10 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import {
-  PREPARATION_KEY,
-  usePreparedPoolFixture,
-  type PoolOptions,
-} from "./prepared-pool.test-support.js";
+import { usePreparedPoolFixture, type PoolOptions } from "./prepared-pool.test-support.js";
 
 describe("prepared pool retention and source admission", () => {
   const fixture = usePreparedPoolFixture();
@@ -143,7 +139,6 @@ describe("prepared pool retention and source admission", () => {
         return {
           providerId: fixture.provider.id,
           profileSnapshot: fixture.profile(),
-          preparationKey: PREPARATION_KEY,
         };
       });
       const reconcile = vi.fn<PoolOptions["reconcile"]>(async () => {});
@@ -249,7 +244,6 @@ describe("prepared pool retention and source admission", () => {
         return {
           providerId: fixture.provider.id,
           profileSnapshot: fixture.profile(projectKey),
-          preparationKey: PREPARATION_KEY,
         };
       },
     });

@@ -60,15 +60,14 @@ export function createPlacementLifecycleWorkerOps(runtime: {
         runtime.now?.() ??
         (command.type === "workerPlacements.startDispatch" ? Date.now() : undefined),
     };
-    const captured = structuredClone(command);
-    captured.input.sessionId = required(captured.input.sessionId, "session id");
+    command.input.sessionId = required(command.input.sessionId, "session id");
     const readReceipt = (facts: unknown): PlacementLifecycleReceipt | undefined => {
-      if (!isReceipt(facts) || facts.sessionId !== captured.input.sessionId) {
+      if (!isReceipt(facts) || facts.sessionId !== command.input.sessionId) {
         return undefined;
       }
       return facts;
     };
-    const dispatch = captured.type === "workerPlacements.startDispatch";
+    const dispatch = command.type === "workerPlacements.startDispatch";
     let newSource: WorkerSessionPlacementRecord | undefined;
     const mutation = createPlacementWorkerMutation<PlacementLifecycleReceipt>({
       context,
@@ -86,7 +85,7 @@ export function createPlacementLifecycleWorkerOps(runtime: {
           const facts = request.facts;
           if (
             !isReceipt(facts) ||
-            facts.sessionId !== captured.input.sessionId ||
+            facts.sessionId !== command.input.sessionId ||
             !facts.placement
           ) {
             throw new Error("Worker placement move admission has a different source");
@@ -106,7 +105,7 @@ export function createPlacementLifecycleWorkerOps(runtime: {
         if (
           facts.joined ||
           facts.changed === false ||
-          (captured.type === "workerPlacements.bindPrepared" && !facts.placement)
+          (command.type === "workerPlacements.bindPrepared" && !facts.placement)
         ) {
           return undefined;
         }
@@ -154,13 +153,13 @@ export function createPlacementLifecycleWorkerOps(runtime: {
         return readReceipt(facts);
       },
       publish(receipt) {
-        if (captured.type === "workerPlacements.retire") {
+        if (command.type === "workerPlacements.retire") {
           runtime.onRetired(receipt.sessionId);
         }
         if (
           receipt.changed === true ||
           receipt.moveRemoved ||
-          captured.type === "workerPlacements.completeMove"
+          command.type === "workerPlacements.completeMove"
         ) {
           sessionChanges.emit({ all: true, scope: "worker-placements" });
         }
@@ -169,7 +168,7 @@ export function createPlacementLifecycleWorkerOps(runtime: {
         }
       },
     });
-    return mutation.run((scope) => scope.execute(captured));
+    return mutation.run((scope) => scope.execute(command));
   };
   const placement = (receipt: PlacementLifecycleReceipt) => {
     if (!receipt.placement) {

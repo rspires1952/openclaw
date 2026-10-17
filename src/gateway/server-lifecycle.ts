@@ -37,7 +37,7 @@ import { createGatewayCronReconciliation } from "./server-cron-reconciled.js";
 import { createGatewayDiagnosticsConfigurator } from "./server-diagnostics.js";
 import { applyGatewayLaneConcurrency, resolveGatewayLaneConcurrency } from "./server-lanes.js";
 import { createGatewayServerLiveState } from "./server-live-state.js";
-import { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
+import { createGatewayPluginRuntimeState } from "./server-plugin-runtime-state.js";
 import type { GatewayCloseOptions } from "./server-public.js";
 import { GatewayRequestEntryLifetime } from "./server-request-entry.js";
 import type { prepareGatewayKernelState } from "./server-runtime-state-prepare.js";
@@ -235,7 +235,7 @@ export async function prepareGatewayLifecycle(params: {
     gatewayMethods: listActiveGatewayMethods(pluginRuntime.baseGatewayMethods),
   });
   const runtimeState = runtimeStateRef.current;
-  const pluginRuntimeGeneration = createGatewayPluginRuntimeGeneration({
+  const pluginRuntimeState = createGatewayPluginRuntimeState({
     getServices: () => runtimeState.pluginServices,
     setServices: (services) => {
       runtimeState.pluginServices = services;
@@ -246,7 +246,7 @@ export async function prepareGatewayLifecycle(params: {
   );
   // Kernel methods are the only writers for readiness and advertised-method state.
   const kernel = {
-    pluginRuntimeGeneration,
+    pluginRuntimeState,
     pluginMetadata: params.pluginMetadata,
     setDispatchReady: (ready: boolean) => {
       startupState.dispatchReady = ready;

@@ -163,7 +163,7 @@ describe("worker placement workspace journal", () => {
     }
   });
 
-  it("captures streamed journal bytes and owner before asynchronous admission", async () => {
+  it("persists streamed journal bytes with the submitted owner", async () => {
     const { owner } = await seedJournal();
     const journal = await store.loadWorkspaceReconciliation(owner);
     assert(journal, "expected journal");
@@ -175,8 +175,6 @@ describe("worker placement workspace journal", () => {
     const requestedOwner = { ...owner };
     const pending = store.beginWorkspaceReconciliation(requestedOwner, journal);
     requestedOwner.ownerEpoch += 1;
-    journal.basePack.fill(0);
-    journal.temporaryNonce = "0".repeat(32);
     await pending;
     const captured = await store.loadWorkspaceReconciliation(owner);
     expect(captured).toBeDefined();

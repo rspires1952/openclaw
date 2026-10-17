@@ -11,7 +11,7 @@ import { resolveOpenClawPackageRoot } from "./openclaw-root.js";
 import { createGatewayUpdateLifecycle } from "./update-check-lifecycle.js";
 import { checkUpdateStatus } from "./update-check.js";
 import { createDevGitStatus } from "./update-startup-git.test-support.js";
-import { createGatewayUpdateCheck, resetUpdateAvailableStateForTest } from "./update-startup.js";
+import { resetUpdateAvailableStateForTest, startGatewayUpdateChecks } from "./update-startup.js";
 import { getUpdateSchedule } from "./update-status-state.js";
 
 vi.mock("./openclaw-root.js", async (original) => ({
@@ -69,15 +69,15 @@ it("returns cleanup before slow dev git discovery schedules a campaign", async (
   let checking: ReturnType<typeof clock.advanceBy> = undefined;
 
   try {
-    const check = createGatewayUpdateCheck({
-      lifecycle: createGatewayUpdateLifecycle(scheduler),
+    const lifecycle = createGatewayUpdateLifecycle(scheduler);
+    stop = lifecycle.stop;
+    startGatewayUpdateChecks({
+      lifecycle,
       getConfig: () => ({ update: { channel: "dev", auto: { enabled: true } } }),
       log: { info: vi.fn() },
       isNixMode: false,
       applyRemoteCatalogUpdate: async () => "unchanged",
     });
-    stop = check.stop;
-    check.start();
     checking = clock.advanceBy(0);
 
     expect(stop).toEqual(expect.any(Function));

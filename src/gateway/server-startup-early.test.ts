@@ -7,7 +7,6 @@ import {
   createGatewaySchedulerClock,
   createTestGatewayScheduler,
 } from "../test-utils/gateway-scheduler-clock.js";
-import { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
 import { runGatewayCloseSteps } from "./server-shutdown.js";
 import { createGatewayMaintenanceStateForTest } from "./test-helpers.maintenance-state.js";
 
@@ -103,10 +102,6 @@ function earlyRuntimeInput(
     logDiscovery: log,
     nodeRegistry: {} as never,
     swapDiscovery: () => null,
-    pluginRuntimeClaim: createGatewayPluginRuntimeGeneration({
-      getServices: () => null,
-      setServices: () => {},
-    }).currentClaim(),
     maintenance: maintenanceState,
     broadcast: maintenanceState.broadcast,
     scheduler,
@@ -474,6 +469,5 @@ describe("startGatewayEarlyRuntime", () => {
     expect(discoveryParams.tailscaleMode).toBe("serve");
     expect(discoveryParams.discovery?.mdns?.mode).toBe("full");
     expect(discoveryParams.gatewayDiscoveryServices).toEqual([service]);
-    expect(discoveryParams.pluginRuntimeClaim).toBe(input.pluginRuntimeClaim);
   });
 });

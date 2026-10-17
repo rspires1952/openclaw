@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { expect, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
+import { currentUpdateCheckLifecycle } from "../infra/update-check-lifecycle.js";
 import { createHookRunner } from "../plugins/hooks.js";
 import type { createPluginRegistryOwner } from "../plugins/runtime.js";
 import type { OpenClawPluginApi } from "../plugins/types.js";
@@ -14,7 +15,7 @@ import type {
   TranscriptStartRequest,
 } from "../transcripts/provider-types.js";
 import type { reloadGatewayPlugins } from "./server-plugin-reload.js";
-import type { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
+import type { createGatewayPluginRuntimeState } from "./server-plugin-runtime-state.js";
 import { startGatewayPostAttachRuntime } from "./server-startup-post-attach.js";
 
 export async function startTranscriptReloadFixtureSidecars(
@@ -22,7 +23,7 @@ export async function startTranscriptReloadFixtureSidecars(
     runtime: Parameters<typeof reloadGatewayPlugins>[0]["runtime"];
     getConfig: () => OpenClawConfig;
     registryOwner: ReturnType<typeof createPluginRegistryOwner>;
-    owner: ReturnType<typeof createGatewayPluginRuntimeGeneration>;
+    owner: ReturnType<typeof createGatewayPluginRuntimeState>;
   },
   workspaceDir: string,
   log: Parameters<typeof startGatewayPostAttachRuntime>[0]["logHooks"],
@@ -73,7 +74,6 @@ export async function startTranscriptReloadFixtureSidecars(
       logChannels: log,
       unlockStartupMethods: () => {},
       waitForPostReadyWork,
-      pluginRuntimeClaim: fixture.owner.currentClaim(),
       getCurrentPluginRegistry: () => fixture.registryOwner.registry,
       getCurrentPluginServices: () => fixture.owner.currentServices() ?? null,
       onPostReadySidecars: runtime.runtimeState.postReadySidecars.publish,
@@ -88,15 +88,14 @@ export async function startTranscriptReloadFixtureSidecars(
       createHookRunner,
       logGatewayStartup: () => {},
       refreshLatestUpdateRestartSentinel: async () => null,
-      createGatewayUpdateCheck: () => ({
-        initialize: async () => ({
+      loadUpdateChecks: () => {
+        currentUpdateCheckLifecycle().installStatus = {
           root: null,
           status: { root: null, installKind: "unknown", packageManager: "unknown" },
           installReceipt: null,
-        }),
-        start: () => {},
-        stop: async () => {},
-      }),
+        };
+        return () => {};
+      },
       startGatewaySidecars: async () => 0,
       warmSystemCa: async () => {},
       loadSubagentRegistryActivation: () => () => {},

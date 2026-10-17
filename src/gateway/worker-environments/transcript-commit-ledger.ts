@@ -24,8 +24,6 @@ export function createWorkerTranscriptCommitStore(
     readReceipt: (facts: unknown) => WorkerTranscriptCommitOperations[Key]["output"] | undefined,
     assertCurrent?: () => void,
   ): Promise<WorkerTranscriptCommitOperations[Key]["output"]> => {
-    // Capture caller-owned payloads before admission can yield to another operation.
-    const captured = structuredClone(command);
     return createPlacementWorkerMutation({
       context,
       label: "Worker transcript ledger",
@@ -33,7 +31,7 @@ export function createWorkerTranscriptCommitStore(
       assertCurrent,
       stageCommit: () => undefined,
       readReceipt,
-    }).run((scope) => scope.execute(captured));
+    }).run((scope) => scope.execute(command));
   };
   return {
     begin(input: WorkerTranscriptCommitInput, assertCurrent?: () => void) {

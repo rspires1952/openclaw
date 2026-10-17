@@ -157,12 +157,7 @@ export function createPlacementWorkspaceJournalWorkerOps(runtime: {
         metadataBytes + journal.basePack.byteLength,
       );
       try {
-        const captured = structuredClone(input);
-        await execute(
-          { type: "placementJournals.begin", input: captured },
-          assertCurrent,
-          preparation,
-        );
+        await execute({ type: "placementJournals.begin", input }, assertCurrent, preparation);
       } finally {
         preparation.release();
       }

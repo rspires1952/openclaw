@@ -5,9 +5,23 @@ import type {
 } from "./placement-dispatch-failure.js";
 import type { WorkerSessionPlacementProjection } from "./placement-read-projection.types.js";
 import type { WithPreparedWorkerWorkspaceRecovery } from "./placement-reclaim-contract.js";
-import type { WorkerSessionPlacementIdentity, WorkerSessionTurnClaim } from "./placement-record.js";
+import type {
+  WorkerPlacementExecutionMode,
+  WorkerSessionPlacementIdentity,
+  WorkerSessionTurnClaim,
+} from "./placement-record.js";
 import type { WorkerSessionWorkspace } from "./session-workspace.js";
 import type { WorkerWorkspaceOperationCoordinator } from "./workspace-operation-coordinator.js";
+
+export type WorkerPlacementRecoveryBarrier = (
+  params: WorkerSessionPlacementIdentity & {
+    executionMode: WorkerPlacementExecutionMode;
+    environmentId: string;
+    expectedGeneration: number;
+    signal?: AbortSignal;
+    run: (workspace: WorkerSessionWorkspace, assertCurrent?: () => void) => Promise<void>;
+  },
+) => Promise<void>;
 
 export type WorkerPlacementRecoveryAdmission = (
   sessionIds: readonly string[],

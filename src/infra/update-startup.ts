@@ -595,7 +595,7 @@ async function runGatewayUpdateCheckOwned(
   await writeState(nextState);
 }
 
-export function createGatewayUpdateCheck(params: {
+export function startGatewayUpdateChecks(params: {
   lifecycle: UpdateCheckLifecycle;
   getConfig: () => OpenClawConfig;
   applyRemoteCatalogUpdate: (signal: AbortSignal) => Promise<RemoteCatalogPublicationResult>;
@@ -605,61 +605,49 @@ export function createGatewayUpdateCheck(params: {
   onUpdateScheduleChange?: (schedule: UpdateScheduleState) => void;
   onUpdateRunCreated?: () => void;
   activeWorkInspectors?: Partial<GatewayActiveWorkInspectors>;
-}): {
-  initialize: () => ReturnType<typeof resolveStartupInstallStatus>;
-  start: () => void;
-  stop: () => Promise<void>;
-} {
+}): void {
   const { lifecycle } = params;
-  let started = false;
-  return {
-    initialize: lifecycle.initialize,
-    stop: lifecycle.stop,
-    start: () => {
-      if (started || lifecycle.signal.aborted) {
-        return;
+  if (lifecycle.signal.aborted) {
+    return;
+  }
+  lifecycle.schedule("update.check", async () => {
+    try {
+      await runGatewayUpdateCheck(params, lifecycle);
+    } catch {
+      // Discovery failures must not crash or retire the Gateway update loop.
+    }
+    return resolveCheckIntervalMs(params.getConfig(), getUpdateSchedule()?.install?.kind);
+  });
+  lifecycle.schedule("update.remote-model-catalog", async () => {
+    let nextCheckInMs = REMOTE_MODEL_CATALOG_TTL_MS;
+    try {
+      const result = await refreshRemoteModelCatalog({
+        config: params.getConfig(),
+        signal: lifecycle.signal,
+      });
+      if (lifecycle.signal.aborted) {
+        return REMOTE_MODEL_CATALOG_TTL_MS;
       }
-      started = true;
-      lifecycle.schedule("update.check", async () => {
-        try {
-          await runGatewayUpdateCheck(params, lifecycle);
-        } catch {
-          // Discovery failures must not crash or retire the Gateway update loop.
+      nextCheckInMs =
+        result.status === "fresh" ? result.nextCheckInMs : REMOTE_MODEL_CATALOG_TTL_MS;
+      if (result.status === "error") {
+        params.log.info(
+          "remote model catalog refresh failed; next check in 6 hours, or run openclaw models refresh",
+          { error: result.error },
+        );
+      } else if (result.status !== "disabled") {
+        const state = await params.applyRemoteCatalogUpdate(lifecycle.signal);
+        if (state === "published") {
+          params.log.info("remote model catalog applied");
+        } else if (state === "superseded") {
+          params.log.info("remote model catalog check superseded; deferred to the next check");
         }
-        return resolveCheckIntervalMs(params.getConfig(), getUpdateSchedule()?.install?.kind);
-      });
-      lifecycle.schedule("update.remote-model-catalog", async () => {
-        let nextCheckInMs = REMOTE_MODEL_CATALOG_TTL_MS;
-        try {
-          const result = await refreshRemoteModelCatalog({
-            config: params.getConfig(),
-            signal: lifecycle.signal,
-          });
-          if (lifecycle.signal.aborted) {
-            return REMOTE_MODEL_CATALOG_TTL_MS;
-          }
-          nextCheckInMs =
-            result.status === "fresh" ? result.nextCheckInMs : REMOTE_MODEL_CATALOG_TTL_MS;
-          if (result.status === "error") {
-            params.log.info(
-              "remote model catalog refresh failed; next check in 6 hours, or run openclaw models refresh",
-              { error: result.error },
-            );
-          } else if (result.status !== "disabled") {
-            const state = await params.applyRemoteCatalogUpdate(lifecycle.signal);
-            if (state === "published") {
-              params.log.info("remote model catalog applied");
-            } else if (state === "superseded") {
-              params.log.info("remote model catalog check superseded; deferred to the next check");
-            }
-          }
-        } catch (error) {
-          if (!lifecycle.signal.aborted) {
-            params.log.info("remote model catalog check failed", { error: String(error) });
-          }
-        }
-        return nextCheckInMs;
-      });
-    },
-  };
+      }
+    } catch (error) {
+      if (!lifecycle.signal.aborted) {
+        params.log.info("remote model catalog check failed", { error: String(error) });
+      }
+    }
+    return nextCheckInMs;
+  });
 }

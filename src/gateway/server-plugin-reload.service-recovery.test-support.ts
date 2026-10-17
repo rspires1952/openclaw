@@ -87,7 +87,6 @@ export function registerPluginServiceRecoveryTests(createRecoveryFixture: Recove
         await vi.waitFor(() => expect(starts).toEqual(["default"]));
         const original = getPluginInstance(fixture.previousRegistry.plugins[0]!);
         assert(original);
-        const generation = fixture.owner.currentClaim();
         vi.useFakeTimers();
         const pending = observeSettlement(fixture.reload().catch((error: unknown) => error));
         try {
@@ -128,7 +127,6 @@ export function registerPluginServiceRecoveryTests(createRecoveryFixture: Recove
           expect(await pending.promise).toMatchObject({
             details: { committed: false, phase: "drain" },
           });
-          expect(fixture.owner.currentClaim()).toEqual(generation);
           expect(fixture.firstStop).toHaveBeenCalledOnce();
           expect(laterStop).toHaveBeenCalledOnce();
           expect(fixture.siblingStop).not.toHaveBeenCalled();
@@ -197,7 +195,6 @@ export function registerPluginServiceRecoveryTests(createRecoveryFixture: Recove
           vi.spyOn(manager, "stopChannel").mockRejectedValueOnce(permanent);
         }
         const original = getPluginInstance(fixture.previousRegistry.plugins[0]!);
-        const generation = fixture.owner.currentClaim();
         vi.useFakeTimers();
         const pending = observeSettlement(fixture.reload().catch((error: unknown) => error));
         try {
@@ -214,7 +211,6 @@ export function registerPluginServiceRecoveryTests(createRecoveryFixture: Recove
           await vi.advanceTimersByTimeAsync(70_000);
           expect(fixture.owner.getReloadStatus()?.phase).toBe("failed");
           expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
-          expect(fixture.owner.currentClaim()).toEqual(generation);
           expect(fixture.candidates).toHaveLength(0);
           expect(registrations).toBe(1);
           expect(fixture.firstStart).toHaveBeenCalledOnce();

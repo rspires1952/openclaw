@@ -25,12 +25,11 @@ export function createWorkerInferenceStore(
     command: { type: Key; input: Operations[Key]["input"] },
     assertCurrent?: () => void,
   ): Promise<Operations[Key]["output"]> => {
-    const captured = structuredClone(command);
     const check = () => {
       context.admission.assertCurrent();
       assertCurrent?.();
     };
-    return runOpenClawStateWorkerOperation(context, (scope) => scope.execute(captured), {
+    return runOpenClawStateWorkerOperation(context, (scope) => scope.execute(command), {
       assertCurrent: check,
       createAdmission: createSqliteWorkerWriteAdmission(check, [context.admission.databasePath]),
     });

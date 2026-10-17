@@ -12,7 +12,7 @@ import {
 import type { GatewayActiveWorkInspectors } from "../infra/gateway-active-work.js";
 import type { GatewayScheduler } from "../infra/gateway-scheduler.js";
 import { hasRestartSentinel } from "../infra/restart-sentinel.js";
-import type { createGatewayUpdateCheck } from "../infra/update-startup.js";
+import type { startGatewayUpdateChecks } from "../infra/update-startup.js";
 import type { PluginHookGatewayCronService } from "../plugins/hook-gateway.types.js";
 import type { createHookRunner } from "../plugins/hooks.js";
 import type { PluginManifestRecord } from "../plugins/manifest-registry.js";
@@ -33,7 +33,6 @@ import type { GatewayBroadcastFn, GatewayBroadcastToConnIdsFn } from "./server-b
 import type { GatewayControlUiRootLifecycle } from "./server-control-ui-root.js";
 import type { GatewayRecoveryRuntime } from "./server-instance-runtime.types.js";
 import type { GatewayClient, GatewayContextResolver } from "./server-methods/shared-types.js";
-import type { GatewayPluginRuntimeClaim } from "./server-plugin-runtime-generation.js";
 import {
   isChannelStartupSuppressedByEnvironment,
   type GatewaySidecarStartupMode,
@@ -208,28 +207,25 @@ export async function startGatewaySidecars(
     (async () => {
       // Agent RPC remains available when transports are disabled. Publish configured/static facts
       // before accepting work; live provider catalogs remain advisory.
-      if ((await params.pluginRuntimeClaim?.waitForUnblocked()) !== false) {
-        await measureStartup(params.startupTrace, "sidecars.model-runtime", () =>
-          withPluginRuntimeRegistryScope(params.pluginRegistry, () =>
-            publishConfiguredModelRuntimeSnapshots({
-              cfg: params.cfg,
-              getConfig: () =>
-                measureStartup(params.startupTrace, "sidecars.model-auth", () =>
-                  hydrateConfiguredExternalCliAuth({
-                    getConfig: getModelRuntimeConfig,
-                    log: params.log,
-                  }),
-                ),
-              isCurrent: params.pluginRuntimeClaim?.isCurrent,
-              ...(params.pluginMetadataSnapshot
-                ? { pluginMetadataSnapshot: params.pluginMetadataSnapshot }
-                : {}),
-              workspaceDir: params.defaultWorkspaceDir,
-              startupTrace: params.startupTrace,
-            }),
-          ),
-        );
-      }
+      await measureStartup(params.startupTrace, "sidecars.model-runtime", () =>
+        withPluginRuntimeRegistryScope(params.pluginRegistry, () =>
+          publishConfiguredModelRuntimeSnapshots({
+            cfg: params.cfg,
+            getConfig: () =>
+              measureStartup(params.startupTrace, "sidecars.model-auth", () =>
+                hydrateConfiguredExternalCliAuth({
+                  getConfig: getModelRuntimeConfig,
+                  log: params.log,
+                }),
+              ),
+            ...(params.pluginMetadataSnapshot
+              ? { pluginMetadataSnapshot: params.pluginMetadataSnapshot }
+              : {}),
+            workspaceDir: params.defaultWorkspaceDir,
+            startupTrace: params.startupTrace,
+          }),
+        ),
+      );
     })(),
     // Readiness owns process-stable request imports so the first turn and connection do not.
     measureStartup(params.startupTrace, "sidecars.reply-runtime", async () => {
@@ -466,9 +462,7 @@ type GatewayPostAttachRuntimeDeps = {
   refreshLatestUpdateRestartSentinel: (
     env?: NodeJS.ProcessEnv,
   ) => Awaitable<ReturnType<typeof prepareLatestUpdateRestartSentinel>>;
-  createGatewayUpdateCheck: (
-    ...args: Parameters<typeof createGatewayUpdateCheck>
-  ) => Awaitable<ReturnType<typeof createGatewayUpdateCheck>>;
+  loadUpdateChecks: () => Awaitable<typeof startGatewayUpdateChecks>;
   startGatewaySidecars: typeof startGatewaySidecars;
   warmSystemCa: typeof warmMacOSSystemCaOffMainThread;
   loadSubagentRegistryActivation: () => Awaitable<
@@ -483,8 +477,8 @@ const defaultGatewayPostAttachRuntimeDeps: GatewayPostAttachRuntimeDeps = {
     (await import("./server-startup-log.js")).logGatewayStartup(params),
   refreshLatestUpdateRestartSentinel: async (env) =>
     (await import("./server-update-sentinel.js")).prepareLatestUpdateRestartSentinel(env),
-  createGatewayUpdateCheck: async (...args) =>
-    (await import("../infra/update-startup.js")).createGatewayUpdateCheck(...args),
+  loadUpdateChecks: async () =>
+    (await import("../infra/update-startup.js")).startGatewayUpdateChecks,
   startGatewaySidecars,
   warmSystemCa: beginMacOSSystemCaWarmupOnce,
   loadSubagentRegistryActivation: async () =>
@@ -542,10 +536,8 @@ export async function startGatewayPostAttachRuntime(
       gatewayMethods: string[];
       retireGatewayRuntimeBindings?: () => void;
     }) => Awaitable<boolean>;
-    pluginRuntimeClaim?: GatewayPluginRuntimeClaim;
     getCurrentPluginRegistry?: () => PluginRegistry;
     getCurrentPluginServices?: () => PluginServicesHandle | null;
-    getCurrentPluginMetadataSnapshot?: () => PluginMetadataSnapshot | undefined;
     getCronService?: () => PluginServiceCronHost | null | undefined;
     onChannelsStarted?: () => Awaitable<void>;
     onPluginServices?: (pluginServices: PluginServicesHandle | null) => void;
@@ -615,8 +607,7 @@ export async function startGatewayPostAttachRuntime(
       }
       pluginRegistry = current;
     };
-    await params.pluginRuntimeClaim?.waitForUnblocked();
-    if (params.isClosing?.() || params.pluginRuntimeClaim?.isCurrent() === false) {
+    if (params.isClosing?.()) {
       return await disposeUnattached();
     }
     let published: boolean | undefined;
@@ -694,7 +685,7 @@ export async function startGatewayPostAttachRuntime(
   const updateCheck = createDeferredGatewayUpdateCheck({
     scheduler: params.scheduler,
     startupTrace: params.startupTrace,
-    createUpdateCheck: runtimeDeps.createGatewayUpdateCheck,
+    loadUpdateChecks: runtimeDeps.loadUpdateChecks,
     getConfig: params.getConfig,
     getPluginRegistry: () => params.getCurrentPluginRegistry?.() ?? pluginRegistry,
     log: params.log,
@@ -708,12 +699,6 @@ export async function startGatewayPostAttachRuntime(
   // Startup failure can precede publication of the post-attach return handle.
   params.onGatewayLifetimeSidecars(updateCheck);
 
-  const reportPluginServices = (pluginServices: PluginServicesHandle | null) => {
-    if (params.pluginRuntimeClaim?.isCurrent() === false) {
-      return;
-    }
-    params.onPluginServices?.(pluginServices);
-  };
   const startSidecars = () =>
     params.minimalTestGateway
       ? startStartupLog().then(() => pluginRegistry)
@@ -765,19 +750,15 @@ export async function startGatewayPostAttachRuntime(
           const loaderStatsBefore = getPluginModuleLoaderStats();
           const postReadySidecarCount = await (async () => {
             try {
-              const startupRuntimeCurrent = params.pluginRuntimeClaim?.isCurrent() !== false;
-              const pluginMetadataSnapshot = startupRuntimeCurrent
-                ? params.pluginMetadataSnapshot
-                : params.getCurrentPluginMetadataSnapshot?.();
               return await measureStartup(params.startupTrace, "sidecars.total", () =>
                 runtimeDeps.startGatewaySidecars({
                   scheduler: params.scheduler,
                   restartSentinelContext,
-                  cfg: startupRuntimeCurrent
-                    ? params.gatewayPluginConfigAtStart
-                    : params.getConfig(),
+                  cfg: params.gatewayPluginConfigAtStart,
                   getModelRuntimeConfig: params.getConfig,
-                  ...(pluginMetadataSnapshot ? { pluginMetadataSnapshot } : {}),
+                  ...(params.pluginMetadataSnapshot
+                    ? { pluginMetadataSnapshot: params.pluginMetadataSnapshot }
+                    : {}),
                   pluginRegistry,
                   defaultWorkspaceDir: params.defaultWorkspaceDir,
                   deps: params.deps,
@@ -791,19 +772,15 @@ export async function startGatewayPostAttachRuntime(
                   logChannels: params.logChannels,
                   startupTrace: params.startupTrace,
                   onChannelsStarted: params.onChannelsStarted,
-                  onPluginServices: reportPluginServices,
+                  onPluginServices: params.onPluginServices,
                   onPostReadySidecars: params.onPostReadySidecars,
                   shouldCreatePostReadySidecars: () => params.isClosing?.() !== true,
-                  shouldStartPluginServices: (pendingOwner) => {
+                  shouldStartPluginServices: () => {
                     const current = params.getCurrentPluginServices?.();
                     return (
-                      params.isClosing?.() !== true &&
-                      (current === undefined || current === null || current === pendingOwner)
+                      params.isClosing?.() !== true && (current === undefined || current === null)
                     );
                   },
-                  ...(params.pluginRuntimeClaim
-                    ? { pluginRuntimeClaim: params.pluginRuntimeClaim }
-                    : {}),
                   broadcastPluginEvent: params.broadcastPluginEvent,
                   startupOutcomes,
                   internalHookSelection,
@@ -878,13 +855,9 @@ export async function startGatewayPostAttachRuntime(
             ...scheduleGatewayPrewarm(params),
             ...(mainSessionRecoverySidecar ? [mainSessionRecoverySidecar] : []),
           ];
-          const transcriptsConfig =
-            params.pluginRuntimeClaim?.isCurrent() === false
-              ? params.getConfig()
-              : params.gatewayPluginConfigAtStart;
           newGatewayLifetimeSidecars.push(
             scheduleTranscriptsSidecar({
-              cfg: transcriptsConfig,
+              cfg: params.gatewayPluginConfigAtStart,
               getConfig: params.getConfig,
               getPluginRegistry: () => params.getCurrentPluginRegistry?.() ?? pluginRegistry,
               lifetimeSignal: getGatewayContextLifetime(params.resolveGatewayContext).signal,

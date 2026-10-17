@@ -73,7 +73,6 @@ describe("authenticated human prepared-pool demand", () => {
       return {
         providerId: fixture.provider.id,
         profileSnapshot,
-        preparationKey,
       };
     });
     const owner = fixture.pool({
@@ -245,7 +244,6 @@ describe("authenticated human prepared-pool demand", () => {
           return {
             providerId: fixture.provider.id,
             profileSnapshot: fixture.profile(healthyKey),
-            preparationKey: PREPARATION_KEY,
           };
         }
         entered.resolve();

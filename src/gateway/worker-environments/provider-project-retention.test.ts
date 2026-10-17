@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createWorkerPreparationIdentity } from "./preparation-identity.js";
+import { readWorkerPreparation } from "./preparation-identity.schema.js";
 import { PROJECT_KEY, usePreparedPoolFixture } from "./prepared-pool.test-support.js";
 import { createWorkerProviderIntent } from "./provider-intent.js";
 import { prepareWorkerProviderProject } from "./provider-project-preparation.js";
@@ -61,12 +62,13 @@ describe("prepared project retention compatibility", () => {
       setupRecipe: "e".repeat(40),
       runSetupScript: false,
     });
+    const preparedProfile = { ...profileSnapshot, project: { ...project, preparation } };
     const record = await fixture.store.createIntent({
       environmentId: "retained",
       providerId: fixture.provider.id,
       profileId: "development",
       provisionOperationId: "provision:retained",
-      profileSnapshot: { ...profileSnapshot, project: { ...project, preparation } },
+      profileSnapshot: preparedProfile,
     });
     const prepareNodeArtifacts = vi.fn(async () => ({
       artifacts,
@@ -85,6 +87,8 @@ describe("prepared project retention compatibility", () => {
     });
     return {
       record,
+      preparation: readWorkerPreparation(record.profileSnapshot)!,
+      preparedProfile,
       owner,
       project,
       artifacts,
@@ -184,8 +188,8 @@ describe("prepared project retention compatibility", () => {
   });
 
   it("checks canonical retained contents without source admission or an allocation authority", async () => {
-    const { record, owner } = await setup();
-    const retained = await owner.prepareRetention(record, fixture.abort.signal);
+    const { record, preparation, preparedProfile, owner } = await setup();
+    const retained = await owner.prepareRetention(record, preparation, fixture.abort.signal);
     expect(retained).toBeDefined();
     expect(retained!.isCurrent()).toBe(true);
     expect(sourceAdmission).not.toHaveBeenCalled();
@@ -193,7 +197,7 @@ describe("prepared project retention compatibility", () => {
     expect(() =>
       owner.assertPreparedIntentCurrent(record.profileId, {
         providerId: record.providerId,
-        profileSnapshot: record.profileSnapshot,
+        profileSnapshot: preparedProfile,
       }),
     ).toThrow("not owned by this lifecycle");
   });
@@ -201,8 +205,8 @@ describe("prepared project retention compatibility", () => {
   it.each(["provider", "target"])(
     "checks %s compatibility on the next retention pass without external source authority",
     async (mutation) => {
-      const { record, owner } = await setup();
-      const retained = await owner.prepareRetention(record, fixture.abort.signal);
+      const { record, preparation, owner } = await setup();
+      const retained = await owner.prepareRetention(record, preparation, fixture.abort.signal);
       expect(retained).toBeDefined();
       if (mutation === "profile") {
         fixture.developmentProfile.settings = { region: "changed" };
@@ -215,7 +219,9 @@ describe("prepared project retention compatibility", () => {
           arch: "x64",
         });
       }
-      expect(await owner.prepareRetention(record, fixture.abort.signal)).toBeUndefined();
+      expect(
+        await owner.prepareRetention(record, preparation, fixture.abort.signal),
+      ).toBeUndefined();
       expect(sourceAdmission).not.toHaveBeenCalled();
     },
   );
@@ -223,8 +229,8 @@ describe("prepared project retention compatibility", () => {
   it.each(["owner selection", "agent deletion"] as const)(
     "rejects known %s drift while provider observation is unavailable",
     async (mutation) => {
-      const { record, owner, providerFor } = await setup();
-      const retained = await owner.prepareRetention(record, fixture.abort.signal);
+      const { record, preparation, owner, providerFor } = await setup();
+      const retained = await owner.prepareRetention(record, preparation, fixture.abort.signal);
       expect(retained?.isCurrent()).toBe(true);
       providerFor.mockClear().mockImplementation(() => {
         throw new Error("Worker provider registry temporarily unavailable");
@@ -236,15 +242,17 @@ describe("prepared project retention compatibility", () => {
       }
 
       expect(retained?.isCurrent()).toBe(false);
-      expect(await owner.prepareRetention(record, fixture.abort.signal)).toBeUndefined();
+      expect(
+        await owner.prepareRetention(record, preparation, fixture.abort.signal),
+      ).toBeUndefined();
       expect(providerFor).not.toHaveBeenCalled();
       expect(sourceAdmission).not.toHaveBeenCalled();
     },
   );
 
   it("rejects agent removal during lifecycle preparation before preparing artifacts", async () => {
-    const { record, owner, prepareNodeArtifacts } = await setup();
-    const pending = owner.prepareRetention(record, fixture.abort.signal);
+    const { record, preparation, owner, prepareNodeArtifacts } = await setup();
+    const pending = owner.prepareRetention(record, preparation, fixture.abort.signal);
     fixture.config.agents = { entries: { other: {} } };
 
     await expect(pending).resolves.toBeUndefined();
@@ -253,9 +261,9 @@ describe("prepared project retention compatibility", () => {
   });
 
   it("rejects an old runtime fingerprint when reconstructing retention after restart", async () => {
-    const { record, owner, artifacts } = await setup();
+    const { record, preparation, owner, artifacts } = await setup();
     artifacts.workerArchiveSha256 = "1".repeat(64);
-    expect(await owner.prepareRetention(record, fixture.abort.signal)).toBeUndefined();
+    expect(await owner.prepareRetention(record, preparation, fixture.abort.signal)).toBeUndefined();
     expect(sourceAdmission).not.toHaveBeenCalled();
   });
 

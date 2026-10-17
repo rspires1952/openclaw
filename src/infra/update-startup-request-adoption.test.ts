@@ -25,7 +25,7 @@ it.each(["complete", "close"] as const)(
   async (outcome) => {
     const state = await createOpenClawTestState({ label: "update-request-adoption" });
     const {
-      createGatewayUpdateCheck,
+      startGatewayUpdateChecks,
       getUpdateEffectiveChannel,
       initializeGatewayUpdateStatus,
       resetUpdateAvailableStateForTest,
@@ -43,11 +43,10 @@ it.each(["complete", "close"] as const)(
     });
     const channelRequest = getUpdateEffectiveChannel();
     const admissionRequest = initializeGatewayUpdateStatus();
-    let owner: ReturnType<typeof createGatewayUpdateCheck> | undefined;
     let initialization: ReturnType<typeof initializeGatewayUpdateStatus> | undefined;
     try {
       const signal = await started.promise;
-      owner = createGatewayUpdateCheck({
+      startGatewayUpdateChecks({
         lifecycle,
         getConfig: () => ({}),
         applyRemoteCatalogUpdate: async () => "unchanged",
@@ -55,10 +54,10 @@ it.each(["complete", "close"] as const)(
         isNixMode: false,
       });
       expect(signal?.aborted).toBe(false);
-      initialization = owner.initialize();
+      initialization = lifecycle.initialize();
       if (outcome === "close") {
         let stopped = false;
-        const stopping = owner.stop().then(() => {
+        const stopping = lifecycle.stop().then(() => {
           stopped = true;
         });
         expect(signal?.aborted).toBe(true);
@@ -81,7 +80,12 @@ it.each(["complete", "close"] as const)(
       expect(checkUpdateStatus).toHaveBeenCalledOnce();
     } finally {
       probe.resolve(status);
-      await Promise.allSettled([channelRequest, admissionRequest, initialization, owner?.stop()]);
+      await Promise.allSettled([
+        channelRequest,
+        admissionRequest,
+        initialization,
+        lifecycle.stop(),
+      ]);
       resetUpdateAvailableStateForTest(scheduler);
       closeOpenClawStateDatabaseForTest();
       await state.cleanup();
@@ -95,7 +99,7 @@ it("aborts and joins early update requests before the post-ready scheduler loads
     await import("../gateway/server-startup-update-check.js");
   const { resolveGatewayUpdateAdmission } =
     await import("../gateway/server-methods/update-admission.js");
-  const { createGatewayUpdateCheck, getUpdateEffectiveChannel, resetUpdateAvailableStateForTest } =
+  const { startGatewayUpdateChecks, getUpdateEffectiveChannel, resetUpdateAvailableStateForTest } =
     await import("./update-startup.js");
   const scheduler = createTestGatewayScheduler();
   resetUpdateAvailableStateForTest(scheduler);
@@ -107,10 +111,10 @@ it("aborts and joins early update requests before the post-ready scheduler loads
     started.resolve(signal);
     return probe.promise;
   });
-  const factory = vi.fn(createGatewayUpdateCheck);
+  const loadUpdateChecks = vi.fn(() => startGatewayUpdateChecks);
   const owner = createDeferredGatewayUpdateCheck({
     scheduler,
-    createUpdateCheck: factory,
+    loadUpdateChecks,
     getConfig: () => ({}),
     getPluginRegistry: () => undefined,
     log: { info: vi.fn(), warn: vi.fn() },
@@ -134,7 +138,7 @@ it("aborts and joins early update requests before the post-ready scheduler loads
     expect(signal?.aborted).toBe(true);
     await Promise.resolve();
     expect(stopped).toBe(false);
-    expect(factory).not.toHaveBeenCalled();
+    expect(loadUpdateChecks).not.toHaveBeenCalled();
     probe.resolve(status);
     const results = await requests;
     expect(results).toEqual([
@@ -144,7 +148,7 @@ it("aborts and joins early update requests before the post-ready scheduler loads
     await stopping;
     expect(stopped).toBe(true);
     expect(checkUpdateStatus).toHaveBeenCalledTimes(2);
-    expect(factory).not.toHaveBeenCalled();
+    expect(loadUpdateChecks).not.toHaveBeenCalled();
   } finally {
     probe.resolve(status);
     await requests;

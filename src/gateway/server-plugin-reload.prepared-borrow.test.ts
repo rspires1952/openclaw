@@ -56,7 +56,7 @@ import * as bootstrap from "./server-plugin-bootstrap.js";
 import { withOperatorToolGatewayAuthority } from "./server-plugin-in-process-dispatch.js";
 import { createContext } from "./server-plugin-in-process-dispatch.test-support.js";
 import { reloadGatewayPlugins } from "./server-plugin-reload.js";
-import { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
+import { createGatewayPluginRuntimeState } from "./server-plugin-runtime-state.js";
 import { refreshModelRuntimeAfterHotReload } from "./server-reload-model-runtime-scope.js";
 import { GatewayRequestEntryLifetime } from "./server-request-entry.js";
 import { createGatewaySidecarStopOwner } from "./server-sidecar-owners.js";
@@ -97,7 +97,7 @@ async function createPublishedPluginFixture(
   config: OpenClawConfig,
   workspaceDir: string,
   logs: Pick<ReturnType<typeof createSubsystemLogger>, "info" | "warn" | "error" | "debug">,
-  services: Parameters<typeof createGatewayPluginRuntimeGeneration>[0] = {
+  services: Parameters<typeof createGatewayPluginRuntimeState>[0] = {
     getServices: () => null,
     setServices() {},
   },
@@ -139,7 +139,7 @@ async function createPublishedPluginFixture(
     pluginRuntime: registryOwner,
     pluginWorkspaceDir: workspaceDir,
     kernel: {
-      pluginRuntimeGeneration: createGatewayPluginRuntimeGeneration(services),
+      pluginRuntimeState: createGatewayPluginRuntimeState(services),
       pluginMetadata: metadata,
       getCronService: () => undefined,
     },

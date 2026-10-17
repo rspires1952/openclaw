@@ -28,11 +28,7 @@ it.for([1, 2])(
   "publishes one remote rows/pricing generation without blocking readers or repricing admitted runs (v%s)",
   { timeout: 120_000 },
   async (schemaVersion, { signal }) => {
-    const createUpdateCheck = updateStartup.createGatewayUpdateCheck;
-    vi.spyOn(updateStartup, "createGatewayUpdateCheck").mockImplementation((params) => ({
-      ...createUpdateCheck(params),
-      start: () => {},
-    }));
+    vi.spyOn(updateStartup, "startGatewayUpdateChecks").mockImplementation(() => {});
     const unexpectedRestart = vi.fn(() => {
       throw new Error("Remote catalog publication unexpectedly requested a Gateway restart");
     });

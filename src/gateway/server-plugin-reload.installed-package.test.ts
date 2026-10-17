@@ -41,7 +41,7 @@ import { withEnvAsync } from "../test-utils/env.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
 import { reloadGatewayPlugins } from "./server-plugin-reload.js";
-import { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
+import { createGatewayPluginRuntimeState } from "./server-plugin-runtime-state.js";
 import { GatewayRequestEntryLifetime } from "./server-request-entry.js";
 import { createGatewaySidecarStopOwner } from "./server-sidecar-owners.js";
 
@@ -273,7 +273,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       config: initialConfig,
       workspaceDir,
     });
-    const owner = createGatewayPluginRuntimeGeneration({
+    const owner = createGatewayPluginRuntimeState({
       getServices: () => currentServices,
       setServices: (handle) => {
         currentServices = handle;
@@ -306,7 +306,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       pluginRuntime: registryOwner,
       pluginWorkspaceDir: workspaceDir,
       kernel: {
-        pluginRuntimeGeneration: owner,
+        pluginRuntimeState: owner,
         pluginMetadata: metadata,
         getCronService: () => runtime.runtimeState.cronState.cron,
       },

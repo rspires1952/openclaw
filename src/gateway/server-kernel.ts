@@ -179,8 +179,7 @@ async function createGatewayKernelWithSdkHost(
         scheduler,
         bootId,
         pluginRegistryOwner: preparedPluginRegistryOwner,
-        getPluginReloadStatus: () =>
-          lifecycleRuntime?.kernel.pluginRuntimeGeneration.getReloadStatus(),
+        getPluginReloadStatus: () => lifecycleRuntime?.kernel.pluginRuntimeState.getReloadStatus(),
         port,
         opts,
         log,
