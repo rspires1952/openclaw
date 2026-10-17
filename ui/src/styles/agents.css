@@ -55,7 +55,7 @@
 
 .agent-identity-editor {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 16px;
   width: 100%;
 }

@@ -25,6 +25,14 @@ it("opens agent avatar selection from the keyboard and respects the busy state",
     expect(popover?.matches(":popover-open")).toBe(true);
     await vi.waitFor(() => expect(popover?.getBoundingClientRect().width).toBeGreaterThan(0));
     const avatarBounds = avatarButton.getBoundingClientRect();
+    const fieldsBounds = container
+      .querySelector<HTMLElement>(".agent-identity-editor__fields")!
+      .getBoundingClientRect();
+    expect(
+      Math.abs(
+        avatarBounds.top + avatarBounds.height / 2 - (fieldsBounds.top + fieldsBounds.height / 2),
+      ),
+    ).toBeLessThanOrEqual(1);
     const popoverBounds = popover!.getBoundingClientRect();
     expect(popoverBounds.width).toBeLessThanOrEqual(480);
     const beside = popoverBounds.left >= avatarBounds.right - 1;
@@ -32,6 +40,11 @@ it("opens agent avatar selection from the keyboard and respects the busy state",
       popoverBounds.top >= avatarBounds.bottom - 1 && popoverBounds.top <= avatarBounds.bottom + 20;
     expect(beside || below).toBe(true);
     expect(popoverBounds.right).toBeLessThanOrEqual(window.innerWidth + 1);
+    expect(
+      [...popover!.querySelectorAll("button")].some(
+        (button) => button.textContent?.trim() === "Reset",
+      ),
+    ).toBe(false);
     await page.getByRole("button", { name: "Upload", exact: true }).click();
     const input = container.querySelector<HTMLInputElement>('input[type="file"]');
     if (!input) {

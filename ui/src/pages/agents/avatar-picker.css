@@ -33,8 +33,7 @@
   border-bottom: 1px solid var(--border);
 }
 
-.avatar-picker__tab,
-.avatar-picker__reset {
+.avatar-picker__tab {
   padding: 8px 12px;
   border: 0;
   border-radius: 20px;
@@ -46,10 +45,6 @@
 .avatar-picker__tab[aria-pressed="true"] {
   background: var(--bg-hover);
   color: var(--text);
-}
-
-.avatar-picker__reset {
-  margin-inline-start: auto;
 }
 
 .avatar-picker__grid {
@@ -192,8 +187,7 @@
     padding: 12px;
   }
 
-  .avatar-picker__tab,
-  .avatar-picker__reset {
+  .avatar-picker__tab {
     padding: 8px;
   }
 }

@@ -141,17 +141,6 @@ export function AvatarPicker(props: AvatarPickerProps) {
               </button>
             )}
           </For>
-          <button
-            type="button"
-            class="avatar-picker__reset"
-            disabled={props.disabled || busy()}
-            onClick={() => {
-              changeMode("bot");
-              void selectPreset("crimson");
-            }}
-          >
-            {t("agents.identity.avatarReset")}
-          </button>
         </div>
         <Show when={mode() === "generate"}>
           <div class="avatar-picker__preview">
