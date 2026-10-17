@@ -304,6 +304,7 @@ export function startManagedGatewayConfigReloader(
     });
 
   let committedRuntimeConfig = params.initialConfig;
+  let configCandidatePending = false;
   const configReloader = startGatewayConfigReloader({
     scheduler: params.scheduler,
     onReloadEnabledChange: params.onReloadEnabledChange,
@@ -373,6 +374,7 @@ export function startManagedGatewayConfigReloader(
     promoteSnapshot: async (snapshot, _reason) => await params.promoteSnapshot(snapshot),
     subscribeToWrites: params.subscribeToWrites,
     onConfigCandidateObserved: () => {
+      configCandidatePending = true;
       // Every writer must expose persisted revisions before runtime acceptance.
       invalidateConfigGetResponseCache();
       pauseGatewayRestartForConfigCandidate();
@@ -408,6 +410,7 @@ export function startManagedGatewayConfigReloader(
       await transactionOwnership.checkpoint();
       assertReloadPublicationCurrent(transactionOwnership.isCurrent(), false);
       params.acceptTerminalConfig(restart);
+      configCandidatePending = false;
       publishDeferredAppliedConfigHash();
     },
     onConfigApplied: (plan, nextConfig) => {
@@ -446,6 +449,7 @@ export function startManagedGatewayConfigReloader(
       configReloader.isReady() &&
       !lifecycle.signal.aborted &&
       !configReloader.isReloading() &&
+      !configCandidatePending &&
       !hasPendingModelRuntimeReload() &&
       !hasOutstandingGatewayRestart(),
   };
