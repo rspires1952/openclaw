@@ -458,7 +458,13 @@ export function createSessionReconciliation(host: Host) {
       | Pick<SessionChangedResult, "applied" | "key" | "row" | "deletedKey">
       | undefined;
     let admittedRosterResult: Omit<SessionChangedResult, "result"> | undefined;
-    const projection = roster.observations.prepareProjection();
+    const snapshots = sessionChangedSnapshots(payload);
+    const eventRows = snapshots.map(readSessionChangedEvent);
+    const projection = roster.observations.prepareEventProjection(
+      eventRows.every((row) => row?.sessionId)
+        ? eventRows.map((row) => ({ sessionId: row?.sessionId ?? undefined }))
+        : undefined,
+    );
     const projectEventFields = (
       admitted: GatewaySessionRow,
       previousRow: GatewaySessionRow,
@@ -525,7 +531,7 @@ export function createSessionReconciliation(host: Host) {
         if (!eventInfo && invalidationReason === "runner-availability") {
           return { row: entry.row, invalidate: "now" };
         }
-        const snapshot = sessionChangedSnapshots(payload).find((candidate) => {
+        const snapshot = snapshots.find((candidate) => {
           const info = readSessionChangedEvent(candidate);
           const agentId = info?.agentId ?? parseAgentSessionKey(info?.key)?.agentId;
           return (
@@ -601,6 +607,7 @@ export function createSessionReconciliation(host: Host) {
     if (!eventIsCurrent()) {
       return staleEvent();
     }
+    roster.observations.completeEventProjection();
     return {
       eventInfo,
       reconciled,

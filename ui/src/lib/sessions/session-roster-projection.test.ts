@@ -11,6 +11,7 @@ import {
   sessionsResult,
 } from "./session-capability.test-support.ts";
 import type { SessionCapability } from "./session-capability.ts";
+import * as rowProvenance from "./session-row-provenance.ts";
 
 const makeRow = (id: string, label: string) => ({
   key: `agent:main:${id}`,
@@ -45,6 +46,7 @@ function makeHarness(result: (params?: unknown) => SessionsListResult) {
   onTestFinished(() => {
     cleanup.forEach((dispose) => dispose());
     harness.sessions.dispose();
+    vi.restoreAllMocks();
     vi.useRealTimers();
   });
   const subscribe = (...args: Parameters<SessionCapability["subscribeList"]>) =>
@@ -54,6 +56,9 @@ function makeHarness(result: (params?: unknown) => SessionsListResult) {
 
 describe("event-driven session list refresh", () => {
   it("bounds held-roster enumeration while reconciling overlapping session views", async () => {
+    const provenance = rowProvenance.createSessionRowProvenance();
+    const mergeRow = vi.spyOn(provenance, "mergeRow");
+    vi.spyOn(rowProvenance, "createSessionRowProvenance").mockReturnValue(provenance);
     const rows = Array.from({ length: 10 }, (_, index) =>
       makeRow(`shared-${index}`, `Shared ${index}`),
     );
@@ -119,50 +124,72 @@ describe("event-driven session list refresh", () => {
     });
     expect(observed).toHaveBeenCalled();
     expect(request).toHaveBeenCalledTimes(queries.length + 1);
+
+    mergeRow.mockClear();
+    emitEvent(changed(target, "update", "Shared updated again", 3));
+    expect(mergeRow).toHaveBeenCalled();
+    expect(new Set(mergeRow.mock.calls.map(([row]) => row.sessionId))).toEqual(
+      new Set([target.sessionId]),
+    );
+    for (const [index, result] of heldResults().entries()) {
+      expect(result?.sessions.find((row) => row.key === rows[1]!.key)).toBe(
+        held[index]?.sessions.find((row) => row.key === rows[1]!.key),
+      );
+    }
   });
 
-  it("converges an unrelated row before managed listeners run through Gateway reconciliation", async () => {
-    const first = makeRow("first", "Shared first");
-    const second = { ...makeRow("second", "Shared second"), lastMessagePreview: "Before" };
-    const olderQuery = makeQuery(10);
-    const newerQuery = makeQuery(11);
-    let fresh = false;
-    const { sessions, emitEvent, request, subscribe } = makeHarness((params) => {
-      const newer = fresh && asNullableRecord(params)?.limit === newerQuery.limit;
-      return sessionsResult(
-        [{ ...first }, { ...second, lastMessagePreview: newer ? "After" : "Before" }],
-        1,
-      );
-    });
-    let observe = false;
-    const delivered: Array<Record<"older" | "newer", string | null | undefined>> = [];
-    const preview = (query: typeof olderQuery) =>
-      sessions.listSnapshot(query).result?.sessions.find((row) => row.key === second.key)
-        ?.lastMessagePreview;
-    subscribe(olderQuery, () => {
-      if (observe) {
-        delivered.push({ older: preview(olderQuery), newer: preview(newerQuery) });
+  it.each(["managed read", "primary reconciliation"])(
+    "converges an unrelated row from %s before managed listeners run",
+    async (source) => {
+      const first = makeRow("first", "Shared first");
+      const second = { ...makeRow("second", "Shared second"), lastMessagePreview: "Before" };
+      const olderQuery = makeQuery(10);
+      const newerQuery = makeQuery(11);
+      let fresh = false;
+      const { sessions, emitEvent, request, subscribe } = makeHarness((params) => {
+        const newer = fresh && asNullableRecord(params)?.limit === newerQuery.limit;
+        return sessionsResult(
+          [{ ...first }, { ...second, lastMessagePreview: newer ? "After" : "Before" }],
+          1,
+        );
+      });
+      let observe = false;
+      const delivered: Array<Record<"older" | "newer", string | null | undefined>> = [];
+      const preview = (query: typeof olderQuery) =>
+        sessions.listSnapshot(query).result?.sessions.find((row) => row.key === second.key)
+          ?.lastMessagePreview;
+      subscribe(olderQuery, () => {
+        if (observe) {
+          delivered.push({ older: preview(olderQuery), newer: preview(newerQuery) });
+        }
+      });
+      subscribe(newerQuery, () => undefined);
+      await sessions.refresh({ agentId: "main", force: true });
+      await sessions.refreshList({ ...olderQuery, force: true });
+      await sessions.refreshList({ ...newerQuery, force: true });
+      emitEvent(changed(first, "patch", first.label));
+      if (source === "managed read") {
+        fresh = true;
+        await sessions.refreshList({ ...newerQuery, force: true });
+      } else {
+        sessions.reconcile({ ...second, lastMessagePreview: "After", updatedAt: 2 });
       }
-    });
-    subscribe(newerQuery, () => undefined);
-    await sessions.refresh({ agentId: "main", force: true });
-    await sessions.refreshList({ ...olderQuery, force: true });
-    await sessions.refreshList({ ...newerQuery, force: true });
-    emitEvent(changed(first, "patch", first.label));
-    fresh = true;
-    await sessions.refreshList({ ...newerQuery, force: true });
-    expect([preview(olderQuery), preview(newerQuery)]).toEqual(["Before", "After"]);
-    const beforeRequests = request.mock.calls.length;
-    observe = true;
-    const label = "Shared first updated";
-    emitEvent(changed(first, "patch", label, 2));
-    expect(delivered).toEqual([{ older: "After", newer: "After" }]);
-    for (const query of [olderQuery, newerQuery]) {
-      expect(sessions.listSnapshot(query).result?.sessions).toHaveLength(2);
-      expect(
-        sessions.listSnapshot(query).result?.sessions.find((row) => row.key === first.key)?.label,
-      ).toBe(label);
-    }
-    expect(request).toHaveBeenCalledTimes(beforeRequests);
-  });
+      expect([preview(olderQuery), preview(newerQuery)]).toEqual([
+        "Before",
+        source === "managed read" ? "After" : "Before",
+      ]);
+      const beforeRequests = request.mock.calls.length;
+      observe = true;
+      const label = "Shared first updated";
+      emitEvent(changed(first, "patch", label, 2));
+      expect(delivered).toEqual([{ older: "After", newer: "After" }]);
+      for (const query of [olderQuery, newerQuery]) {
+        expect(sessions.listSnapshot(query).result?.sessions).toHaveLength(2);
+        expect(
+          sessions.listSnapshot(query).result?.sessions.find((row) => row.key === first.key)?.label,
+        ).toBe(label);
+      }
+      expect(request).toHaveBeenCalledTimes(beforeRequests);
+    },
+  );
 });
