@@ -222,9 +222,15 @@ describe("oxlint config", () => {
     for (const fixture of fixtures) {
       const diagnostics = byFile(report, fixture.file);
       expect(
-        diagnostics.map(({ code, severity }) => [code, severity]).toSorted(),
+        diagnostics
+          .map(({ code, severity }) => [code, severity])
+          .toSorted((left, right) => left.join(",").localeCompare(right.join(","))),
         fixture.file,
-      ).toEqual(fixture.rules.map((code) => [code, "error"]).toSorted());
+      ).toEqual(
+        fixture.rules
+          .map((code) => [code, "error"])
+          .toSorted((left, right) => left.join(",").localeCompare(right.join(","))),
+      );
     }
     const ownerDiagnostics = byFile(report, "extensions/qa-lab/src/web-runtime.ts");
     expect(ownerDiagnostics.map((diagnostic) => diagnostic.labels[0]?.span.line)).toEqual([1]);
