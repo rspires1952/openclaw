@@ -82,6 +82,23 @@ it("rejects active model markup even when the model returns valid JSON", async (
     }),
   });
   await expect(generateBlobsterForAgent(input)).rejects.toThrow("Unsupported SVG");
+  expect(complete).toHaveBeenCalledTimes(2);
+});
+
+it("retries once when the model returns an invalid design", async () => {
+  complete.mockResolvedValueOnce({ text: "not JSON" }).mockResolvedValueOnce({
+    text: JSON.stringify(design),
+  });
+  const result = await generateBlobsterForAgent(input);
+  expect(result.name).toBe("Garden Keeper");
+  expect(complete).toHaveBeenCalledTimes(2);
+  expect(complete.mock.calls[1][0].systemPrompt).toContain("previous design could not be rendered");
+});
+
+it("does not retry provider errors", async () => {
+  complete.mockRejectedValueOnce(new Error("provider offline"));
+  await expect(generateBlobsterForAgent(input)).rejects.toThrow("provider offline");
+  expect(complete).toHaveBeenCalledTimes(1);
 });
 
 it("rejects a runtime that cannot guarantee a tool-free completion", async () => {
