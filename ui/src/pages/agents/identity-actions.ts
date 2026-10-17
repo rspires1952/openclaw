@@ -41,6 +41,7 @@ export function selectIdentityAvatar(
   host: AgentIdentityEditorHost,
   file: File,
   config?: ApplicationConfigCapability,
+  onSelected?: () => void,
 ) {
   const selection = Symbol("avatar-selection");
   avatarSelections.set(host, selection);
@@ -59,6 +60,7 @@ export function selectIdentityAvatar(
       }
       if (result.ok) {
         setIdentityAvatar(host, result.dataUrl, config);
+        onSelected?.();
       } else {
         host.identityError = t(AVATAR_REJECTION_MESSAGE_KEYS[result.reason]);
       }
@@ -149,7 +151,11 @@ export async function saveIdentityDraft(params: {
       }
     }
     if (params.isCurrent()) {
-      resetIdentityDraft(host);
+      host.identityDraft = {
+        name: host.identityDraft.name === draft.name ? null : host.identityDraft.name,
+        emoji: host.identityDraft.emoji === draft.emoji ? null : host.identityDraft.emoji,
+        avatar: host.identityDraft.avatar === draft.avatar ? null : host.identityDraft.avatar,
+      };
       params.onSaved();
       host.identityError = refreshErrors.length > 0 ? refreshErrors.join(" ") : null;
     }

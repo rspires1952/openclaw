@@ -67,12 +67,24 @@
   min-width: 0;
 }
 
-.agent-identity-editor__actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
+.oc-overlay.agent-identity-editor__popover {
+  width: min(480px, calc(100dvw - 16px));
+  max-width: min(480px, calc(100dvw - 16px));
+  --oc-overlay-max-height: calc(100dvh - 16px);
+  --oc-overlay-distance: 12px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  box-shadow: var(--shadow-lg);
+  border-radius: 24px;
+}
+
+.agent-identity-editor__popover .avatar-picker {
+  width: 100%;
+}
+
+.agent-identity-editor__popover .avatar-picker__preview {
+  height: 112px;
 }
 
 .agent-identity-editor__avatar {

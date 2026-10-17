@@ -128,6 +128,7 @@ export class AgentsPageState
   );
   @viewState() identitySaving = false;
   @viewState() identityError: string | null = null;
+  private identityAutosaveTimer: ReturnType<typeof setTimeout> | null = null;
   @viewState() agentSkillsLoading = false;
   @viewState() agentSkillsError: string | null = null;
   @viewState() agentSkillsReport: SkillStatusReport | null = null;
@@ -329,6 +330,7 @@ export class AgentsPageState
   }
 
   override disconnect() {
+    this.clearIdentityAutosave();
     this.githubIdentity.dispose();
     this.subscriptions.clear();
     super.disconnect();
@@ -766,7 +768,30 @@ export class AgentsPageState
     }
   }
 
-  private saveIdentityDraft() {
+  private clearIdentityAutosave() {
+    if (this.identityAutosaveTimer !== null) {
+      clearTimeout(this.identityAutosaveTimer);
+      this.identityAutosaveTimer = null;
+    }
+  }
+
+  private scheduleIdentitySave(delay = 550) {
+    this.clearIdentityAutosave();
+    const { name, emoji, avatar } = this.identityDraft;
+    if (
+      (name !== null && !name.trim()) ||
+      (emoji !== null && !emoji.trim()) ||
+      (name === null && emoji === null && avatar === null)
+    ) {
+      return;
+    }
+    this.identityAutosaveTimer = setTimeout(() => {
+      this.identityAutosaveTimer = null;
+      void this.saveIdentityDraft();
+    }, delay);
+  }
+
+  private async saveIdentityDraft() {
     if (!this.canCall("agents.update", "operator.admin")) {
       return;
     }
@@ -778,7 +803,8 @@ export class AgentsPageState
     const generation = this.requestGeneration;
     const agents = this.context.agents;
     const agentIdentity = this.context.agentIdentity;
-    void saveIdentityDraft({
+    const draftAtStart = this.identityDraft;
+    await saveIdentityDraft({
       host: this,
       config: this.context.config,
       expectedClient: client,
@@ -793,9 +819,16 @@ export class AgentsPageState
         this.isCurrentRequest(client, generation, agentId, { agents, agentIdentity }),
       onSaved: () => this.syncAgentState(agents),
     });
+    if (
+      this.isCurrentRequest(client, generation, agentId, { agents, agentIdentity }) &&
+      this.identityDraft !== draftAtStart
+    ) {
+      this.scheduleIdentitySave(0);
+    }
   }
 
   private resetSelectionState() {
+    this.clearIdentityAutosave();
     this.gateway.invalidate();
     this.resetModelCatalog();
     resetAgentFiles(this);
@@ -1044,16 +1077,20 @@ export class AgentsPageState
         onIdentityFieldChange: (field, value) => {
           if (canEditIdentity()) {
             setIdentityDraftField(this, field, value);
+            this.scheduleIdentitySave();
           }
         },
         onIdentityAvatarSelect: (file) => {
           if (canEditIdentity()) {
-            selectIdentityAvatar(this, file, this.context.config);
+            selectIdentityAvatar(this, file, this.context.config, () =>
+              this.scheduleIdentitySave(0),
+            );
           }
         },
         onIdentityAvatarSet: (dataUrl) => {
           if (canEditIdentity()) {
             setIdentityAvatar(this, dataUrl, this.context.config);
+            this.scheduleIdentitySave(0);
           }
         },
         onIdentityAvatarGenerate: async (prompt) => {
@@ -1076,7 +1113,7 @@ export class AgentsPageState
           }
           return result;
         },
-        onIdentitySave: () => this.saveIdentityDraft(),
+        onIdentitySave: () => this.scheduleIdentitySave(0),
         ...createAgentModelActions({
           ...this.configEditor,
           onPrimaryChanged: () => void refreshVisibleToolsEffectiveForCurrentSession(this),

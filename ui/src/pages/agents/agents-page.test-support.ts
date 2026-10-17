@@ -82,6 +82,7 @@ export type TestAgentsPage = AgentFilesState & {
   identitySaving: boolean;
   identityError: string | null;
   saveIdentityDraft: () => void;
+  scheduleIdentitySave: (delay?: number) => void;
   setDefaultAgent: (agentId: string) => void;
 };
 

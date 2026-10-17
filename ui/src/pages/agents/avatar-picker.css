@@ -95,9 +95,13 @@
 
 .avatar-picker__ghost {
   width: 100px;
-  height: 100px;
-  fill: var(--bg-hover);
+  color: var(--bg-hover);
   animation: avatar-picker-ghost-pulse 1.6s ease-in-out infinite;
+}
+
+.avatar-picker__ghost .lobster-pet__svg :is(path, circle, ellipse, rect, polygon, line, polyline) {
+  fill: currentColor !important;
+  stroke: currentColor !important;
 }
 
 @keyframes avatar-picker-ghost-pulse {

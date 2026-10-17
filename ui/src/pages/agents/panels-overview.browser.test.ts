@@ -19,6 +19,18 @@ it("opens agent avatar selection from the keyboard and respects the busy state",
     avatarButton.focus();
     await userEvent.keyboard("{Enter}");
     expect(avatarButton.getAttribute("aria-expanded")).toBe("true");
+    expect(avatarButton.hasAttribute("title")).toBe(false);
+    const popover = container.querySelector<HTMLElement>(".agent-identity-editor__popover");
+    expect(popover?.matches(":popover-open")).toBe(true);
+    await vi.waitFor(() => expect(popover?.getBoundingClientRect().width).toBeGreaterThan(0));
+    const avatarBounds = avatarButton.getBoundingClientRect();
+    const popoverBounds = popover!.getBoundingClientRect();
+    expect(popoverBounds.width).toBeLessThanOrEqual(480);
+    const beside = popoverBounds.left >= avatarBounds.right - 1;
+    const below =
+      popoverBounds.top >= avatarBounds.bottom - 1 && popoverBounds.top <= avatarBounds.bottom + 20;
+    expect(beside || below).toBe(true);
+    expect(popoverBounds.right).toBeLessThanOrEqual(window.innerWidth + 1);
     await page.getByRole("button", { name: "Upload", exact: true }).click();
     const input = container.querySelector<HTMLInputElement>('input[type="file"]');
     if (!input) {
@@ -36,10 +48,12 @@ it("opens agent avatar selection from the keyboard and respects the busy state",
     await userEvent.keyboard(" ");
     expect(openPicker).toHaveBeenCalledTimes(2);
 
-    mounted.update({ ...props, overview: { ...props.overview, identitySaving: true } });
+    mounted.update({ ...props, access: { ...props.access, canUpdateIdentity: false } });
     expect(button.disabled).toBe(true);
     button.click();
     expect(openPicker).toHaveBeenCalledTimes(2);
+    await userEvent.keyboard("{Escape}");
+    expect(popover?.matches(":popover-open")).toBe(false);
   } finally {
     vi.restoreAllMocks();
     mounted.dispose();

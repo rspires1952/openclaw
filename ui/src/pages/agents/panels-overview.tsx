@@ -1,4 +1,12 @@
-import { createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import {
+  createMemo,
+  createSignal,
+  createUniqueId,
+  For,
+  onCleanup,
+  onSettled,
+  Show,
+} from "solid-js";
 import { normalizeAgentModelRefForConfig } from "../../../../src/config/model-input.js";
 import type {
   AgentIdentityResult,
@@ -11,13 +19,16 @@ import type { ApplicationConfigCapability } from "../../app/config.ts";
 import { AgentEmojiPicker } from "../../components/agent-emoji-picker.tsx";
 import type { DecisionModelEntry } from "../../components/model-picker-options.ts";
 import { MultiSelect } from "../../components/multi-select.tsx";
-import type { PanelRefreshStatus } from "../../components/panel-refresh-status-state.ts";
+import { createOverlayAnchor } from "../../components/overlay-anchor.ts";
 import "../../components/tooltip.ts";
+import { createOverlay, findOverlayParent } from "../../components/overlay-lifecycle.ts";
+import type { PanelRefreshStatus } from "../../components/panel-refresh-status-state.ts";
 import { DecisionModelPicker } from "../../components/solid/decision-model-picker.tsx";
 import { AgentIdentityAvatar } from "../../components/solid/identity-avatar.tsx";
 import { ModelPicker } from "../../components/solid/model-picker.tsx";
 import { PanelRefreshStatus as PanelRefreshNotice } from "../../components/solid/panel-refresh-status.tsx";
 import { SettingsRow, SettingsSection } from "../../components/solid/settings-ui.tsx";
+import "../../components/solid/overlay.css";
 import {
   type AgentContext,
   buildAgentContext,
@@ -199,19 +210,7 @@ export function AgentOverview(
     const source = persistedAvatarUrl();
     return source ? avatarLoader.imageErrorHandler(source) : undefined;
   });
-  const identityDirty = createMemo(
-    () =>
-      identityDraft().name !== null ||
-      identityDraft().emoji !== null ||
-      identityDraft().avatar !== null,
-  );
-  const identityInvalid = createMemo(() => {
-    const draft = identityDraft();
-    return (
-      (draft.name !== null && !draft.name.trim()) || (draft.emoji !== null && !draft.emoji.trim())
-    );
-  });
-  const identityBusy = createMemo(() => params.identitySaving || !params.canUpdateIdentity);
+  const identityBusy = createMemo(() => !params.canUpdateIdentity);
   const limitEmoji = (value: string) => {
     let result = "";
     for (const { segment } of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(
@@ -229,6 +228,31 @@ export function AgentOverview(
   };
 
   const [avatarPickerOpen, setAvatarPickerOpen] = createSignal(false);
+  const avatarPickerId = `agent-avatar-picker-${createUniqueId()}`;
+  const pickerContentVisible = createMemo(
+    () => avatarPickerOpen() && uploadsEnabled(params.applicationConfig),
+  );
+  const avatarOverlay = createOverlay(avatarPickerId, undefined, {
+    exclusiveGroup: "menu",
+  });
+  let avatarTrigger: HTMLButtonElement | undefined;
+  let avatarSurface: HTMLDivElement | undefined;
+  onSettled(() => {
+    if (!avatarTrigger || !avatarSurface) {
+      return () => avatarOverlay.dispose();
+    }
+    avatarOverlay.bindSurface(avatarSurface);
+    avatarOverlay.bindTrigger(avatarTrigger);
+    avatarOverlay.setParent(findOverlayParent(avatarTrigger));
+    const anchor = createOverlayAnchor(avatarSurface, { sameRoot: true });
+    anchor.update(avatarTrigger, "right-start");
+    const unsubscribe = avatarOverlay.subscribe(setAvatarPickerOpen);
+    return () => {
+      unsubscribe();
+      anchor.dispose();
+      avatarOverlay.dispose();
+    };
+  });
   const renderIdentityAvatar = () => (
     <AgentIdentityAvatar
       agent={{
@@ -260,13 +284,14 @@ export function AgentOverview(
           <div class="agent-identity-editor">
             {uploadsEnabled(params.applicationConfig) ? (
               <button
+                ref={(element) => (avatarTrigger = element)}
                 type="button"
                 class="agent-identity-editor__avatar"
                 aria-label={t("agents.identity.chooseAvatar")}
                 aria-expanded={avatarPickerOpen() ? "true" : "false"}
-                title={t("agents.identity.chooseAvatar")}
+                aria-controls={avatarPickerId}
                 disabled={identityBusy()}
-                onClick={() => setAvatarPickerOpen((open) => !open)}
+                onClick={() => avatarOverlay.request(!avatarOverlay.open)}
               >
                 {renderIdentityAvatar()}
                 <span class="agent-identity-editor__avatar-edit" aria-hidden="true">
@@ -300,6 +325,7 @@ export function AgentOverview(
                     onInput={(event) =>
                       params.onIdentityFieldChange("name", event.currentTarget.value)
                     }
+                    onBlur={() => params.onIdentitySave()}
                   />
                 </label>
                 <div class="field agent-identity-editor__emoji">
@@ -318,6 +344,7 @@ export function AgentOverview(
                           params.onIdentityFieldChange("emoji", emoji);
                         }
                       }}
+                      onBlur={() => params.onIdentitySave()}
                     />
                     <AgentEmojiPicker
                       value={identityEmoji()}
@@ -334,40 +361,35 @@ export function AgentOverview(
                   {params.identityError}
                 </div>
               ) : undefined}
-              <div class="agent-identity-editor__actions">
-                <button
-                  type="button"
-                  class="btn btn--sm primary"
-                  disabled={
-                    identityBusy() ||
-                    !identityDirty() ||
-                    identityInvalid() ||
-                    (identityDraft().avatar !== null && !uploadsEnabled(params.applicationConfig))
-                  }
-                  onClick={() => params.onIdentitySave()}
-                >
-                  {params.identitySaving ? t("common.saving") : t("common.save")}
-                </button>
-              </div>
-              <Show when={avatarPickerOpen() && uploadsEnabled(params.applicationConfig)}>
+            </div>
+            <div
+              ref={(element) => (avatarSurface = element)}
+              id={avatarPickerId}
+              class="oc-overlay agent-identity-editor__popover"
+              popover="manual"
+              role="dialog"
+              aria-label={t("agents.identity.avatarPicker")}
+            >
+              <Show when={pickerContentVisible()}>
                 <For each={[`${params.agent.id}:${params.identityScope}`]}>
                   {() => (
                     <AvatarPicker
                       agentId={params.agent.id}
                       avatar={identityAvatarUrl()}
                       disabled={identityBusy()}
-                      onSelect={(dataUrl) => params.onIdentityAvatarSet(dataUrl)}
-                      onUpload={(file) => params.onIdentityAvatarSelect(file)}
+                      onSelect={(dataUrl) => {
+                        params.onIdentityAvatarSet(dataUrl);
+                        avatarOverlay.request(false, "return");
+                      }}
+                      onUpload={(file) => {
+                        params.onIdentityAvatarSelect(file);
+                        avatarOverlay.request(false, "return");
+                      }}
                       onGenerate={(prompt) => params.onIdentityAvatarGenerate(prompt)}
                     />
                   )}
                 </For>
               </Show>
-              <div class="settings-row__desc agent-identity-editor__hint">
-                {uploadsEnabled(params.applicationConfig)
-                  ? t("agents.identity.fileHint")
-                  : undefined}
-              </div>
             </div>
           </div>
         </div>

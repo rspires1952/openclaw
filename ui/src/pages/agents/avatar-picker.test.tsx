@@ -64,6 +64,7 @@ it("submits only the description and requires acceptance before replacing identi
   view.describe("  A patient gardener with a watering can  ");
   view.click("Generate");
   await waitForFast(() => expect(view.container.textContent).toContain("Garden keeper"));
+  expect(view.container.textContent).not.toContain("Generate again");
   expect(generate).toHaveBeenCalledWith("A patient gardener with a watering can");
   expect(view.props.onSelect).not.toHaveBeenCalled();
   expect(view.container.textContent).not.toContain("Chat and sidebar preview");
@@ -108,7 +109,7 @@ it("shows a Blobster silhouette and generating label while a preview is pending"
   const view = mount(() => pending.promise);
   view.describe("Explorer");
   view.click("Generate");
-  expect(view.container.querySelector(".avatar-picker__ghost path")).not.toBeNull();
+  expect(view.container.querySelector(".avatar-picker__ghost .lobster-pet__svg")).not.toBeNull();
   expect(view.container.textContent).toContain("Generating...");
   pending.resolve(generated);
   await waitForFast(() => expect(view.container.textContent).toContain("Use avatar"));

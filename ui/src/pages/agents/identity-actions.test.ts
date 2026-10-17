@@ -10,6 +10,7 @@ import {
   resetIdentityDraft,
   saveIdentityDraft,
   selectIdentityAvatar,
+  setIdentityDraftField,
   setIdentityAvatar,
 } from "./identity-actions.ts";
 
@@ -63,6 +64,19 @@ describe("agent identity actions", () => {
     resolveUpload({ ok: true, dataUrl: "data:image/png;base64,b2xk" });
     await Promise.resolve();
     expect(state.identityDraft.avatar).toBe("data:image/webp;base64,YXZhdGFy");
+  });
+
+  it("queues persistence only after a valid uploaded avatar is ready", async () => {
+    const state = host();
+    const onSelected = vi.fn();
+    fileToAvatarDataUrlMock.mockResolvedValueOnce({
+      ok: true,
+      dataUrl: "data:image/png;base64,aA==",
+    });
+    selectIdentityAvatar(state, {} as File, undefined, onSelected);
+    expect(onSelected).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(onSelected).toHaveBeenCalledOnce());
+    expect(state.identityDraft.avatar).toBe("data:image/png;base64,aA==");
   });
 
   it("rejects disabled avatar reads and results finishing after policy changes", async () => {
@@ -283,5 +297,35 @@ describe("agent identity actions", () => {
     expect(runExternalMutation).toHaveBeenCalledOnce();
     expect(state.identityDraft).toEqual({ name: null, emoji: null, avatar: null });
     expect(state.identityError).toContain("config.get failed after identity commit");
+  });
+
+  it("preserves edits made while an autosave is in flight", async () => {
+    const state = host();
+    state.identityDraft.name = "First name";
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const runExternalMutation = vi.fn(async () => {
+      await pending;
+      return { ok: true as const, value: {}, refresh: { ok: true as const } };
+    });
+    const saving = saveIdentityDraft({
+      ...saveOptions(state),
+      agents: {
+        refreshList: vi.fn(async () => undefined),
+      } as unknown as ApplicationContext["agents"],
+      agentIdentity: {
+        invalidate: vi.fn(),
+        ensure: vi.fn(async () => undefined),
+      } as unknown as ApplicationContext["agentIdentity"],
+      runtimeConfig: { runExternalMutation } as unknown as ApplicationContext["runtimeConfig"],
+    });
+    setIdentityDraftField(state, "name", "Second name");
+    release();
+    await saving;
+
+    expect(state.identityDraft.name).toBe("Second name");
+    expect(state.identitySaving).toBe(false);
   });
 });

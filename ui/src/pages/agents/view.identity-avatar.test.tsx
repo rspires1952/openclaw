@@ -266,6 +266,8 @@ it("keeps a reopened picker preview pending until the authenticated avatar resol
   }
   chooser.click();
   flush();
+  view.container.querySelector<HTMLButtonElement>(".avatar-picker__tab:nth-child(2)")?.click();
+  flush();
   const preview = view.container.querySelector(".avatar-picker__preview .identity-avatar--agent");
   const image = preview?.querySelector("img");
   expect(preview?.classList).toContain("is-pending");

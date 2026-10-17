@@ -120,41 +120,6 @@ export function AvatarPicker(props: AvatarPickerProps) {
 
   return (
     <div class="avatar-picker" aria-label={t("agents.identity.avatarPicker")}>
-      <div class="avatar-picker__preview">
-        <Show
-          when={busy() && mode() === "generate"}
-          fallback={
-            <Show
-              when={candidate()?.dataUrl ?? props.avatar}
-              fallback={
-                <div
-                  class="avatar-picker__sprite lobster-pet lobster-pet--palette-crimson"
-                  style={lobsterLookStyle(canonicalLobsterLook(LOBSTER_PALETTE_WEIGHTS[0][0]))}
-                >
-                  <LobsterSvg
-                    look={canonicalLobsterLook(LOBSTER_PALETTE_WEIGHTS[0][0])}
-                    standalone
-                  />
-                </div>
-              }
-            >
-              {(source) => (
-                <AgentIdentityAvatar
-                  agent={{
-                    id: props.agentId,
-                    avatar: source(),
-                    name: candidate()?.name ?? t("agents.identity.avatarPreview"),
-                  }}
-                />
-              )}
-            </Show>
-          }
-        >
-          <svg class="avatar-picker__ghost" viewBox="0 0 120 120" aria-hidden="true">
-            <path d="M27 31C30 18 43 13 55 17c13-7 28 1 31 13 12 1 19 13 16 25 6 12-1 25-13 28-7 11-19 13-30 7-12 6-24 1-29-9-13-2-19-14-14-25-3-10 1-20 11-25Z" />
-          </svg>
-        </Show>
-      </div>
       <div class="avatar-picker__panel">
         <div
           class="avatar-picker__tabs"
@@ -188,6 +153,46 @@ export function AvatarPicker(props: AvatarPickerProps) {
             {t("agents.identity.avatarReset")}
           </button>
         </div>
+        <Show when={mode() === "generate"}>
+          <div class="avatar-picker__preview">
+            <Show
+              when={busy() && mode() === "generate"}
+              fallback={
+                <Show
+                  when={candidate()?.dataUrl ?? props.avatar}
+                  fallback={
+                    <div
+                      class="avatar-picker__sprite lobster-pet lobster-pet--palette-crimson"
+                      style={lobsterLookStyle(canonicalLobsterLook(LOBSTER_PALETTE_WEIGHTS[0][0]))}
+                    >
+                      <LobsterSvg
+                        look={canonicalLobsterLook(LOBSTER_PALETTE_WEIGHTS[0][0])}
+                        standalone
+                      />
+                    </div>
+                  }
+                >
+                  {(source) => (
+                    <AgentIdentityAvatar
+                      agent={{
+                        id: props.agentId,
+                        avatar: source(),
+                        name: candidate()?.name ?? t("agents.identity.avatarPreview"),
+                      }}
+                    />
+                  )}
+                </Show>
+              }
+            >
+              <div
+                class="avatar-picker__ghost avatar-picker__sprite lobster-pet"
+                aria-hidden="true"
+              >
+                <LobsterSvg look={canonicalLobsterLook(LOBSTER_PALETTE_WEIGHTS[0][0])} standalone />
+              </div>
+            </Show>
+          </div>
+        </Show>
         <Show when={mode() === "bot"}>
           <div class="avatar-picker__grid" aria-label={t("agents.identity.avatarPresets")}>
             <For each={LOBSTER_PET_PALETTES}>
@@ -250,18 +255,18 @@ export function AvatarPicker(props: AvatarPickerProps) {
                 </div>
               )}
             </Show>
-            <button
-              type="button"
-              class="btn avatar-picker__generate"
-              disabled={props.disabled || busy() || !prompt().trim()}
-              onClick={() => void generate()}
-            >
-              {busy()
-                ? t("agents.identity.avatarGenerating")
-                : candidate()
-                  ? t("agents.identity.avatarRegenerate")
+            <Show when={!candidate()}>
+              <button
+                type="button"
+                class="btn avatar-picker__generate"
+                disabled={props.disabled || busy() || !prompt().trim()}
+                onClick={() => void generate()}
+              >
+                {busy()
+                  ? t("agents.identity.avatarGenerating")
                   : t("agents.identity.avatarGenerate")}
-            </button>
+              </button>
+            </Show>
           </div>
         </Show>
         <Show when={mode() === "upload"}>
