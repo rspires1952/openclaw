@@ -11,9 +11,10 @@ import {
   tryBeginGatewayRootWorkAdmission,
 } from "../../process/gateway-work-admission.js";
 import {
-  beginSessionWorkAdmission,
-  getSessionWorkAdmissionRelease,
-} from "../../sessions/session-lifecycle-admission.js";
+  beginSessionEffect,
+  getCompetingSessionWorkAdmissionRelease,
+} from "../../sessions/session-controller.lifecycle.js";
+import { rpcSourceTesting } from "../../sessions/session-lifecycle-admission.test-support.js";
 import { runInDetachedAsyncContext } from "../../shared/detached-async-context.js";
 import { readOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db-identity.js";
 import { closeOpenClawAgentDatabasesAsync } from "../../state/openclaw-agent-db-lifecycle.js";
@@ -76,7 +77,7 @@ describe("chat admission authority", () => {
       });
       if (revokeInCallback) {
         await expect(admitting).rejects.toThrow("caller revoked during admission");
-        expect(fixture.context.chatAbortControllers.size).toBe(0);
+        expect(rpcSourceTesting.size).toBe(0);
       } else {
         const admitted = await admitting;
         expect(admitted.ok).toBe(true);
@@ -122,9 +123,9 @@ describe("chat admission authority", () => {
       expect(reservedIdentity).toBe(first.request.requestIdentity);
       await closing;
       expect(fixture.context.dedupe.has(pendingKey)).toBe(false);
-      expect(fixture.context.chatAbortControllers.size).toBe(0);
+      expect(rpcSourceTesting.size).toBe(0);
       expect(
-        getSessionWorkAdmissionRelease({
+        getCompetingSessionWorkAdmissionRelease({
           scope: fixture.scope.storePath,
           identities: [fixture.scope.sessionKey, fixture.scope.sessionId],
         }),
@@ -203,14 +204,14 @@ describe("chat admission authority", () => {
       }
       // Closure can reach the reader after its synchronous consumption finishes.
       const [readerOutcome] = await Promise.allSettled([retainedRead]);
-      const released = getSessionWorkAdmissionRelease({
+      const released = getCompetingSessionWorkAdmissionRelease({
         scope: fixture.scope.storePath,
         identities: [fixture.scope.sessionKey, fixture.scope.sessionId],
       });
       expect(released).toBeDefined();
       expect(getActiveGatewayRootWorkCount()).toBe(rootsBefore + 1);
       expect(caller.isCurrent()).toBe(true);
-      expect(fixture.context.chatAbortControllers.size).toBe(1);
+      expect(rpcSourceTesting.size).toBe(1);
       finishCallback.resolve();
       const result = await outcome;
       if (readerOutcome.status === "rejected") {
@@ -224,7 +225,7 @@ describe("chat admission authority", () => {
       await released;
       expect(getActiveGatewayRootWorkCount()).toBe(rootsBefore);
       expect(caller.isCurrent()).toBe(false);
-      expect(fixture.context.chatAbortControllers.size).toBe(0);
+      expect(rpcSourceTesting.size).toBe(0);
       expect(onAdmissionOwned).toHaveBeenCalledOnce();
       expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
     } finally {
@@ -270,7 +271,7 @@ describe("chat admission authority", () => {
       }),
     ).resolves.toEqual({ ok: false });
     expect(fixture.context.dedupe.size).toBe(0);
-    expect(fixture.context.chatAbortControllers.size).toBe(0);
+    expect(rpcSourceTesting.size).toBe(0);
     expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
     expect(respond).toHaveBeenCalledWith(false, undefined, expect.anything());
   });
@@ -320,7 +321,7 @@ describe("chat admission authority", () => {
       throw new Error("Expected retained worker authorization");
     }
     // The cancelled turn still owns its lifecycle, so reconciliation leaves its claim alone.
-    const cancelledTurn = await beginSessionWorkAdmission({
+    const cancelledTurn = await beginSessionEffect({
       scope: session.storePath,
       identities: [session.sessionKey, fixture.scope.sessionId],
     });

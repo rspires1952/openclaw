@@ -203,6 +203,11 @@ export async function executeDispatch(state: PrepareDispatchExecutionReadyState)
                       didDeliverVisiblePartialReply ||= hasOutboundReplyContent(payload, {
                         trimText: true,
                       });
+                      if (didDeliverVisiblePartialReply) {
+                        state
+                          .getDispatchReplyOperation()
+                          ?.watchdog.progress("finalization", "reply:partial_delivered");
+                      }
                     },
                   }),
               onReasoningStream,

@@ -3,23 +3,17 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ErrorCodes } from "../../../packages/gateway-protocol/src/index.js";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { resolveEmbeddedSessionLane } from "../../agents/embedded-agent-runner/lanes.js";
-import { clearFollowupDrainCallback } from "../../auto-reply/reply/queue/drain.js";
-import { enqueueFollowupRun, getFollowupQueueDepth } from "../../auto-reply/reply/queue/enqueue.js";
-import { clearFollowupQueue } from "../../auto-reply/reply/queue/state.js";
-import type { FollowupRun } from "../../auto-reply/reply/queue/types.js";
+import {
+  enqueueFollowupRun,
+  getFollowupQueueDepth,
+  type FollowupRun,
+} from "../../auto-reply/reply/queue.js";
+import { createQueueTestRun } from "../../auto-reply/reply/queue.test-helpers.js";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
 } from "../../config/runtime-snapshot.js";
 import { waitForSessionTranscriptIndexReconcile } from "../../config/sessions/session-transcript-reconcile.js";
-import {
-  clearCommandLane,
-  CommandLaneClearedError,
-  enqueueCommandInLane,
-  getCommandLaneSnapshot,
-  setCommandLaneConcurrency,
-} from "../../process/command-queue.js";
 import { registerOpenClawAgentDatabaseAsyncResource } from "../../state/openclaw-agent-db-resources.js";
 import {
   closeOpenClawAgentDatabasesForTest,
@@ -94,20 +88,27 @@ import {
 } from "../../config/sessions/session-entry-read-runtime.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
-import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
+import {
+  captureSessionTarget,
+  runSessionMutation,
+  type SessionTarget,
+} from "../../sessions/session-controller.lifecycle.js";
+import {
+  cancelCapturedSessionControllerSource,
+  captureSessionControllerStop,
+} from "../../sessions/session-controller.stop.js";
 import { listSessionStateEventsSince } from "../../sessions/session-state-events.js";
 import { createDeferredCore } from "../../shared/deferred.js";
+import { claimRpcSourceForTest, createRpcSourceForTest } from "../test-helpers.rpc-source.js";
 import { sessionRewindHandlers } from "./sessions-rewind.js";
 
 // One teardown owns drainage and deletion so a failed drain retains the fixture root.
 const tempDirs = createTempDirTracker();
 const sessionKey = "agent:main:rewind-handler";
 const sourceSessionId = "rewind-handler-source";
-const sessionLane = resolveEmbeddedSessionLane(sessionKey);
 const storedImageId = "stored-image.png";
 const storedImagePath = `/state/media/inbound/${storedImageId}`;
 const storedImageData = Buffer.from("stored-image");
-const queuedCommandSettlements = new Set<Promise<void>>();
 
 beforeEach(async () => {
   mocks.readMediaBuffer.mockReset().mockImplementation(async (id: string) => {
@@ -123,7 +124,7 @@ beforeEach(async () => {
   });
   setActivePluginRegistry(createEmptyPluginRegistry());
   vi.stubEnv("OPENCLAW_STATE_DIR", tempDirs.make("openclaw-rewind-handler-"));
-  setRuntimeConfigSnapshot(context().getRuntimeConfig());
+  setRuntimeConfigSnapshot((await context()).getRuntimeConfig());
   await upsertSessionEntryCore(
     { agentId: "main", sessionKey },
     {
@@ -187,14 +188,15 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  for (const key of [sessionKey, sourceSessionId]) {
-    clearFollowupQueue(key);
-    clearFollowupDrainCallback(key);
-    clearCommandLane(resolveEmbeddedSessionLane(key));
-  }
-  setCommandLaneConcurrency(sessionLane, 1);
-  await Promise.all(queuedCommandSettlements);
-  queuedCommandSettlements.clear();
+  clearQueuedSessionWork(
+    captureSessionTarget({
+      storeScope: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+      sessionKey,
+      agentId: "main",
+      incarnation: sourceSessionId,
+    }),
+  );
+
   try {
     for (const stateDir of tempDirs.dirs) {
       await cleanupSessionStateForTest({ stateDir });
@@ -240,12 +242,9 @@ it("drains rewind fixture owners before closing handles and restoring selectors"
   });
 });
 
-function context(active = false): GatewayRequestContext {
+async function context(): Promise<GatewayRequestContext> {
   return {
     broadcastToConnIds: vi.fn(),
-    chatAbortControllers: new Map(
-      active ? [["active-run", { sessionId: sourceSessionId, sessionKey }]] : undefined,
-    ),
     getRuntimeConfig: () => ({ agents: { entries: { main: {} } } }),
     getSessionEventSubscriberConnIds: () => new Set(),
   } as unknown as GatewayRequestContext;
@@ -261,7 +260,6 @@ async function invoke(
   method: MessageCutMethod,
   entryId?: string,
   client: GatewayClient | null = null,
-  active = false,
   runtimeConfig?: GatewayRequestContext["getRuntimeConfig"],
 ) {
   const respond = vi.fn();
@@ -280,8 +278,8 @@ async function invoke(
     },
     respond: respond as unknown as RespondFn,
     context: runtimeConfig
-      ? { ...context(active), getRuntimeConfig: runtimeConfig }
-      : context(active),
+      ? { ...(await context()), getRuntimeConfig: runtimeConfig }
+      : await context(),
     client,
     isWebchatConnect: () => false,
   });
@@ -289,10 +287,16 @@ async function invoke(
 }
 
 type QueuedSessionWork = {
-  command: Promise<string>;
   followup: FollowupRun;
-  hasCommandRun: () => boolean;
 };
+
+function clearQueuedSessionWork(target: SessionTarget | undefined): void {
+  if (target) {
+    cancelCapturedSessionControllerSource(
+      captureSessionControllerStop({ targets: [target], includeActive: false }),
+    );
+  }
+}
 
 function enqueueSessionWork(label: string): QueuedSessionWork {
   const followup: FollowupRun = {
@@ -317,40 +321,20 @@ function enqueueSessionWork(label: string): QueuedSessionWork {
     enqueueFollowupRun(sessionKey, followup, { mode: "followup" }, "none", undefined, false),
   ).toBe(true);
 
-  setCommandLaneConcurrency(sessionLane, 0);
-  let commandRan = false;
-  const command = enqueueCommandInLane(sessionLane, async () => {
-    commandRan = true;
-    return `${label} command`;
-  });
-  const settlement = command.then(
-    () => undefined,
-    () => undefined,
-  );
-  queuedCommandSettlements.add(settlement);
-
-  return { command, followup, hasCommandRun: () => commandRan };
+  return { followup };
 }
 
 function expectSessionWorkQueued(work: QueuedSessionWork): void {
   expect(getFollowupQueueDepth(sessionKey)).toBe(1);
+  expect(work.followup.controllerInput?.abortSignal.aborted).toBe(false);
   expect(work.followup.turnAdoptionLifecycle?.onSettled).not.toHaveBeenCalled();
-  expect(getCommandLaneSnapshot(sessionLane)).toMatchObject({
-    activeCount: 0,
-    queuedCount: 1,
-  });
-  expect(work.hasCommandRun()).toBe(false);
 }
 
 async function expectSessionWorkCleared(work: QueuedSessionWork): Promise<void> {
   expect(getFollowupQueueDepth(sessionKey)).toBe(0);
+  expect(work.followup.controllerInput?.abortSignal.aborted).toBe(true);
+  await work.followup.controllerInput?.settlement.promise;
   expect(work.followup.turnAdoptionLifecycle?.onSettled).toHaveBeenCalledOnce();
-  expect(getCommandLaneSnapshot(sessionLane)).toMatchObject({
-    activeCount: 0,
-    queuedCount: 0,
-  });
-  await expect(work.command).rejects.toBeInstanceOf(CommandLaneClearedError);
-  expect(work.hasCommandRun()).toBe(false);
 }
 
 async function archiveSourceSession(storePath?: string): Promise<void> {
@@ -404,7 +388,7 @@ describe("session message-cut methods", () => {
     );
     using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
 
-    const fork = await invoke("sessions.fork", "user-entry", client, false, runtimeConfig);
+    const fork = await invoke("sessions.fork", "user-entry", client, runtimeConfig);
     expect(fork).toHaveBeenCalledWith(
       false,
       undefined,
@@ -420,7 +404,7 @@ describe("session message-cut methods", () => {
       }),
     ).toHaveLength(1);
 
-    const rewind = await invoke("sessions.rewind", "user-entry", client, false, runtimeConfig);
+    const rewind = await invoke("sessions.rewind", "user-entry", client, runtimeConfig);
     expect(rewind).toHaveBeenCalledWith(true, expect.any(Object), undefined);
   });
 
@@ -432,7 +416,7 @@ describe("session message-cut methods", () => {
     );
     using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
 
-    const fork = await invoke("sessions.fork", "user-entry", client, false, runtimeConfig);
+    const fork = await invoke("sessions.fork", "user-entry", client, runtimeConfig);
     const forkKey = (fork.mock.calls[0]?.[1] as { sessionKey?: string } | undefined)?.sessionKey;
 
     expect(fork).toHaveBeenCalledWith(
@@ -460,11 +444,48 @@ describe("session message-cut methods", () => {
       req: { id: "fresh-branches-list" } as never,
       params: { sessionKey: "agent:main:never-materialized" },
       respond,
-      context: context(),
+      context: await context(),
       client: null,
       isWebchatConnect: () => false,
     });
     expect(respond).toHaveBeenCalledWith(true, { branches: [] }, undefined);
+  });
+
+  it("lists branches and switches to an inactive tip", async () => {
+    const listed = await invoke("sessions.branches.list");
+    expect(listed).toHaveBeenCalledWith(
+      true,
+      {
+        branches: [
+          expect.objectContaining({
+            leafEntryId: "assistant-entry",
+            headline: "answer",
+            messageCount: 2,
+            active: true,
+          }),
+          expect.objectContaining({
+            leafEntryId: "off-path-entry",
+            headline: "inactive",
+            messageCount: 1,
+            active: false,
+          }),
+        ],
+      },
+      undefined,
+    );
+
+    const switched = await invoke("sessions.branches.switch", "off-path-entry");
+    expect(switched).toHaveBeenCalledWith(true, {}, undefined);
+  });
+
+  it("clears queued session work after a successful branch switch", async () => {
+    const work = enqueueSessionWork("branch switch");
+    expectSessionWorkQueued(work);
+
+    const respond = await invoke("sessions.branches.switch", "off-path-entry");
+
+    expect(respond).toHaveBeenCalledWith(true, {}, undefined);
+    await expectSessionWorkCleared(work);
   });
 
   it.each([false, true])(
@@ -492,7 +513,7 @@ describe("session message-cut methods", () => {
         req: { id: "committed-rewind" } as never,
         params: { sessionKey, entryId: "user-entry" },
         respond,
-        context: context(),
+        context: await context(),
         client: null,
         isWebchatConnect: () => false,
         sessionMutationCommitGuard: () => {
@@ -513,7 +534,6 @@ describe("session message-cut methods", () => {
 
   it("rewinds research's global session without clearing main's shared lane", async () => {
     const key = "global";
-    const lane = resolveEmbeddedSessionLane(key);
     const target = { agentId: "research", sessionKey: key, sessionId: "research-rewind" };
     await upsertSessionEntryCore(target, { sessionId: target.sessionId, updatedAt: 1 });
     await appendTranscriptMessage(target, {
@@ -521,15 +541,16 @@ describe("session message-cut methods", () => {
       message: { role: "user", content: "research question" },
       parentId: null,
     });
-    setCommandLaneConcurrency(lane, 0);
-    const commands = [
-      enqueueCommandInLane(lane, async () => "main tagged", {
-        sessionTarget: { agentId: "main", sessionKey: key, sessionId: "main-rewind" },
-      }),
-      enqueueCommandInLane(lane, async () => "main untagged"),
-      enqueueCommandInLane(lane, async () => "research", { sessionTarget: target }),
-    ];
-    const settled = Promise.allSettled(commands);
+    const main = createQueueTestRun({ prompt: "main queued work" });
+    Object.assign(main.run, { agentId: "main", sessionKey: key, sessionId: "main-rewind" });
+    const research = createQueueTestRun({ prompt: "research queued work" });
+    Object.assign(research.run, target);
+    expect(enqueueFollowupRun(key, main, { mode: "followup" }, "none", undefined, false)).toBe(
+      true,
+    );
+    expect(enqueueFollowupRun(key, research, { mode: "followup" }, "none", undefined, false)).toBe(
+      true,
+    );
     try {
       const respond = vi.fn();
       await sessionRewindHandlers["sessions.rewind"]!({
@@ -537,23 +558,18 @@ describe("session message-cut methods", () => {
         params: { sessionKey: key, agentId: target.agentId, entryId: "research-user" },
         respond,
         context: {
-          ...context(),
+          ...(await context()),
           getRuntimeConfig: () => ({ agents: { entries: { main: {}, research: {} } } }),
         },
         client: null,
         isWebchatConnect: () => false,
       });
       expect(respond).toHaveBeenCalledWith(true, { editorText: "research question" }, undefined);
-      setCommandLaneConcurrency(lane, 1);
-      expect(await settled).toEqual([
-        { status: "fulfilled", value: "main tagged" },
-        { status: "fulfilled", value: "main untagged" },
-        { status: "rejected", reason: expect.any(CommandLaneClearedError) },
-      ]);
+      expect(main.controllerInput?.abortSignal.aborted).toBe(false);
+      expect(research.controllerInput?.abortSignal.aborted).toBe(true);
     } finally {
-      clearCommandLane(lane);
-      setCommandLaneConcurrency(lane, 1);
-      await settled;
+      clearQueuedSessionWork(main.controllerInput?.mailbox.owner.target);
+      clearQueuedSessionWork(research.controllerInput?.mailbox.owner.target);
     }
   });
 
@@ -572,10 +588,6 @@ describe("session message-cut methods", () => {
       }),
     );
     expectSessionWorkQueued(work);
-
-    setCommandLaneConcurrency(sessionLane, 1);
-    await expect(work.command).resolves.toBe("rejected branch switch command");
-    expect(work.hasCommandRun()).toBe(true);
   });
 
   it.each([
@@ -735,7 +747,7 @@ describe("session message-cut methods", () => {
     const storePath = resolveSessionStorePathCore(undefined, { agentId: "main" });
     const mutationEntered = createDeferredCore();
     const releaseMutation = createDeferredCore();
-    const archiving = runExclusiveSessionLifecycleMutation("archive", {
+    const archiving = runSessionMutation({
       scope: storePath,
       identities: [sourceSessionId],
       run: async () => {
@@ -782,12 +794,21 @@ describe("session message-cut methods", () => {
     ["sessions.rewind", "Rewind"],
     ["sessions.branches.switch", "Branch switch"],
   ] as const)("rejects %s while the source run is active", async (method, label) => {
+    const source = createRpcSourceForTest(
+      {},
+      {
+        sessionKey,
+        sessionId: sourceSessionId,
+        agentId: "main",
+        storeScope: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+      },
+    );
+    const release = await claimRpcSourceForTest(source);
     const respond = await invoke(
       method,
       method === "sessions.branches.switch" ? "off-path-entry" : "user-entry",
-      null,
-      true,
     );
+    release();
 
     expect(respond).toHaveBeenCalledWith(
       false,

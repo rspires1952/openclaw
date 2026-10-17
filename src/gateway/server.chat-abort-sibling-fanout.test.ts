@@ -32,11 +32,12 @@ import {
   replaceSessionEntrySync,
 } from "../config/sessions/session-accessor.js";
 import {
-  beginSessionWorkAdmission,
-  getActiveSessionLifecycleMutationCount,
-  getActiveSessionWorkAdmissionCount,
-  type SessionWorkAdmissionLease,
-} from "../sessions/session-lifecycle-admission.js";
+  beginSessionEffect,
+  getSessionMutationCount,
+  getSessionControllerWorkCount,
+  type SessionEffectRef,
+} from "../sessions/session-controller.lifecycle.js";
+import { observeGatewayConnectionWork } from "./server-held-work.test-support.js";
 import {
   agentCommandMock,
   connectOk,
@@ -50,14 +51,21 @@ import {
 } from "./test-helpers.js";
 
 let gateway: Awaited<ReturnType<typeof createGatewaySuiteHarness>>;
+let connectionObserver: Awaited<ReturnType<typeof observeGatewayConnectionWork>>;
 installGatewayTestHooks({
   scope: "suite",
   setup: async () => {
-    gateway = await createGatewaySuiteHarness();
+    connectionObserver = await observeGatewayConnectionWork();
+    try {
+      gateway = await createGatewaySuiteHarness();
+    } finally {
+      connectionObserver.stopCapture();
+    }
   },
   cleanup: async () => {
     await runQaGatewayFixture(
       async () => gateway?.close(),
+      () => connectionObserver.restore(),
       async () => {
         await settleSubagentRegistryPersistenceWork();
         await resetSubagentRegistryForTests({ persist: false });
@@ -127,12 +135,14 @@ for (const { name, fault, replaceParent } of [
     const socket = await gateway.openWs();
     const parentStarted = createDeferred<AgentCommandOpts>();
     const parentFinish = createDeferred();
-    const leases: SessionWorkAdmissionLease[] = [];
+    const leases: SessionEffectRef[] = [];
+    const releasedLeases = new Set<SessionEffectRef>();
     const interrupted: string[] = [];
     const firstInterrupted = createDeferred();
     const slotReleaseResults: boolean[] = [];
     const start = vi.fn(async () => {});
     let parentRequestId: string | undefined;
+    let parentTerminal: Promise<PromiseSettledResult<unknown>> | undefined;
     let abortResponse: ReturnType<typeof rpcReq> | undefined;
     let abortOutcome:
       | Promise<
@@ -168,6 +178,9 @@ for (const { name, fault, replaceParent } of [
           const command = input as AgentCommandOpts;
           expect(command.abortSignal).toBeInstanceOf(AbortSignal);
           await command.onExecutionStarted?.();
+          command.abortSignal!.addEventListener("abort", () => parentFinish.resolve(), {
+            once: true,
+          });
           parentStarted.resolve(command);
           await parentFinish.promise;
           command.abortSignal!.throwIfAborted();
@@ -195,9 +208,13 @@ for (const { name, fault, replaceParent } of [
           if (running.includes(runId)) {
             // Recovery must observe the live owner when the run is registered.
             leases.push(
-              await beginSessionWorkAdmission({
+              await beginSessionEffect({
                 scope: storePath,
                 identities: [sessionKey(runId), `${runId}-session`],
+                resolveGatewayContext: expectDefined(
+                  connectionObserver.context,
+                  "Gateway fixture context",
+                ).resolveGatewayContext,
                 run: {
                   runId,
                   sessionKey: sessionKey(runId),
@@ -263,10 +280,25 @@ for (const { name, fault, replaceParent } of [
             isSwarmRunWaitingForCapacity(runId, getSubagentRunRuntimeKey(subagentRuns.get(runId)!)),
           ).toBe(true);
         }
-        const activeAdmissionCount = getActiveSessionWorkAdmissionCount();
+        expect(leases).toHaveLength(running.length);
+        for (const lease of leases) {
+          void lease.released.then(() => {
+            releasedLeases.add(lease);
+          });
+        }
+        const activeAdmissionCount = getSessionControllerWorkCount();
         expect(activeAdmissionCount).toBeGreaterThanOrEqual(running.length);
         expect(start).not.toHaveBeenCalled();
 
+        parentTerminal = Promise.allSettled([
+          onceMessage(
+            socket,
+            (frame) =>
+              frame.type === "res" &&
+              frame.id === parentRequestId &&
+              frame.payload?.status !== "accepted",
+          ),
+        ]).then(([result]) => result);
         if (replaceParent) {
           const history = await rpcReq<{
             sessionId: string;
@@ -311,8 +343,8 @@ for (const { name, fault, replaceParent } of [
         await expect.poll(() => interrupted.toSorted(), { timeout: 2_000 }).toEqual(running);
         expect(parent.abortSignal!.aborted).toBe(true);
         expect(slotReleaseResults).toEqual(running.map(() => true));
-        expect(leases.every((lease) => lease.isActive())).toBe(true);
-        expect(getActiveSessionWorkAdmissionCount()).toBe(activeAdmissionCount);
+        expect(releasedLeases.size).toBe(0);
+        expect(getSessionControllerWorkCount()).toBeGreaterThanOrEqual(running.length);
         expect(responseSettled).toBe(false);
         expect(start).not.toHaveBeenCalled();
         if (replaceParent) {
@@ -350,11 +382,7 @@ for (const { name, fault, replaceParent } of [
             ok: false,
             error: {
               code: "INVALID_REQUEST",
-              details: {
-                code: "SESSION_MUTATION_AUTHORIZATION_CHANGED",
-                method: "chat.send",
-                sessionKey: parentKey,
-              },
+              details: { reason: "active-leaf-changed" },
             },
           });
           expect(embeddedRunMock.abortCalls).not.toContain(`${firstRunId}-session`);
@@ -447,17 +475,11 @@ for (const { name, fault, replaceParent } of [
         }
       },
       async () => {
-        const terminal = parentRequestId
-          ? onceMessage(
-              socket,
-              (frame) =>
-                frame.type === "res" &&
-                frame.id === parentRequestId &&
-                frame.payload?.status !== "accepted",
-            )
-          : undefined;
         parentFinish.resolve();
-        await terminal;
+        const terminal = await parentTerminal;
+        if (terminal?.status === "rejected") {
+          throw terminal.reason;
+        }
       },
       async () => {
         const reservationReleases: Promise<void>[] = [];
@@ -474,11 +496,12 @@ for (const { name, fault, replaceParent } of [
             releaseSwarmRun(runId);
           }
           socket.close();
-          expect(getActiveSessionLifecycleMutationCount()).toBe(0);
-          expect(getActiveSessionWorkAdmissionCount()).toBe(0);
         } finally {
           await Promise.all(reservationReleases);
         }
+        socket.close();
+        expect(getSessionMutationCount()).toBe(0);
+        expect(getSessionControllerWorkCount()).toBe(0);
       },
     );
   });

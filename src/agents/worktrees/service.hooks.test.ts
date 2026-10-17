@@ -19,7 +19,7 @@ import {
 import { withTimeout } from "../../infra/fs-safe.js";
 import * as commandRunner from "../../process/exec.js";
 import type { SpawnResult } from "../../process/exec.js";
-import { SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS } from "../../sessions/session-lifecycle-admission.js";
+import { SESSION_CONTROLLER_DRAIN_TIMEOUT_MS } from "../../sessions/session-controller.lifecycle.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
   closeOpenClawStateDatabaseAsync,
@@ -347,7 +347,7 @@ describe("ManagedWorktreeService repository code isolation", () => {
               throw new Error(`Worktree creation completed before ${label}`);
             }),
           ]),
-          SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS,
+          SESSION_CONTROLLER_DRAIN_TIMEOUT_MS,
           label,
         );
       try {

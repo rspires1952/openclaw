@@ -4,11 +4,6 @@ import { Type } from "typebox";
 import { expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement } from "../../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
-import type { ReplyBackendMessageInjectionV2 } from "../../auto-reply/reply/reply-run-registry.contracts.js";
-import {
-  beginReplyMessageInjectionTarget,
-  replyRunRegistry,
-} from "../../auto-reply/reply/reply-run-registry.js";
 import { createTestReplyOperation } from "../../auto-reply/reply/reply-run-registry.test-helpers.js";
 import { setRuntimeConfigSnapshot } from "../../config/config.js";
 import {
@@ -17,6 +12,11 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import { SqliteTranscriptMutationConflictError } from "../../config/sessions/session-mutation-conflict-error.js";
 import type { Context, Model } from "../../llm/types.js";
+import type { ReplyBackendMessageInjectionV2 } from "../../sessions/session-controller.contracts.js";
+import {
+  beginReplyMessageInjectionTarget,
+  captureCurrentReplyMessageInjectionTarget,
+} from "../../sessions/session-controller.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
@@ -476,9 +476,7 @@ it("keeps the active turn and all steers after an earlier steer receipt rewrites
         ),
       );
       expect(staged).toEqual(words.map(() => true));
-      const injectionTarget = replyRunRegistry.resolveCurrentMessageInjectionTarget(
-        target.sessionKey,
-      )!;
+      const injectionTarget = captureCurrentReplyMessageInjectionTarget(target.sessionKey)!;
       attempts.push(
         ...(await Promise.all(
           recorders.map((recorder, index) =>

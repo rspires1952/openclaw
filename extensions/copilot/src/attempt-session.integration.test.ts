@@ -21,12 +21,12 @@ import {
   transcriptMessages,
 } from "./attempt-transcript-journal.test-helpers.js";
 import type { AttemptParamsLike, AttemptResultWithSdkSessionId } from "./attempt-types.js";
-import { runCopilotAttempt } from "./attempt.js";
 import {
   makeAssistantMessageEvent,
   makeFakePool,
   makeFakeSdk,
   projectAgentRunAttemptTerminal,
+  runCopilotAttempt,
 } from "./attempt.test-support.js";
 import { createCopilotTestHostCapabilities } from "./host-capability.test-support.js";
 import type { CopilotClientPool } from "./runtime.js";

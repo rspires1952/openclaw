@@ -20,7 +20,11 @@ import * as operationAdmission from "../../infra/sqlite-worker-operation-admissi
 import { setGatewayPluginMetadataSnapshot } from "../../plugins/current-plugin-metadata-snapshot.js";
 import { retainGatewayPluginMetadata } from "../../plugins/plugin-metadata-lifecycle.js";
 import { resolvePluginMetadataSnapshotAsync } from "../../plugins/plugin-metadata-snapshot.js";
-import * as sessionLifecycle from "../../sessions/session-lifecycle-admission.js";
+import * as sessionControllerLifecycle from "../../sessions/session-controller.lifecycle.js";
+import {
+  getRpcSource,
+  getRpcSourceIdentity,
+} from "../../sessions/session-controller.rpc-sources.js";
 import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import { requireOpenClawStateDatabaseIdentity } from "../../state/openclaw-state-db-cache.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
@@ -203,8 +207,8 @@ it.each(["unchanged", "caller revoked", "session replaced"] as const)(
       using diagnostics = startChatSendDiagnostics(log);
       const queued = createDeferred();
       const begin = createDeferred();
-      const beginAdmission = sessionLifecycle.beginSessionWorkAdmission;
-      using delayedAdmission = vi.spyOn(sessionLifecycle, "beginSessionWorkAdmission");
+      const beginAdmission = sessionControllerLifecycle.beginSessionEffect;
+      using delayedAdmission = vi.spyOn(sessionControllerLifecycle, "beginSessionEffect");
       delayedAdmission.mockImplementationOnce(async (params) => {
         queued.resolve();
         await begin.promise;
@@ -330,10 +334,12 @@ it.each(["unchanged", "caller revoked", "session replaced"] as const)(
           change === "unchanged",
         );
         if (change === "unchanged") {
-          expect(context.chatAbortControllers.get(runId)?.sessionId).toBe(entry.sessionId);
+          expect(getRpcSourceIdentity(getRpcSource(runId)!)).toMatchObject({
+            sessionId: entry.sessionId,
+          });
           expect(respond).not.toHaveBeenCalled();
         } else {
-          expect(context.chatAbortControllers.size).toBe(0);
+          expect(getRpcSource(runId)).toBeUndefined();
           expect(respond.mock.calls[0]?.[2]?.message).toContain(
             change === "caller revoked"
               ? "Original chat caller revoked"
@@ -583,7 +589,7 @@ it("releases rejected upload reservations so corrected input can reuse its key",
         await expect(admission).resolves.toMatchObject({ ok: false });
       }
       expect(context.dedupe.has(session.pendingChatSendKey)).toBe(false);
-      expect(context.chatAbortControllers.size).toBe(0);
+      expect(getRpcSource(runId)).toBeUndefined();
       const corrected = await normalizeChatSendRequest({
         client: null,
         params: { sessionKey, message: "Hello", idempotencyKey: runId },
@@ -672,11 +678,11 @@ it.each(["known-source", "new-terminal", "new-receipt"] as const)(
         content: "Hello",
         __openclaw: { humanMentions: [{ profileId: "bob", start: 0, end: 5 }] },
       });
-      const begin = sessionLifecycle.beginSessionWorkAdmission;
+      const begin = sessionControllerLifecycle.beginSessionEffect;
       const publication =
         source === "new-receipt"
           ? vi
-              .spyOn(sessionLifecycle, "beginSessionWorkAdmission")
+              .spyOn(sessionControllerLifecycle, "beginSessionEffect")
               .mockImplementation(async (params) => {
                 const lease = await begin(params);
                 context.dedupe.delete(pendingChatSendDedupeKey(runId));
@@ -714,15 +720,15 @@ it.each(["known-source", "new-terminal", "new-receipt"] as const)(
                 },
           ),
         );
-        expect(context.chatAbortControllers.size).toBe(0);
+        expect(getRpcSource(runId)).toBeUndefined();
         expect(context.dedupe.has(pendingChatSendDedupeKey(runId))).toBe(false);
         expect(context.dedupe.size).toBe(source === "new-receipt" ? 1 : 0);
         expect(
-          sessionLifecycle.getSessionWorkAdmissionRelease({
-            scope: session.storePath,
-            identities: [sessionKey, session.entry?.sessionId],
-          }),
-        ).toBeUndefined();
+          sessionControllerLifecycle.isSessionControllerWorkActive(session.storePath, [
+            sessionKey,
+            session.entry?.sessionId,
+          ]),
+        ).toBe(false);
       } finally {
         publication?.mockRestore();
         comparison.mockRestore();
@@ -901,17 +907,17 @@ it.each([
       expect(result.ok).toBe(accepted);
       if (accepted && result.ok) {
         expect(respond).not.toHaveBeenCalled();
-        expect(context.chatAbortControllers.size).toBe(1);
+        expect(getRpcSource(runId)).toBeDefined();
         expect(Boolean(result.value.restartSafeAdmission)).toBe(change === "retired placement");
       } else {
         expect(respond).toHaveBeenCalledOnce();
-        expect(context.chatAbortControllers.size).toBe(0);
+        expect(getRpcSource(runId)).toBeUndefined();
       }
       expect(context.dedupe.has(pendingChatSendDedupeKey(runId))).toBe(false);
       expect(sessionAccessor.loadSessionEntry(scope)).toEqual(initialEntry);
       if (!accepted) {
         expect(
-          sessionLifecycle.getSessionWorkAdmissionRelease({
+          sessionControllerLifecycle.captureSessionControllerSettlement({
             scope: session.storePath,
             identities: [sessionKey, entry.sessionId],
           }),
@@ -936,9 +942,9 @@ it.each([
       }
       clearAgentRunContext(runId);
     }
-    expect(context.chatAbortControllers.size).toBe(0);
+    expect(getRpcSource(runId)).toBeUndefined();
     expect(
-      sessionLifecycle.getSessionWorkAdmissionRelease({
+      sessionControllerLifecycle.captureSessionControllerSettlement({
         scope: session.storePath,
         identities: [sessionKey, entry.sessionId],
       }),

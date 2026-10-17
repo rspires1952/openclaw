@@ -15,7 +15,7 @@ import { projectPublicSessionEntry } from "../../config/sessions/session-entry-p
 import * as sharingStore from "../../config/sessions/session-sharing-store.js";
 import { isSecretValueRegisteredForRedaction } from "../../logging/secret-redaction-registry.js";
 import { resetSecretRedactionRegistryForTest } from "../../logging/secret-redaction-registry.test-support.js";
-import * as sharingLifecycle from "../../sessions/session-lifecycle-admission.js";
+import * as sharingLifecycle from "../../sessions/session-controller.lifecycle.js";
 import {
   closeOpenClawAgentDatabasesAsync,
   closeOpenClawAgentDatabasesForTest,
@@ -186,13 +186,11 @@ describe("world-readable session publication management", () => {
       const requestContext = sessionSharingTestContext(vi.fn(), firstConfig);
       requestContext.getRuntimeConfig = () => currentConfig;
       await initializeSessionReadContext(requestContext);
-      const run = sharingLifecycle.runExclusiveSessionLifecycleMutation;
-      vi.spyOn(sharingLifecycle, "runExclusiveSessionLifecycleMutation").mockImplementationOnce(
-        async (operation, params) => {
-          currentConfig = secondConfig;
-          return run(operation, params);
-        },
-      );
+      const run = sharingLifecycle.runSessionMutation;
+      vi.spyOn(sharingLifecycle, "runSessionMutation").mockImplementationOnce(async (params) => {
+        currentConfig = secondConfig;
+        return run(params);
+      });
       const admin = identifiedClient("admin");
       admin.connect.scopes = ["operator.admin"];
       const responses: Parameters<RespondFn>[] = [];
@@ -238,11 +236,11 @@ describe("world-readable session publication management", () => {
             sessionId: "replacement-generation",
           });
         if (method !== "session.members.listEvidence") {
-          const run = sharingLifecycle.runExclusiveSessionLifecycleMutation;
-          vi.spyOn(sharingLifecycle, "runExclusiveSessionLifecycleMutation").mockImplementationOnce(
-            async (operation, params) => {
+          const run = sharingLifecycle.runSessionMutation;
+          vi.spyOn(sharingLifecycle, "runSessionMutation").mockImplementationOnce(
+            async (params) => {
               await resetSession();
-              return run(operation, params);
+              return run(params);
             },
           );
         } else {
@@ -279,13 +277,11 @@ describe("world-readable session publication management", () => {
         true,
       );
       expect(loadSessionEntry(scope)?.visibility).toBeUndefined();
-      const run = sharingLifecycle.runExclusiveSessionLifecycleMutation;
-      vi.spyOn(sharingLifecycle, "runExclusiveSessionLifecycleMutation").mockImplementationOnce(
-        async (operation, params) => {
-          await upsertSessionEntryCore(scope, { visibility: "draft" });
-          return run(operation, params);
-        },
-      );
+      const run = sharingLifecycle.runSessionMutation;
+      vi.spyOn(sharingLifecycle, "runSessionMutation").mockImplementationOnce(async (params) => {
+        await upsertSessionEntryCore(scope, { visibility: "draft" });
+        return run(params);
+      });
       expect((await call("session.visibility.set", { ...scope, visibility: "shared" }))?.[0]).toBe(
         true,
       );

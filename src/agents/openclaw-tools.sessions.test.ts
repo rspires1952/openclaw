@@ -35,10 +35,10 @@ import {
   resetGatewayWorkAdmission,
 } from "../process/gateway-work-admission.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
+import * as controllerSteer from "../sessions/session-controller.steer.js";
 import { runOpenClawAgentWriteAdmission } from "../state/openclaw-agent-write-admission.js";
 import { useSessionStoreTempDirs } from "../test-utils/session-state-cleanup.js";
 import { resetAdjustedParamsByToolCallIdForTests } from "./agent-tools.before-tool-call.state.js";
-import * as embeddedRuns from "./embedded-agent-runner/runs.js";
 import { testing as embeddedRunsTesting } from "./embedded-agent-runner/runs.test-support.js";
 import { registerSessionsSendParticipantTests } from "./openclaw-tools.sessions-participants.test-support.js";
 import { registerSessionsSendResumeTests } from "./openclaw-tools.sessions-resume.test-support.js";
@@ -728,7 +728,7 @@ describe("sessions tools", () => {
       name: "non-Cron run-looking key",
       key: "agent:leasing-ops:slack:channel:c-room:run:run-fast",
       streaming: false,
-      reason: "not_streaming",
+      reason: "injection_unavailable",
     },
   ])(
     "rejects $name without durable-session fallback",
@@ -793,7 +793,10 @@ describe("sessions tools", () => {
       steered: true,
       busyPastDeadline: true,
     },
-    { name: "starts the same child during compaction", rejection: "compacting" as const },
+    {
+      name: "starts the same child during compaction",
+      rejection: "injection_unavailable" as const,
+    },
   ])("sessions_send $name", async (testCase) => {
     const { steered, busyPastDeadline, rejection } = testCase;
     const requesterKey = "agent:main:main";
@@ -814,16 +817,11 @@ describe("sessions tools", () => {
         }
       });
     }
-    const queue = vi.spyOn(embeddedRuns, "queueGuardedEmbeddedAgentMessageWithOutcomeAsync");
+    const queue = vi.spyOn(controllerSteer, "steerSessionControllerOperation");
     const prepare = vi.spyOn(sessionsSendFollowup, "prepareSessionsSendFollowup");
     try {
       if (rejection) {
-        queue.mockResolvedValueOnce({
-          queued: false,
-          sessionId,
-          reason: rejection,
-          gatewayHealth: "live",
-        });
+        queue.mockResolvedValueOnce({ status: "rejected", reason: rejection });
       }
       mockGatewayResponses({
         agent: { runId: "child-followup", status: "accepted" },
@@ -843,10 +841,11 @@ describe("sessions tools", () => {
         delivery: { status: steered ? "skipped" : "pending" },
       });
       expect(queue).toHaveBeenCalledOnce();
-      expect(queue).toHaveBeenCalledWith(
-        sessionId,
-        expect.stringContaining("deps are ready"),
-        {
+      expect(queue).toHaveBeenCalledWith({
+        operation: expect.objectContaining({ sessionId }),
+        text: expect.stringContaining("deps are ready"),
+        abortOnUnconfirmedTranscript: false,
+        options: {
           steeringMode: "all",
           debounceMs: 0,
           deliveryTimeoutMs: 30_000,
@@ -854,8 +853,7 @@ describe("sessions tools", () => {
           onQueueAccepted: expect.any(Function),
           userTurnTranscriptRecorder: expect.any(Object),
         },
-        expect.any(Function),
-      );
+      });
       if (steered) {
         expect(queueMessage).toHaveBeenCalledOnce();
       }

@@ -14,18 +14,19 @@ import type { RawData } from "ws";
 import type { HelloOk } from "../../packages/gateway-protocol/src/index.js";
 import { createDeferred } from "../../test/helpers/promise.js";
 import type { AgentCommandOpts } from "../agents/command/types.js";
+import { resolveActiveEmbeddedRunOwnerByRunId } from "../agents/embedded-agent-runner/runs.js";
 import {
-  clearActiveEmbeddedRun,
-  resolveActiveEmbeddedRunOwnerByRunId,
-  setActiveEmbeddedRun,
-} from "../agents/embedded-agent-runner/runs.js";
+  clearTestEmbeddedRun as clearActiveEmbeddedRun,
+  registerTestEmbeddedRun as setActiveEmbeddedRun,
+} from "../agents/embedded-agent-runner/runs.test-support.js";
 import * as subagentControl from "../agents/subagents/registry/subagent-control.js";
 import { createQueueTestRun } from "../auto-reply/reply/queue.test-helpers.js";
 import * as queueCleanup from "../auto-reply/reply/queue/cleanup.js";
-import { clearFollowupDrainCallback } from "../auto-reply/reply/queue/drain.js";
 import { enqueueFollowupRun } from "../auto-reply/reply/queue/enqueue.js";
-import { clearFollowupQueue, getExistingFollowupQueue } from "../auto-reply/reply/queue/state.js";
+import { getExistingFollowupQueue } from "../auto-reply/reply/queue/state.js";
 import { loadOrCreateDeviceIdentity } from "../infra/device-identity.js";
+import { getRpcSourceIdentity } from "../sessions/session-controller.rpc-sources.js";
+import { rpcSourceTesting } from "../sessions/session-lifecycle-admission.test-support.js";
 import { observeGatewayRunExecution } from "./agent-command.test-helpers.js";
 import { callGatewayCli } from "./call.js";
 import * as chatAbort from "./chat-abort.js";
@@ -46,7 +47,7 @@ const gatewayToken = "abort-authorization-test-token";
 let harness: Awaited<ReturnType<typeof createGatewaySuiteHarness>>;
 let registration: MockInstance<typeof chatAbort.registerChatAbortController>;
 let childCancellation: MockInstance<typeof subagentControl.killAllControlledSubagentRuns>;
-let queueClearing: MockInstance<typeof queueCleanup.clearSessionLifecycleQueues>;
+let queueClearing: MockInstance<typeof queueCleanup.clearSessionQueues>;
 
 beforeAll(async () => {
   harness = await createGatewaySuiteHarness({
@@ -55,7 +56,7 @@ beforeAll(async () => {
   // Observe production admission and effects without replacing their implementations.
   registration = vi.spyOn(chatAbort, "registerChatAbortController");
   childCancellation = vi.spyOn(subagentControl, "killAllControlledSubagentRuns");
-  queueClearing = vi.spyOn(queueCleanup, "clearSessionLifecycleQueues");
+  queueClearing = vi.spyOn(queueCleanup, "clearSessionQueues");
 });
 
 beforeEach(async () => {
@@ -96,6 +97,16 @@ async function startNativeRun(owner: Awaited<ReturnType<typeof openOperator>>, n
   const sessionKey = `agent:main:${name}`;
   const started = createDeferred();
   const finish = createDeferred();
+  let terminal: ReturnType<typeof onceMessage> | undefined;
+  const finishCommand = () => {
+    // Start the response deadline only when this modeled command can finish.
+    terminal ??= onceMessage(
+      owner.ws,
+      (frame) => frame.type === "res" && frame.id === runId && frame.payload?.status !== "accepted",
+    );
+    void terminal.catch(() => {});
+    finish.resolve();
+  };
   const nativeAbort = vi.fn();
   let command: AgentCommandOpts;
   let handle: Parameters<typeof setActiveEmbeddedRun>[1];
@@ -104,8 +115,12 @@ async function startNativeRun(owner: Awaited<ReturnType<typeof openOperator>>, n
     expect(command.abortSignal).toBeInstanceOf(AbortSignal);
     const runController = new AbortController();
     const abort = () => {
+      if (runController.signal.aborted) {
+        return;
+      }
       nativeAbort();
       runController.abort();
+      finishCommand();
     };
     handle = {
       runId,
@@ -142,17 +157,19 @@ async function startNativeRun(owner: Awaited<ReturnType<typeof openOperator>>, n
     await started.promise;
     const admission = registration.mock.calls.find(([input]) => input.runId === runId)?.[0];
     expect(admission).toBeDefined();
-    const entry = admission!.chatAbortControllers.get(runId)!;
-    expect(entry).toMatchObject({
-      ownerConnId: owner.hello.server.connId,
-      ownerDeviceId: owner.deviceId,
+    const entry = rpcSourceTesting.get(runId)!;
+    expect(entry.adapter).toMatchObject({
+      requester: {
+        connectionId: owner.hello.server.connId,
+        deviceId: owner.deviceId,
+      },
       kind: "agent",
-      sessionKey,
     });
+    expect(getRpcSourceIdentity(entry).sessionKey).toBe(sessionKey);
     expect(resolveActiveEmbeddedRunOwnerByRunId(runId)).toMatchObject({
       runId,
       sessionKey,
-      sessionId: entry.sessionId,
+      sessionId: getRpcSourceIdentity(entry).sessionId,
     });
     return {
       runId,
@@ -160,14 +177,7 @@ async function startNativeRun(owner: Awaited<ReturnType<typeof openOperator>>, n
       entry,
       nativeAbort,
       finish: async () => {
-        // The modeled command cannot finish until released. Start its response
-        // deadline here, not while the test deliberately holds execution open.
-        const terminal = onceMessage(
-          owner.ws,
-          (frame) =>
-            frame.type === "res" && frame.id === runId && frame.payload?.status !== "accepted",
-        );
-        finish.resolve();
+        finishCommand();
         try {
           await terminal;
         } finally {
@@ -215,6 +225,13 @@ describe("native sessions.abort requester authorization over WebSocket", () => {
     };
     owner.ws.on("message", record);
     const queued = createQueueTestRun({ prompt: "preserve queued followup" });
+    const target = run.entry.input.target!;
+    queued.run = {
+      ...queued.run,
+      agentId: target.agentId!,
+      sessionId: target.incarnation!,
+      config: { session: { store: target.storeScope } },
+    };
     enqueueFollowupRun(run.sessionKey, queued, { mode: "collect" });
     const queue = getExistingFollowupQueue(run.sessionKey)!;
     try {
@@ -246,7 +263,7 @@ describe("native sessions.abort requester authorization over WebSocket", () => {
       expect
         .soft(result)
         .toMatchObject({ ok: false, error: { code: "INVALID_REQUEST", message: "unauthorized" } });
-      expect.soft(run.entry.controller.signal.aborted).toBe(false);
+      expect.soft(run.entry.input.abortSignal.aborted).toBe(false);
       expect.soft(run.nativeAbort).not.toHaveBeenCalled();
       expect.soft(childCancellation).not.toHaveBeenCalled();
       expect.soft(queueClearing).not.toHaveBeenCalled();
@@ -269,8 +286,7 @@ describe("native sessions.abort requester authorization over WebSocket", () => {
       expect(events).toContain("sessions.changed");
     } finally {
       owner.ws.off("message", record);
-      clearFollowupQueue(run.sessionKey);
-      clearFollowupDrainCallback(run.sessionKey);
+      queueCleanup.clearSessionQueues([run.sessionKey]);
       try {
         await run.finish();
       } finally {
@@ -303,14 +319,14 @@ describe("native sessions.abort requester authorization over WebSocket", () => {
         result,
         JSON.stringify({
           result,
-          controllerAborted: run.entry.controller.signal.aborted,
+          controllerAborted: run.entry.input.abortSignal.aborted,
           nativeAbortCalls: run.nativeAbort.mock.calls.length,
         }),
       ).toMatchObject({
         ok: true,
         payload: { status: "aborted", abortedRunId: run.runId },
       });
-      expect(run.entry.controller.signal.aborted).toBe(true);
+      expect(run.entry.input.abortSignal.aborted).toBe(true);
       expect(run.nativeAbort).toHaveBeenCalledTimes(1);
     } finally {
       try {
@@ -344,7 +360,7 @@ describe("native sessions.abort requester authorization over WebSocket", () => {
         await expect(callGatewayCli({ ...options, scopes: ["operator.write"] })).rejects.toThrow(
           "unauthorized",
         );
-        expect(run.entry.controller.signal.aborted).toBe(false);
+        expect(run.entry.input.abortSignal.aborted).toBe(false);
         expect(run.nativeAbort).not.toHaveBeenCalled();
 
         await expect(callGatewayCli(options)).resolves.toMatchObject(
@@ -352,7 +368,7 @@ describe("native sessions.abort requester authorization over WebSocket", () => {
             ? { aborted: true, runIds: [run.runId] }
             : { status: "aborted", abortedRunId: run.runId },
         );
-        expect(run.entry.controller.signal.aborted).toBe(true);
+        expect(run.entry.input.abortSignal.aborted).toBe(true);
         expect(run.nativeAbort).toHaveBeenCalledTimes(1);
       } finally {
         try {
@@ -368,7 +384,8 @@ describe("native sessions.abort requester authorization over WebSocket", () => {
     const owner = await openOperator("recovered-owner");
     const sessionKey = "agent:main:recovered";
     const runId = "native-recovered";
-    const abort = vi.fn();
+    const stopped = createDeferred();
+    const abort = vi.fn(() => stopped.resolve());
     const handle = {
       runId,
       abort,
@@ -377,16 +394,23 @@ describe("native sessions.abort requester authorization over WebSocket", () => {
       queueMessage: async () => {},
     };
     setActiveEmbeddedRun("recovered-session", handle, sessionKey);
+    const request = rpcReq(owner.ws, "sessions.abort", { key: sessionKey, runId });
     try {
-      const result = await rpcReq(owner.ws, "sessions.abort", { key: sessionKey, runId });
-      expect(result, JSON.stringify(result.error)).toMatchObject({
+      const first = await Promise.race([
+        stopped.promise.then(() => "stopped"),
+        request.then((result) => ({ result })),
+      ]);
+      expect(first).toBe("stopped");
+      expect(abort).toHaveBeenCalledTimes(1);
+      clearActiveEmbeddedRun("recovered-session", handle, sessionKey);
+      expect(await request).toMatchObject({
         ok: true,
         payload: { status: "aborted", abortedRunId: runId },
       });
-      expect(abort).toHaveBeenCalledTimes(1);
     } finally {
       clearActiveEmbeddedRun("recovered-session", handle, sessionKey);
       owner.ws.close();
+      await request.catch(() => {});
     }
   });
 });

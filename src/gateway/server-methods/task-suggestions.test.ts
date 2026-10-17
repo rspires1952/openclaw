@@ -510,6 +510,41 @@ describe("task suggestion gateway methods", () => {
     expect(listed.response?.[1]).toMatchObject({ suggestions: [{ id: taskId }] });
   });
 
+  it("sends an idle session acceptance as a new turn and replays its source key", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      await upsertSessionEntryCore(
+        { agentId: "main", sessionKey: SOURCE_SESSION_KEY },
+        { sessionId: "source-session", updatedAt: 1 },
+      );
+      const taskId = await createSourceSuggestion();
+      const client = operatorClient();
+
+      const accepted = await call("taskSuggestions.accept", { taskId, mode: "session" }, vi.fn(), {
+        client,
+        context: {},
+      });
+      const replay = await call("taskSuggestions.accept", { taskId, mode: "session" });
+
+      expect(accepted.response?.[0]).toBe(true);
+      expect(accepted.response?.[1]).toEqual({ taskId, key: SOURCE_SESSION_KEY });
+      expect(replay.response?.[1]).toEqual({ taskId, key: SOURCE_SESSION_KEY });
+      expect(mocks.handleChatSend).toHaveBeenCalledTimes(1);
+      expect(mocks.handleChatSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          client,
+          params: {
+            sessionKey: SOURCE_SESSION_KEY,
+            agentId: "main",
+            sessionId: "source-session",
+            message: "Apply the focused fix in this session.",
+            queueMode: "steer",
+            idempotencyKey: `task-suggestion:${taskId}`,
+          },
+        }),
+      );
+    });
+  });
+
   it("rejects a missing source session and restores the suggestion", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       const taskId = await createSourceSuggestion();
@@ -517,7 +552,7 @@ describe("task suggestion gateway methods", () => {
 
       const accepted = await call("taskSuggestions.accept", { taskId, mode: "session" }, vi.fn(), {
         client: operatorClient(),
-        context: { chatAbortControllers: new Map() },
+        context: {},
       });
       const listed = await call("taskSuggestions.list", {});
 
@@ -546,7 +581,7 @@ describe("task suggestion gateway methods", () => {
 
       const accepted = await call("taskSuggestions.accept", { taskId, mode: "session" }, vi.fn(), {
         client: operatorClient(),
-        context: { chatAbortControllers: new Map() },
+        context: {},
       });
       const listed = await call("taskSuggestions.list", {});
 

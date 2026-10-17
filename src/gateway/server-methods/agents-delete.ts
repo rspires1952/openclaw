@@ -58,7 +58,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { isMissingPathError } from "../../infra/errors.js";
 import { withAgentExecApprovalsRemoved } from "../../infra/exec-approvals.js";
 import { isPathInside } from "../../infra/path-guards.js";
-import { closeAgentWorkAdmissions } from "../../sessions/session-lifecycle-admission.js";
+import { closeAgentWorkAdmissions } from "../../sessions/session-controller.lifecycle.js";
 import {
   readAgentDeletionJournalAsync,
   type AgentDeletionJournalCleanupPath,

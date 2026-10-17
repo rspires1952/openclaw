@@ -22,6 +22,7 @@ import {
   createEmptyPluginRegistry,
   disposePluginRegistryInstances,
   getActivePluginRegistry,
+  runInHarnessToolAuthorityForTest,
   setActivePluginRegistry,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
 import {
@@ -234,17 +235,23 @@ export function runCodexAppServerAttempt(
     }
   };
   trackedParams.onExecutionPhase = observeExecutionPhase;
-  const promise = runCodexAppServerAttemptImpl(trackedParams, {
-    ...options,
-    startupTimeoutFloorMs: options.startupTimeoutFloorMs ?? 30_000,
-    bindingStore: options.bindingStore ?? testCodexAppServerBindingStore,
-    ...(clientFactory ? { clientFactory } : {}),
-  }).finally(() => {
-    if (trackedParams.onExecutionPhase === observeExecutionPhase) {
-      trackedParams.onExecutionPhase = onExecutionPhase;
-    }
-    activeAppServerAttemptsForTest.delete(entry);
-  });
+  const attemptOptions = options;
+  const runAdmitted = (admitted: EmbeddedRunAttemptParams) =>
+    runCodexAppServerAttemptImpl(admitted, {
+      ...attemptOptions,
+      startupTimeoutFloorMs: attemptOptions.startupTimeoutFloorMs ?? 30_000,
+      bindingStore: attemptOptions.bindingStore ?? testCodexAppServerBindingStore,
+      ...(clientFactory ? { clientFactory } : {}),
+    });
+  // Gateway runs reach the harness inside an admitted session turn.
+  const promise = runInHarnessToolAuthorityForTest(trackedParams, "codex", runAdmitted).finally(
+    () => {
+      if (trackedParams.onExecutionPhase === observeExecutionPhase) {
+        trackedParams.onExecutionPhase = onExecutionPhase;
+      }
+      activeAppServerAttemptsForTest.delete(entry);
+    },
+  );
   entry.promise = promise;
   activeAppServerAttemptsForTest.add(entry);
   promise.catch(() => undefined);

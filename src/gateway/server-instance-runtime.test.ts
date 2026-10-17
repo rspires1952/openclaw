@@ -11,6 +11,7 @@ import {
   stageActivePluginRegistry,
 } from "../plugins/runtime.js";
 import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
+import { rpcSourceTesting } from "../sessions/session-lifecycle-admission.test-support.js";
 import { trackAsyncWork } from "../shared/async-work-scope.js";
 import { createTestRegistry } from "../test-utils/channel-plugins.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
@@ -24,6 +25,7 @@ import { createGatewayInstanceRuntime } from "./server-instance-runtime.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./server-methods/types.js";
 import { createSyntheticPluginRuntimeClient } from "./server-plugin-runtime-client.js";
 import { getGatewayRecoveryRuntime } from "./server-recovery-runtime-context.js";
+import { createRpcSourceForTest, claimRpcSourceForTest } from "./test-helpers.rpc-source.js";
 
 function createContext(): GatewayRequestContext {
   return {
@@ -34,8 +36,6 @@ function createContext(): GatewayRequestContext {
       warn: vi.fn(),
       error: vi.fn(),
     },
-    chatAbortControllers: new Map(),
-    chatQueuedTurns: new Map(),
     dedupe: new Map(),
   } as unknown as GatewayRequestContext;
 }
@@ -134,10 +134,9 @@ describe("createGatewayInstanceRuntime", () => {
       ok: true,
       payload: { runId: "run-cached-active", status: "accepted" },
     });
-    context.chatAbortControllers.set("run-cached-active", {
-      controller: new AbortController(),
-      executionStarted: true,
-    } as never);
+    const activeSource = createRpcSourceForTest({}, { runId: "run-cached-active" });
+    await claimRpcSourceForTest(activeSource);
+    rpcSourceTesting.set("run-cached-active", activeSource);
     await expect(
       runtime.recovery.dispatchAgent(
         { message: "test", idempotencyKey: "run-cached-active" },

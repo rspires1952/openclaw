@@ -14,7 +14,7 @@ import {
 } from "../config/sessions/session-accessor.sqlite-scope.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import { createGatewayActiveWorkSnapshot } from "../infra/gateway-active-work.js";
-import { beginSessionWorkAdmission } from "../sessions/session-lifecycle-admission.js";
+import { beginSessionEffect } from "../sessions/session-controller.lifecycle.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { openOpenClawAgentDatabase } from "../state/openclaw-agent-db.js";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
@@ -493,7 +493,7 @@ test("sessions.create rechecks Fast Mode before interrupting reset work", async 
   });
   let interrupted = false;
   let releaseAdmission = () => {};
-  const admission = await beginSessionWorkAdmission({
+  const admission = await beginSessionEffect({
     scope: storePath,
     identities: [key, "sess-fast-race"],
     assertAllowed: () => undefined,
@@ -562,7 +562,7 @@ test("sessions.create rejects a Fast Mode change completed by draining work befo
     runId: "fast-drain-run",
   });
   const interrupted = createDeferredCore();
-  const admission = await beginSessionWorkAdmission({
+  const admission = await beginSessionEffect({
     scope: storePath,
     identities: [key, initialEntry.sessionId],
     assertAllowed: () => undefined,

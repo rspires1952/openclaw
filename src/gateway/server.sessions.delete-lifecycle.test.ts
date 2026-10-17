@@ -3,7 +3,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { expect, test, vi } from "vitest";
-import { createDeferred } from "../../test/helpers/promise.js";
+import {
+  awaitGateBeforeSettlement,
+  createDeferred,
+  withinTest,
+} from "../../test/helpers/promise.js";
 import { seedCanonicalAcpSessionMeta } from "../acp/runtime/session-meta-fixture.test-support.js";
 import { readAcpSessionEntry } from "../acp/runtime/session-meta.js";
 import {
@@ -17,10 +21,18 @@ import { memorySessionActorOwners } from "../config/sessions/session-actor-memor
 import { acquireSessionActorStorage } from "../config/sessions/session-actor-storage-binding.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import { readAttachedSessionEndTranscriptSourceForTest } from "../plugins/session-end-transcript.test-support.js";
+import { withSessionTurn } from "../sessions/session-controller.admission.js";
 import {
-  beginSessionWorkAdmission,
-  runExclusiveSessionLifecycleMutation,
-} from "../sessions/session-lifecycle-admission.js";
+  beginSessionEffect,
+  captureSessionTarget,
+  isSessionMutationActive,
+  runSessionMutation,
+} from "../sessions/session-controller.lifecycle.js";
+import {
+  submitSessionControllerTask,
+  releaseSessionControllerClaim,
+} from "../sessions/session-controller.mailbox.js";
+import { createReplyOperation } from "../sessions/session-controller.operation.js";
 import { resolveIncognitoOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.paths.js";
 import { deleteIncognitoSessionForReset } from "./session-reset-incognito.js";
 import { embeddedRunMock, rpcReq, testState, writeSessionStore } from "./test-helpers.js";
@@ -97,7 +109,7 @@ test("sessions.delete protects the sole explicit agent's global session before c
 });
 
 test("sessions.delete rejects main and aborts active runs", async () => {
-  const { dir } = await createSessionStoreDir();
+  const { dir, storePath } = await createSessionStoreDir();
   await writeSingleLineSession(dir, "sess-main", "hello");
   await writeSingleLineSession(dir, "sess-active", "active");
 
@@ -108,8 +120,28 @@ test("sessions.delete rejects main and aborts active runs", async () => {
     },
   });
 
-  embeddedRunMock.activeIds.add("sess-active");
-  embeddedRunMock.waitResults.set("sess-active", true);
+  const target = captureSessionTarget({
+    storeScope: storePath,
+    sessionKey: "agent:main:discord:group:dev",
+    aliases: ["discord:group:dev", "sess-active"],
+    incarnation: "sess-active",
+    agentId: "main",
+  });
+  const started = createDeferred();
+  let interrupted = false;
+  const activeRun = withSessionTurn(
+    { sessionKey: target.sessionKey, sessionId: "sess-active", target },
+    async (_operation, signal) => {
+      started.resolve();
+      await new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => {
+          interrupted = true;
+          resolve();
+        });
+      });
+    },
+  );
+  await started.promise;
 
   const mainDelete = await directSessionReq("sessions.delete", { key: "main" });
   expect(mainDelete.ok).toBe(false);
@@ -117,8 +149,9 @@ test("sessions.delete rejects main and aborts active runs", async () => {
   await expectSessionDeleteSucceeds({
     key: "discord:group:dev",
   });
-  expect(embeddedRunMock.abortCalls).toContain("sess-active");
-  expect(embeddedRunMock.activeIds.has("sess-active")).toBe(false);
+  await activeRun;
+  expect(interrupted).toBe(true);
+  expect(embeddedRunMock.abortCalls).not.toContain("sess-active");
   expect(bundleMcpRuntimeMocks.disposeSessionMcpRuntime).toHaveBeenCalledWith("sess-active");
   expect(browserSessionTabMocks.closeTrackedBrowserTabsForSessions).toHaveBeenCalledTimes(1);
   const closeTabsCall = (
@@ -267,6 +300,34 @@ test("sessions.delete removes a locked plugin-owned session from its persisted a
   });
 });
 
+test("sessions.delete interrupts work admitted before runtime registration", async () => {
+  const { storePath } = await createSessionStoreDir();
+  await writeSessionStore({
+    entries: {
+      "agent:main:subagent:worker": sessionStoreEntry("sess-subagent"),
+    },
+  });
+  let interrupted = false;
+  let releaseAdmission = () => {};
+  const admissionLease = await beginSessionEffect({
+    scope: storePath,
+    identities: ["agent:main:subagent:worker", "sess-subagent"],
+    assertAllowed: () => {},
+    onInterrupt: () => {
+      interrupted = true;
+      releaseAdmission();
+    },
+  });
+  releaseAdmission = admissionLease.release;
+
+  const deleted = await expectSessionDeleteSucceeds({
+    key: "agent:main:subagent:worker",
+  });
+
+  expect(deleted.payload?.deleted).toBe(true);
+  expect(interrupted).toBe(true);
+});
+
 test.each(["session id", "updated at"] as const)(
   "sessions.delete rechecks expected %s before interrupting replacement work",
   async (guard) => {
@@ -283,7 +344,7 @@ test.each(["session id", "updated at"] as const)(
       },
     });
     let replacementInterrupted = false;
-    const replacementAdmission = await beginSessionWorkAdmission({
+    const replacementAdmission = await beginSessionEffect({
       scope: storePath,
       identities: [sessionKey, replacementSessionId],
       assertAllowed: () => {},
@@ -294,7 +355,7 @@ test.each(["session id", "updated at"] as const)(
     let releaseBlockingMutation = () => {};
     const { promise: blockingMutationStarted, resolve: markBlockingMutationStarted } =
       createDeferred();
-    const blockingMutation = runExclusiveSessionLifecycleMutation("delete", {
+    const blockingMutation = runSessionMutation({
       scope: storePath,
       identities: [sessionKey],
       run: async () => {
@@ -332,15 +393,119 @@ test.each(["session id", "updated at"] as const)(
   },
 );
 
-test("sessions.delete rejects a same-key successor created during cleanup without a caller identity guard", async () => {
-  const sessionKey = "agent:main:cleanup-successor";
+test("sessions.delete rejects a replacement with the same updated-at timestamp", async () => {
+  const sessionKey = "agent:main:cron:cleanup";
+  const updatedAt = 1_737_600_000_000;
   const { storePath } = await createSessionStoreDir();
-  await writeSessionStore({ entries: { [sessionKey]: sessionStoreEntry("original-session") } });
-  bundleMcpRuntimeMocks.disposeSessionMcpRuntime.mockImplementationOnce(async () => {
-    replaceSessionEntrySync({ sessionKey, storePath }, sessionStoreEntry("successor-session"));
+  await replaceSessionEntry(
+    { sessionKey, storePath },
+    {
+      ...sessionStoreEntry("replacement-run", {
+        lifecycleRevision: "replacement-revision",
+        updatedAt,
+      }),
+    },
+  );
+  let interrupted = false;
+  const admission = await beginSessionEffect({
+    scope: storePath,
+    identities: [sessionKey, "replacement-run"],
+    assertAllowed: () => {},
+    onInterrupt: () => {
+      interrupted = true;
+    },
   });
-  await expectSessionDeleteChanged({ key: sessionKey });
-  expect(loadSessionEntry({ sessionKey, storePath })?.sessionId).toBe("successor-session");
+
+  try {
+    await expectSessionDeleteChanged({
+      key: sessionKey,
+      expectedSessionId: "stale-run",
+      expectedLifecycleRevision: "stale-revision",
+      expectedSessionUpdatedAt: updatedAt,
+    });
+
+    expect(interrupted).toBe(false);
+    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({
+      lifecycleRevision: "replacement-revision",
+      sessionId: "replacement-run",
+      updatedAt,
+    });
+  } finally {
+    admission.release();
+  }
+});
+
+test.each(["controller cancellation", "cleanup"] as const)(
+  "sessions.delete rejects a same-key successor created during %s without a caller identity guard",
+  async (phase) => {
+    const sessionKey = "agent:main:cleanup-successor";
+    const { storePath } = await createSessionStoreDir();
+    await writeSessionStore({ entries: { [sessionKey]: sessionStoreEntry("original-session") } });
+    const replace = () => {
+      replaceSessionEntrySync({ sessionKey, storePath }, sessionStoreEntry("successor-session"));
+    };
+    let releaseAdmission = () => {};
+    if (phase === "controller cancellation") {
+      const admission = await beginSessionEffect({
+        scope: storePath,
+        identities: [sessionKey, "original-session"],
+        assertAllowed: () => {},
+        onInterrupt: () => {
+          try {
+            replace();
+          } finally {
+            releaseAdmission();
+          }
+        },
+      });
+      releaseAdmission = admission.release;
+    } else {
+      bundleMcpRuntimeMocks.disposeSessionMcpRuntime.mockImplementationOnce(async () => replace());
+    }
+    try {
+      await expectSessionDeleteChanged({ key: sessionKey });
+      expect(loadSessionEntry({ sessionKey, storePath })?.sessionId).toBe("successor-session");
+      if (phase === "controller cancellation") {
+        expect(bundleMcpRuntimeMocks.disposeSessionMcpRuntime).not.toHaveBeenCalled();
+      }
+    } finally {
+      releaseAdmission();
+    }
+  },
+);
+
+test("sessions.delete includes cleanup-owned row changes in its guarded deletion", async () => {
+  const sessionKey = "agent:main:cron:cleanup";
+  const sessionId = "sess-cleanup";
+  const lifecycleRevision = "cleanup-revision";
+  const updatedAt = 1_737_600_000_000;
+  const { storePath } = await createSessionStoreDir();
+  await writeSessionStore({
+    entries: {
+      [sessionKey]: sessionStoreEntry(sessionId, { lifecycleRevision, updatedAt }),
+    },
+  });
+  bundleMcpRuntimeMocks.disposeSessionMcpRuntime.mockImplementationOnce(async () => {
+    await writeSessionStore({
+      entries: {
+        [sessionKey]: sessionStoreEntry(sessionId, {
+          label: "cleanup-owned revision",
+          lifecycleRevision,
+          updatedAt: updatedAt + 1,
+        }),
+      },
+    });
+  });
+
+  const deleted = await expectSessionDeleteSucceeds({
+    key: sessionKey,
+    expectedSessionId: sessionId,
+    expectedLifecycleRevision: lifecycleRevision,
+    expectedSessionUpdatedAt: updatedAt,
+  });
+
+  expect(deleted.payload?.deleted).toBe(true);
+  expect(loadSessionEntry({ sessionKey, storePath })).toBeUndefined();
 });
 
 test("sessions.delete serializes a patch behind asynchronous runtime cleanup", async () => {
@@ -405,6 +570,46 @@ test("sessions.delete serializes a patch behind asynchronous runtime cleanup", a
   }
 });
 
+test("sessions.patch waits for an in-flight session lifecycle mutation", async () => {
+  const { storePath } = await createSessionStoreDir();
+  const sessionKey = "agent:main:subagent:worker";
+  const sessionId = "sess-subagent";
+  await writeSessionStore({
+    entries: {
+      [sessionKey]: sessionStoreEntry(sessionId),
+    },
+  });
+  let releaseMutation = () => {};
+  const { promise: mutationStarted, resolve: markMutationStarted } = createDeferred();
+  const mutation = runSessionMutation({
+    scope: storePath,
+    identities: [sessionKey, sessionId],
+    run: async () => {
+      markMutationStarted();
+      await new Promise<void>((release) => {
+        releaseMutation = release;
+      });
+    },
+  });
+  await mutationStarted;
+  let patchSettled = false;
+
+  const patch = directSessionReq("sessions.patch", {
+    key: sessionKey,
+    label: "after lifecycle mutation",
+  }).then((result) => {
+    patchSettled = true;
+    return result;
+  });
+  await Promise.resolve();
+  expect(patchSettled).toBe(false);
+  releaseMutation();
+
+  const [patched] = await Promise.all([patch, mutation]);
+  expect(patched.ok).toBe(true);
+  expect(loadSessionEntry({ sessionKey, storePath })?.label).toBe("after lifecycle mutation");
+});
+
 test("sessions.delete keeps lifecycle admission blocked through session unbinding", async () => {
   const { storePath } = await createSessionStoreDir();
   const sessionKey = "agent:main:subagent:worker";
@@ -443,7 +648,7 @@ test("sessions.delete keeps lifecycle admission blocked through session unbindin
   );
   await unbindStarted;
   let replacementAdmitted = false;
-  const replacement = beginSessionWorkAdmission({
+  const replacement = beginSessionEffect({
     scope: storePath,
     identities: [sessionKey, sessionId],
     assertAllowed: () => {
@@ -494,7 +699,7 @@ test("sessions.delete limits plugin-runtime cleanup to sessions owned by that pl
     },
   } as never;
   let foreignWorkInterrupted = false;
-  const foreignAdmission = await beginSessionWorkAdmission({
+  const foreignAdmission = await beginSessionEffect({
     scope: storePath,
     identities: ["agent:main:dreaming-narrative-foreign", "sess-foreign"],
     assertAllowed: () => {},
@@ -623,7 +828,7 @@ test("sessions.delete closes child ACP runtimes spawned from the deleted parent"
   expect(readAcpSessionEntry({ sessionKey: "agent:main:acp-child" })?.acp).toBeUndefined();
 });
 
-test("sessions.delete returns unavailable when active run does not stop", async () => {
+test("sessions.delete returns unavailable when active run does not stop", async ({ signal }) => {
   const { dir, storePath } = await createSessionStoreDir();
   await writeSingleLineSession(dir, "sess-active", "active");
 
@@ -633,32 +838,95 @@ test("sessions.delete returns unavailable when active run does not stop", async 
     },
   });
 
-  embeddedRunMock.activeIds.add("sess-active");
-  embeddedRunMock.waitResults.set("sess-active", false);
-  const { ws } = await openClient();
-
-  const deleted = await rpcReq(ws, "sessions.delete", {
-    key: "discord:group:dev",
-  });
-  expect(deleted.ok).toBe(false);
-  expect(deleted.error?.code).toBe("UNAVAILABLE");
-  expect(deleted.error?.message ?? "").toMatch(/still active/i);
-  expect(embeddedRunMock.abortCalls).toContain("sess-active");
-  expect(embeddedRunMock.waitCalls).toContain("sess-active");
-  expect(bundleMcpRuntimeMocks.retireSessionMcpRuntime).not.toHaveBeenCalled();
-  expect(browserSessionTabMocks.closeTrackedBrowserTabsForSessions).not.toHaveBeenCalled();
-
-  const storedEntry = loadSessionEntry({
+  const target = captureSessionTarget({
+    storeScope: storePath,
     sessionKey: "agent:main:discord:group:dev",
-    storePath,
+    aliases: ["discord:group:dev", "sess-active"],
+    incarnation: "sess-active",
+    agentId: "main",
   });
-  expect(storedEntry?.sessionId).toBe("sess-active");
-  const filesAfterDeleteAttempt = await fs.readdir(dir);
-  expect(
-    filesAfterDeleteAttempt.filter((fileName) => fileName.startsWith("sess-active.jsonl.deleted.")),
-  ).toEqual([]);
+  const claim = await submitSessionControllerTask(target.sessionKey, {
+    target,
+    start: (mailboxClaim) => {
+      createReplyOperation({
+        sessionKey: target.sessionKey,
+        sessionId: "sess-active",
+        target,
+        resetTriggered: false,
+        mailboxClaim,
+      });
+    },
+  });
+  const operation = claim.operation!;
+  const preemptAttempted = createDeferred();
+  const deadlineArmed = createDeferred();
+  let restoreDeadlineObserver = () => {};
+  vi.spyOn(operation, "abort").mockImplementation(() => {
+    if (!vi.isFakeTimers()) {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const schedule = globalThis.setTimeout;
+      const observer = vi
+        .spyOn(globalThis, "setTimeout")
+        .mockImplementation((callback, ms, ...args) => {
+          const timer = schedule(callback, ms, ...args);
+          if (ms === 15_000) {
+            deadlineArmed.resolve();
+          }
+          return timer;
+        });
+      restoreDeadlineObserver = () => {
+        restoreDeadlineObserver = () => {};
+        observer.mockRestore();
+      };
+    }
+    preemptAttempted.resolve();
+    return false;
+  });
+  const deletion = directSessionReq("sessions.delete", { key: "discord:group:dev" });
+  void deletion.catch(() => {});
+  try {
+    await withinTest(
+      awaitGateBeforeSettlement(
+        preemptAttempted.promise,
+        deletion,
+        "Session deletion settled before attempting to stop its active run",
+      ),
+      signal,
+    );
+    expect(isSessionMutationActive(storePath, target.aliases)).toBe(true);
+    await withinTest(deadlineArmed.promise, signal);
+    await vi.advanceTimersByTimeAsync(15_000);
+    restoreDeadlineObserver();
+    vi.useRealTimers();
 
-  ws.close();
+    const deleted = await withinTest(deletion, signal);
+    expect(deleted.ok).toBe(false);
+    expect(deleted.error).toEqual({
+      code: "UNAVAILABLE",
+      message:
+        "Session discord:group:dev could not safely stop before deletion: Session agent:main:discord:group:dev did not settle before delete preemption timed out Retry after active work or worker recovery finishes.",
+      retryable: true,
+    });
+    expect(bundleMcpRuntimeMocks.retireSessionMcpRuntime).not.toHaveBeenCalled();
+    expect(browserSessionTabMocks.closeTrackedBrowserTabsForSessions).not.toHaveBeenCalled();
+
+    expect(loadSessionEntry({ sessionKey: target.sessionKey, storePath })?.sessionId).toBe(
+      "sess-active",
+    );
+    const filesAfterDeleteAttempt = await fs.readdir(dir);
+    expect(
+      filesAfterDeleteAttempt.filter((fileName) =>
+        fileName.startsWith("sess-active.jsonl.deleted."),
+      ),
+    ).toEqual([]);
+  } finally {
+    restoreDeadlineObserver();
+    vi.useRealTimers();
+    operation.complete();
+    releaseSessionControllerClaim(claim);
+    await claim.settlement.promise;
+    await deletion.catch(() => undefined);
+  }
 });
 
 test("sessions.delete refreshes memory metadata changed by cleanup without an ambient actor", async () => {

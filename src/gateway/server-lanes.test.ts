@@ -106,7 +106,7 @@ describe("applyGatewayLaneConcurrency", () => {
       const release = createDeferred();
       const started: number[] = [];
       const runs = Array.from({ length: limit + 2 }, (_, index) =>
-        enqueueCommandInLane(`session:agent:main:recall-${index}`, () =>
+        enqueueCommandInLane(`test:recall-parent-${index}`, () =>
           enqueueCommandInLane("active-memory", async () => {
             started.push(index);
             await release.promise;

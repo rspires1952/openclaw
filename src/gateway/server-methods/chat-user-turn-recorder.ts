@@ -12,6 +12,7 @@ import {
 } from "../../config/sessions/session-source-authority.js";
 import { measureDiagnosticsTimelineSpan } from "../../infra/diagnostics-timeline.js";
 import { isProgressCardRefreshInputProvenance } from "../../sessions/input-provenance.js";
+import { getRpcSourceIdentity } from "../../sessions/session-controller.rpc-sources.js";
 import {
   buildRunUserTurnIdempotencyKey,
   createUserTurnTranscriptRecorder,
@@ -144,7 +145,7 @@ export function createGatewayChatUserTurnController(params: {
             stableStringify([
               {
                 ...request.p,
-                sessionId: admission.sessionBinding.sessionId,
+                sessionId: getRpcSourceIdentity(admission.sourceRef).sessionId,
                 expectedLeafEntryId: undefined,
               },
               sender.identity ?? sender.id,
@@ -168,7 +169,7 @@ export function createGatewayChatUserTurnController(params: {
     target: () => {
       // Retain only the current binding; transcript writers recheck it at commit.
       const target = session.sessionTarget;
-      const sessionId = admission.sessionBinding.sessionId;
+      const sessionId = getRpcSourceIdentity(admission.sourceRef).sessionId;
       return {
         sessionId,
         expectedSessionId: sessionId,

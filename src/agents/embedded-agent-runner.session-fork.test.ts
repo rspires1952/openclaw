@@ -450,6 +450,7 @@ describe("embedded cache-parity session fork", () => {
               previousSessionEntry: { sessionId },
               agentId: "main",
               sessionKey,
+              storePath: target.storePath,
               onError: onResetError,
             });
           await expect(fork()).rejects.toThrow("requires a parent turn");

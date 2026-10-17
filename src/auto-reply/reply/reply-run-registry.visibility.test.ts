@@ -6,6 +6,16 @@ import {
   QuestionDispatchUnsupportedError,
 } from "../../agents/harness/gateway-question-dispatch.js";
 import { clearAgentRunContext, registerAgentRunContext } from "../../infra/agent-run-registry.js";
+import type {
+  ReplyBackendMessageInjectionV2,
+  ReplyBackendQueueMessageOptions,
+} from "../../sessions/session-controller.contracts.js";
+import {
+  beginReplyMessageInjectionTarget,
+  finalizeReplyMessageInjectionAttempt,
+  captureCurrentReplyMessageInjectionTarget,
+} from "../../sessions/session-controller.js";
+import { testing } from "../../sessions/session-controller.test-support.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
   MessageInjectionAcceptedUnconfirmedError,
@@ -13,19 +23,9 @@ import {
   MessageInjectionTargetUnavailableError,
   MessageInjectionWithdrawnError,
 } from "./message-injection-authority.js";
-import type {
-  ReplyBackendMessageInjectionV2,
-  ReplyBackendQueueMessageOptions,
-} from "./reply-run-registry.contracts.js";
-import {
-  beginReplyMessageInjectionTarget,
-  finalizeReplyMessageInjectionAttempt,
-  replyRunRegistry,
-} from "./reply-run-registry.js";
 import { createTestReplyOperation } from "./reply-run-registry.test-helpers.js";
-import { testing } from "./reply-run-registry.test-support.js";
 
-afterEach(() => testing.resetReplyRunRegistry());
+afterEach(() => testing.resetSessionControllerForTest());
 
 it("keeps cross-profile question answers out of a backend restricted to its turn owner", async () => {
   const authority = (profileId: string) =>
@@ -60,7 +60,7 @@ it("keeps cross-profile question answers out of a backend restricted to its turn
     });
     operation.setPhase("running");
     try {
-      const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key)!;
+      const target = captureCurrentReplyMessageInjectionTarget(operation.key)!;
       const answer = async (operatorAuthority: typeof owner) =>
         (
           await beginReplyMessageInjectionTarget(target, "Green", {
@@ -109,13 +109,13 @@ it("leaves new human input for a visible followup instead of a hidden coordinati
     messageInjection: { isAvailable: () => true, queueMessage },
   });
   operation.setPhase("running");
-  const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key);
+  const target = captureCurrentReplyMessageInjectionTarget(operation.key);
   if (!target) {
     throw new Error("Expected a visible run to accept steering before its display scope changed");
   }
   registerAgentRunContext(runId, { isControlUiVisible: false, projectSessionMessages: false });
   try {
-    expect(replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key)).toMatchObject({
+    expect(captureCurrentReplyMessageInjectionTarget(operation.key)).toMatchObject({
       runId,
     });
     await expect(
@@ -213,7 +213,7 @@ it.each([
         throwFromSink(undefined, assertCurrent),
     },
     async (operation) => {
-      const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key)!;
+      const target = captureCurrentReplyMessageInjectionTarget(operation.key)!;
       const attempt = await beginReplyMessageInjectionTarget(target, "Keep this input", {
         isInboundUserMessage: true,
         toolAuthorityFingerprint: "same-owner",
@@ -257,7 +257,7 @@ it.each([
   await withHiddenQuestionRun(
     { version: 2, isAvailable: () => true, queueMessage, claimPendingUserInputAnswer },
     async (operation) => {
-      const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key);
+      const target = captureCurrentReplyMessageInjectionTarget(operation.key);
       expect(target).toBeDefined();
       const onQueueSettled = vi.fn();
       const result = await (
@@ -300,7 +300,7 @@ it.each(["source", "backend"] as const)(
         },
       },
       async (operation) => {
-        const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key);
+        const target = captureCurrentReplyMessageInjectionTarget(operation.key);
         expect(target).toBeDefined();
         const attempt = await beginReplyMessageInjectionTarget(target!, "Green", {
           isInboundUserMessage: true,
@@ -358,7 +358,7 @@ it.each(["same-owner", "other-owner"])(
         cancelPendingUserInput,
       },
       async (operation) => {
-        const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key);
+        const target = captureCurrentReplyMessageInjectionTarget(operation.key);
         expect(target).toBeDefined();
         await expect(
           (
@@ -404,7 +404,7 @@ it.each(["same-owner", "different-owner"])(
       },
     });
     operation.setPhase("running");
-    const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key)!;
+    const target = captureCurrentReplyMessageInjectionTarget(operation.key)!;
     const result = await (
       await beginReplyMessageInjectionTarget(target, "Refresh the card", {
         isInboundUserMessage: true,
@@ -445,7 +445,7 @@ it.each(["result", "exception"] as const)(
       },
     });
     operation.setPhase("running");
-    const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key)!;
+    const target = captureCurrentReplyMessageInjectionTarget(operation.key)!;
     const attempt = await beginReplyMessageInjectionTarget(target, "Queued guidance", {
       onQueueAccepted,
     });
@@ -478,7 +478,7 @@ it.each([false, true])(
       messageInjection: { isAvailable: () => true, queueMessage: async () => {} },
     });
     operation.setPhase("running");
-    const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key)!;
+    const target = captureCurrentReplyMessageInjectionTarget(operation.key)!;
     const attempt = await beginReplyMessageInjectionTarget(target, "Confirmed guidance");
     await expect(attempt.outcome).resolves.toEqual({ status: "accepted" });
     if (replaced) {

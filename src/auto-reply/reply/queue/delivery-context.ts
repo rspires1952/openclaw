@@ -27,11 +27,13 @@ export function hasPreparedCurrentTurnImages(run: InternalFollowupRun): boolean 
   return run.currentTurnImagesPrepared === true;
 }
 
-const QUEUED_ADMISSION_OWNER_STATE_KEY = Symbol.for("openclaw.queuedAdmissionOwnerState");
-const queuedAdmissionOwnerState = resolveGlobalSingleton(QUEUED_ADMISSION_OWNER_STATE_KEY, () => ({
-  keys: new WeakMap<NonNullable<FollowupRun["turnAdoptionLifecycle"]>, string>(),
-  nextId: 1,
-}));
+const queuedAdmissionOwnerState = resolveGlobalSingleton(
+  Symbol.for("openclaw.queuedAdmissionOwnerState"),
+  () => ({
+    keys: new WeakMap<NonNullable<FollowupRun["turnAdoptionLifecycle"]>, string>(),
+    nextId: 1,
+  }),
+);
 
 export function hasExclusiveTurnAdmission(
   lifecycle: FollowupRun["turnAdoptionLifecycle"],
@@ -69,8 +71,6 @@ function resolveTurnAdoptionLifecycleDeliveryKey(
     admissionOwnerKey = `admission:${queuedAdmissionOwnerState.nextId++}`;
     queuedAdmissionOwnerState.keys.set(lifecycle, admissionOwnerKey);
   }
-  // Durable admission callbacks own separate ingress identities. Combining
-  // them would let one source commit before a sibling rejects the aggregate.
   return JSON.stringify([explicitOwnerKey, admissionOwnerKey]);
 }
 
@@ -392,9 +392,10 @@ export function collectRuntimeMetadata(
   return {
     sourceTurnId: authoritySource?.sourceTurnId,
     operatorAuthority: authoritySource?.operatorAuthority,
-    ...(items.length > 0 && items.every((item) => item.personalBootstrapEligible === true)
-      ? { personalBootstrapEligible: true }
-      : {}),
+    personalBootstrapEligible:
+      items.length > 0 && items.every((item) => item.personalBootstrapEligible === true)
+        ? true
+        : undefined,
     currentInboundEventKind: currentTurnSource?.currentInboundEventKind,
     currentInboundAudio: currentTurnSource?.currentInboundAudio,
     currentInboundContext: collectCurrentInboundContext(items),
@@ -460,8 +461,9 @@ export function getFollowupOriginRouting(source: FollowupRun) {
   };
 }
 
-export function createOverflowSummaryRetrySource(source: FollowupRun): FollowupRun {
+export function createOverflowSummaryRetrySource(source: InternalFollowupRun): InternalFollowupRun {
   return {
+    controllerInput: source.controllerInput,
     prompt: source.prompt,
     sourceTurnId: source.sourceTurnId,
     admissionSessionId: source.admissionSessionId,
@@ -475,8 +477,10 @@ export function createOverflowSummaryRetrySource(source: FollowupRun): FollowupR
     disableTools: source.disableTools,
     forceRestartSafeTools: source.forceRestartSafeTools,
     forceCodeModeTools: source.forceCodeModeTools,
+    currentTurnImagesPrepared: source.currentTurnImagesPrepared,
     images: source.images,
     imageOrder: source.imageOrder,
+    mediaImageLayout: source.mediaImageLayout,
     media: source.media,
     channelAdmissionEvidence: source.channelAdmissionEvidence,
     gatewayLocalUserIngress: source.gatewayLocalUserIngress,

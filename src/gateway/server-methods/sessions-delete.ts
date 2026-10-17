@@ -32,7 +32,11 @@ import {
 } from "../../routing/session-key.js";
 import { isAgentHarnessSessionKey } from "../../sessions/agent-harness-session-key.js";
 import { isModelSelectionLocked } from "../../sessions/model-overrides.js";
-import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
+import {
+  captureSessionTarget,
+  runSessionMutation,
+  SessionMutationPreemptTimeoutError,
+} from "../../sessions/session-controller.lifecycle.js";
 import { handleSessionStateSessionDeleted } from "../../sessions/session-state-events.js";
 import { removeSessionWorktree } from "../../sessions/session-worktree-lifecycle.js";
 import { resolvePluginSessionOwnershipError } from "../session-plugin-ownership.js";
@@ -342,9 +346,18 @@ async function deleteGatewaySessionInScope(
           );
         }
         // Reclaim may wait for an earlier placement operation that needs this mutex.
-        return await runExclusiveSessionLifecycleMutation("delete", {
-          scope: storePath,
-          identities: deleteLifecycleIdentities,
+        return await runSessionMutation({
+          diagnosticLabel: "delete",
+          target: captureSessionTarget({
+            storeScope: storePath,
+            sessionKey: target.canonicalKey,
+            aliases: deleteLifecycleIdentities,
+            incarnation: initialDeleteEntry?.sessionId,
+            agentId: target.agentId,
+          }),
+          kind: "delete",
+          policy: "wait",
+          assertCurrent,
           prepare: async () => drain?.handoffToMutation(),
           finalize: async () => drain?.release(),
           run: async () => {
@@ -460,6 +473,15 @@ async function deleteGatewaySessionInScope(
     try {
       deletion = await deleteCurrent();
     } catch (error) {
+      if (error instanceof SessionMutationPreemptTimeoutError) {
+        return {
+          ok: false,
+          error: errorShape(
+            ErrorCodes.UNAVAILABLE,
+            `Session ${key} is still active; try again in a moment.`,
+          ),
+        };
+      }
       if (error instanceof SessionResetCleanupError) {
         return { ok: false, error: sessionChangedError() };
       }

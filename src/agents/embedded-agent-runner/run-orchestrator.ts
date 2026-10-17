@@ -65,17 +65,13 @@ import { settleFailedRequesterRun, settleRequesterRun } from "../requester-run-s
 import { resolveAgentRunErrorLifecycleFields } from "../run-termination.js";
 import { withRequiredSessionPlacement } from "../session-placement-admission.js";
 import { resolveSessionPlacementTurnSettlementAssertion } from "../session-placement-forced-terminal-settlement.js";
-import {
-  resolveSessionSuspensionTarget,
-  suspendSession,
-  type SessionSuspensionParams,
-} from "../session-suspension.js";
+import { captureSessionSuspension, type SessionSuspensionParams } from "../session-suspension.js";
 import { SessionManager } from "../sessions/session-manager.js";
 import { redactRunIdentifier } from "../workspace-run.js";
 import { runEmbeddedAgentViaCliBackendIfEligible } from "./cli-backend-dispatch.js";
 import { buildCompletedAgentUsageMeta, mergeCompletedAgentUsage } from "./completed-usage.js";
 import { waitForDeferredTurnMaintenanceForSession } from "./context-engine-maintenance.js";
-import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
+import { resolveGlobalLane } from "./lanes.js";
 import { log } from "./logger.js";
 import { createEmbeddedAgentPluginRuntimeRefresh } from "./plugin-runtime-refresh.js";
 import { runPreparedEmbeddedLoop } from "./run-loop.js";
@@ -159,34 +155,23 @@ async function runEmbeddedAgentForSession(
         ? SessionManager.inMemory(paramsBase.cwd ?? paramsBase.workspaceDir)
         : undefined),
   });
-  const sessionLane = resolveSessionLane(params.sessionKey?.trim() || params.sessionId);
   const globalLane = resolveGlobalLane(params.lane, params);
   // Outer fallback attempts defer session suspension only while another
   // candidate remains. Direct and final-candidate runs suspend normally.
   // Detached runs neither write durable metadata nor claim the outer deferral.
   const failureSuspension =
-    params.sessionPersistence === "detached" ? undefined : resolveSessionSuspensionTarget();
-  const suspendForFailure = (suspensionParams: SessionSuspensionParams) => {
-    if (!failureSuspension) {
-      return;
-    }
-    const suspension = {
+    params.sessionPersistence === "detached" ? undefined : captureSessionSuspension();
+  const suspendForFailure = (suspensionParams: SessionSuspensionParams) =>
+    failureSuspension?.({
       ...suspensionParams,
       // A caller-supplied id wins; the run owns unregistered agent directories.
       agentId: suspensionParams.agentId ?? params.agentId,
-    };
-    if (failureSuspension.mode === "defer") {
-      failureSuspension.defer(suspension);
-      return;
-    }
-    void suspendSession(suspension);
-  };
+    });
   const laneController = createEmbeddedRunLaneController({
     getLifecycleGeneration: () => lifecycleGeneration,
     getParams: () => params,
     globalLane,
     initialQueuedLifecycleGeneration: queuedLifecycleGeneration,
-    sessionLane,
     setLifecycleGeneration: (generation) => {
       lifecycleGeneration = generation;
     },
@@ -324,6 +309,9 @@ async function runEmbeddedAgentForSession(
         };
         startupStages.mark("harness-selection");
         const callerResult = createDeferredCore<EmbeddedAgentRunResult>();
+        const generationCleanupSettlement = createDeferredCore();
+        // Cleanup can outlive every attachment consumer; observe its late failure here.
+        void generationCleanupSettlement.promise.catch(() => {});
         const trackOwner = captureAsyncWorkTracker();
         const parentSignal = getAsyncWorkSignal();
         const work = new AsyncWorkScope();
@@ -537,6 +525,7 @@ async function runEmbeddedAgentForSession(
                 },
                 runParams: {
                   ...params,
+                  runCleanupSettlement: generationCleanupSettlement.promise,
                   assistantErrorTranscript,
                   deferTerminalLifecycle: true,
                   onAttemptStart: () => {
@@ -633,6 +622,10 @@ async function runEmbeddedAgentForSession(
             }
           }
         });
+        void generationCleanup.then(
+          generationCleanupSettlement.resolve,
+          generationCleanupSettlement.reject,
+        );
         void generationCleanup.catch(callerResult.reject);
         return await callerResult.promise;
       };

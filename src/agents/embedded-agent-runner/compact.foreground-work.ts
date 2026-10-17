@@ -2,6 +2,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { ContextEngine } from "../../context-engine/types.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import {
+  withSessionTurn,
+  type SessionTurnAdmission,
+} from "../../sessions/session-controller.admission.js";
+import type { ReplyOperation } from "../../sessions/session-controller.contracts.js";
+import {
   AsyncWorkScope,
   captureAsyncWorkTracker,
   getAsyncWorkSignal,
@@ -11,6 +16,47 @@ import type { PreparedModelRuntimeLease } from "../prepared-model-runtime.js";
 import type { ContextEngineMaintenanceResources } from "./context-engine-maintenance-work.js";
 import { log } from "./logger.js";
 import type { EmbeddedAgentCompactResult } from "./types.js";
+
+/** A timeout can return a result while the exact turn still owns raw work and disposal. */
+export async function withQueuedCompactionTurn(
+  admission: SessionTurnAdmission,
+  run: (
+    operation: ReplyOperation | undefined,
+    signal: AbortSignal,
+    onSettled: (cleanup: () => void) => void,
+  ) => Promise<EmbeddedAgentCompactResult>,
+): Promise<EmbeddedAgentCompactResult> {
+  const result = createDeferredCore<EmbeddedAgentCompactResult>();
+  const trackOwner = captureAsyncWorkTracker();
+  void trackOwner(() =>
+    withSessionTurn(admission, async (operation, signal) => {
+      const work = new AsyncWorkScope();
+      const cleanups: Array<() => void> = [];
+      try {
+        const value = await work.track(() =>
+          run(operation, signal, (cleanup) => cleanups.push(cleanup)),
+        );
+        if (work.hasPendingWork && !admission.replyOperation) {
+          result.resolve(value);
+        }
+        return value;
+      } catch (error) {
+        if (work.hasPendingWork && !admission.replyOperation) {
+          result.reject(error);
+        }
+        throw error;
+      } finally {
+        // Standalone callers may get a result early, but this turn retains raw work.
+        await AsyncWorkScope.runWhenAllIdle(
+          () => [work],
+          () => work.drain(),
+        );
+        await Promise.all(cleanups.toReversed().map(async (cleanup) => cleanup()));
+      }
+    }),
+  ).then(result.resolve, result.reject);
+  return await result.promise;
+}
 
 export type ForegroundCompactionOwner = {
   adoptLease: (lease: PreparedModelRuntimeLease) => ContextEngineMaintenanceResources;

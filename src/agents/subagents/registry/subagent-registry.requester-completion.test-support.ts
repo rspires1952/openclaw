@@ -37,6 +37,7 @@ import {
   withPluginRuntimeGatewayRequestScope,
 } from "../../../plugins/runtime/gateway-request-scope.js";
 import { createPluginRecord } from "../../../plugins/status.test-helpers.js";
+import { createDeferredCore } from "../../../shared/deferred.js";
 import { withOpenClawTestState } from "../../../test-utils/openclaw-test-state.js";
 import { createAdmittedRunOperatorAuthority } from "../../admitted-run-context.js";
 import { createTestAdmittedRunContext } from "../../admitted-run-context.test-support.js";
@@ -46,6 +47,7 @@ import {
 } from "../../cron-creator-authority-context.js";
 import { withGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
 import * as delivery from "../announce/subagent-announce-delivery.js";
+import * as deliveryRuntime from "../announce/subagent-announce-delivery.runtime.js";
 import { maybeWakeRequesterAfterAllChildrenSettled } from "../announce/subagent-announce.requester-settle-wake.js";
 import { revokeRequesterCronAuthority } from "../requester-cron-authority.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
@@ -55,6 +57,7 @@ import {
   markRequesterTurnYieldedWithAuthority,
 } from "./subagent-registry-requester-yield.test-support.js";
 import { loadSubagentRegistryFromSqlite } from "./subagent-registry-state.fixture.test-support.js";
+import { observeRootWork } from "./subagent-registry.browser-cleanup.test-support.js";
 import {
   activateSubagentRegistry,
   initSubagentRegistry,
@@ -175,7 +178,26 @@ export function registerRequesterCompletionCustodyTests({
           scopes: ["operator.write"],
         });
         client.internal.operatorRunAuthority = narrowed;
-        const deliver = vi.spyOn(delivery, "deliverSubagentAnnouncement");
+        const resumeDelivery = createDeferredCore();
+        const captureRequester = deliveryRuntime.captureRequesterSessionEntryCurrent;
+        // Activation restores authority first; release the actual wake after each policy decision.
+        const requesterRead = vi
+          .spyOn(deliveryRuntime, "captureRequesterSessionEntryCurrent")
+          .mockImplementation(async (...args) => {
+            await resumeDelivery.promise;
+            return captureRequester(...args);
+          });
+        let deliveredAuthority: ReturnType<typeof createAdmittedRunOperatorAuthority> | undefined;
+        const deliver = vi
+          .spyOn(delivery, "deliverSubagentAnnouncement")
+          .mockImplementation(async (params) => {
+            await params.onBeforeDispatch?.();
+            deliveredAuthority =
+              getPluginRuntimeGatewayRequestScope()?.client?.internal?.operatorRunAuthority;
+            params.onAccepted?.({ status: "accepted" });
+            return { delivered: true, path: "direct" };
+          });
+        const join = observeRootWork();
         try {
           await withPluginRuntimeGatewayRequestScope(
             {
@@ -272,7 +294,6 @@ export function registerRequesterCompletionCustodyTests({
               requesterAgentId: "main",
               batchRunIds: runIds,
               rearmGeneration: 1,
-              sharedAttemptKey: true,
             }),
             requesterSessionKey,
             requesterAgentId: "main",
@@ -315,6 +336,8 @@ export function registerRequesterCompletionCustodyTests({
             }
             await expect(prepareRecovery()).resolves.toBeUndefined();
             expect(loadSubagentRegistryFromSqlite()).toEqual(settled);
+            resumeDelivery.resolve();
+            await join(true);
             getGatewayContextLifetime(replacement.resolveGatewayContext).abort();
             await resetSubagentRegistryForTests({ persist: false });
             rotateAgentEventLifecycleGeneration();
@@ -377,7 +400,6 @@ export function registerRequesterCompletionCustodyTests({
             await testing.sweepOnceForTests();
             expect(resumeGrant).toHaveBeenCalledTimes(resumedGrants);
           }
-          await settleSubagentRegistryPersistenceWork();
           if (recovery !== "replaced requester") {
             expect(resumeGrant).toHaveBeenCalledWith(
               expect.objectContaining({ grantId: grantRef.grantId }),
@@ -401,41 +423,16 @@ export function registerRequesterCompletionCustodyTests({
             expect(staleEffect).not.toHaveBeenCalled();
           }
           expect(source.authority.assertCurrent).toThrow();
-          for (const runId of runIds) {
-            await updateRun(runId, (draft) => {
-              if (draft.requesterSettleWake) {
-                draft.requesterSettleWake.nextAttemptAt = undefined;
-              }
-            });
-          }
-          let deliveredAuthority: ReturnType<typeof createAdmittedRunOperatorAuthority> | undefined;
-          deliver.mockImplementation(async () => {
-            deliveredAuthority =
-              getPluginRuntimeGatewayRequestScope()?.client?.internal?.operatorRunAuthority;
-            return { delivered: true, path: "direct" };
-          });
-          const completeBatch = vi.fn();
-          const delivered = await maybeWakeRequesterAfterAllChildrenSettled({
-            requesterSessionKey,
-            settledEntry: currentChild(),
-            isSourceCurrent: () => true,
-            transitionBatch: async (batch, wake, onPublished) => {
-              for (const entry of batch) {
-                await updateRun(entry.runId, (draft) => {
-                  draft.requesterSettleWake = wake;
-                });
-              }
-              onPublished(batch.map((entry) => subagentRuns.get(entry.runId)!));
-            },
-            completeBatch,
-          });
-          expect(
-            delivered,
-            subagentRuns.get(runIds[0])?.requesterSettleWake?.lastError ?? "requester dispatch",
-          ).toBe(canDispatch);
+          resumeDelivery.resolve();
+          await join(true);
+          await settleSubagentRegistryPersistenceWork();
           expect(deliver).toHaveBeenCalledTimes(canDispatch ? 1 : 0);
           if (canDispatch) {
-            expect(completeBatch).toHaveBeenCalledOnce();
+            for (const runId of runIds) {
+              expect(
+                loadSubagentRegistryFromSqlite().get(runId)?.requesterSettleWake,
+              ).toBeUndefined();
+            }
             expect(deliveredAuthority?.profileId).toBe(source.authority.profileId);
             expect(deliveredAuthority?.scopes).toEqual(["operator.write"]);
             expect(deliveredAuthority?.gatewayAccessGrant).toEqual(grantRef);
@@ -466,6 +463,9 @@ export function registerRequesterCompletionCustodyTests({
             expect(persisted.get("fresh-child-task")?.operatorRecoverySource).toBeUndefined();
           }
         } finally {
+          resumeDelivery.resolve();
+          await join();
+          requesterRead.mockRestore();
           if (overloaded) {
             vi.mocked(operatorRecovery.restoreGatewayOperatorSource).mockRestore();
           }
@@ -656,8 +656,9 @@ export function registerRequesterCompletionCustodyTests({
             profileName: "unrelated-ambient-operator",
             scopes: ["operator.admin", "operator.pairing"],
           });
+          const pendingWake = structuredClone(subagentRuns.get(runId)?.requesterSettleWake);
           // Exercise the real settle dispatcher, including its canonical registry authority wrapper.
-          const delivered = await withPluginRuntimeGatewayRequestScope(
+          const deliveryAttempt = withPluginRuntimeGatewayRequestScope(
             { client: unrelatedClient, context, isWebchatConnect: () => false },
             () =>
               maybeWakeRequesterAfterAllChildrenSettled({
@@ -668,13 +669,13 @@ export function registerRequesterCompletionCustodyTests({
                   await updateRun(runId, (draft) => {
                     draft.requesterSettleWake = wake;
                   });
-                  onPublished([subagentRuns.get(runId)!]);
+                  onPublished?.([subagentRuns.get(runId)!]);
                 },
                 completeBatch,
               }),
           );
-          expect(delivered).toBe(authority === "current");
           if (authority === "current") {
+            await expect(deliveryAttempt).resolves.toBe(true);
             expect(deliver).toHaveBeenCalledOnce();
             expect(completeBatch).toHaveBeenCalledWith(
               expect.any(Array),
@@ -683,10 +684,12 @@ export function registerRequesterCompletionCustodyTests({
               expect.any(Function),
             );
           } else {
-            expect(deliver).not.toHaveBeenCalled();
-            expect(subagentRuns.get(runId)?.requesterSettleWake?.lastError).toBe(
+            await expect(deliveryAttempt).rejects.toThrow(
               "Subagent completion authority is no longer active",
             );
+            expect(deliver).not.toHaveBeenCalled();
+            expect(completeBatch).not.toHaveBeenCalled();
+            expect(subagentRuns.get(runId)?.requesterSettleWake).toEqual(pendingWake);
           }
         } finally {
           deliver.mockRestore();

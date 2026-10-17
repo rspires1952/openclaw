@@ -7,10 +7,6 @@ import { resolveModelFallbackOptions } from "../../auto-reply/reply/agent-runner
 import { handleDirectiveOnly } from "../../auto-reply/reply/directive-handling.impl.js";
 import { parseInlineSessionDirectives } from "../../auto-reply/reply/directive-handling.parse.js";
 import {
-  admitFollowupTurn,
-  type AdmittedFollowupTurn,
-} from "../../auto-reply/reply/followup-turn-admission.js";
-import {
   enqueueFollowupRun,
   scheduleFollowupDrain,
   type FollowupRun,
@@ -19,6 +15,10 @@ import {
   clearFollowupQueue,
   getExistingFollowupQueue,
 } from "../../auto-reply/reply/queue/state.js";
+import {
+  prepareReplyAgentTurn,
+  type AdmittedFollowupTurn,
+} from "../../auto-reply/reply/reply-agent-turn-preparation.js";
 import * as replyAdmission from "../../auto-reply/reply/reply-turn-admission.js";
 import { createTypingController } from "../../auto-reply/reply/typing.js";
 import type { SessionEntry } from "../../config/sessions.js";
@@ -27,6 +27,7 @@ import {
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { releaseSessionControllerClaim } from "../../sessions/session-controller.mailbox.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import type { OpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { sessionMutationHandlers } from "./sessions-mutations.js";
@@ -109,8 +110,6 @@ async function patchSession(patch: Record<string, unknown>, config = cfg) {
     }),
     getSessionEventSubscriberConnIds: () => new Set(),
     broadcastToConnIds: vi.fn(),
-    chatAbortControllers: new Map(),
-    chatQueuedTurns: new Map(),
     dedupe: new Map(),
   } satisfies GatewayRequestContext;
   await expectDefined(
@@ -156,7 +155,7 @@ function enqueue(
       config: cfg,
       ...selectionX,
       hasSessionModelOverride: true,
-      modelOverrideSource: "user",
+      modelOverrideSource: "user" as const,
       timeoutMs: 30_000,
       blockReplyBreak: "message_end",
       ...overrides,
@@ -185,7 +184,7 @@ it("keeps admitted A on X, starts queued B on Y, and applies a later Z only to w
       const current = index++;
       let turn: AdmittedFollowupTurn | undefined;
       try {
-        const result = await admitFollowupTurn({
+        const result = await prepareReplyAgentTurn({
           queued,
           defaults: {
             typing: createTypingController({}),
@@ -526,12 +525,12 @@ it.each([
       });
       const changing = patchSession(patch);
       void changing.catch(committed.reject);
-      let starting: ReturnType<typeof admitFollowupTurn> | undefined;
-      let result: Awaited<ReturnType<typeof admitFollowupTurn>> | undefined;
+      let starting: ReturnType<typeof prepareReplyAgentTurn> | undefined;
+      let result: Awaited<ReturnType<typeof prepareReplyAgentTurn>> | undefined;
       try {
         await committed.promise;
         expect(b.run).toMatchObject(selectionX);
-        starting = admitFollowupTurn({
+        starting = prepareReplyAgentTurn({
           queued: b,
           defaults: {
             typing: createTypingController({}),
@@ -567,6 +566,11 @@ it.each([
         result ??= await starting;
         if (result?.kind === "admitted") {
           result.turn.operation.complete();
+        }
+        const claim = b.controllerInput?.claim;
+        if (claim) {
+          releaseSessionControllerClaim(claim);
+          await claim.settlement.promise;
         }
       }
     });

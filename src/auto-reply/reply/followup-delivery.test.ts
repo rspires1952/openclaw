@@ -13,8 +13,8 @@ import {
   createSettledExecution,
   createTurn,
 } from "./followup-delivery.test-helpers.js";
-import type { AdmittedFollowupTurn } from "./followup-turn-admission.js";
 import type { FollowupRun } from "./queue/types.js";
+import type { AdmittedFollowupTurn } from "./reply-agent-turn-preparation.js";
 import { createMockReplyOperation } from "./test-helpers.js";
 
 const deliveryState = vi.hoisted(() => ({

@@ -91,6 +91,11 @@ beforeEach(() => {
 describe("runEmbeddedAttemptSettledPhase", () => {
   it("runs prompt and finalization, cleans stream resources, then projects the result", async () => {
     const fixture = createFixture(mocks);
+    // Cleanup must release the exact attachment registered for this attempt's stream.
+    const registration = {} as NonNullable<
+      typeof fixture.input.preparedStreamRuntime.stream.registration
+    >;
+    fixture.input.preparedStreamRuntime.stream.registration = registration;
 
     const result = await runEmbeddedAttemptSettledPhase(fixture.input);
 
@@ -137,6 +142,8 @@ describe("runEmbeddedAttemptSettledPhase", () => {
       fixture.queueHandle,
       "agent:main",
       "/tmp/session.jsonl",
+      undefined,
+      registration,
     );
   });
 

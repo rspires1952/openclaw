@@ -1,14 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionsPatchParams } from "../../../packages/gateway-protocol/src/schema/sessions-patch.js";
 import { awaitGateBeforeSettlement, withinTest } from "../../../test/helpers/promise.js";
-import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
+import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
 import {
   loadSessionEntry,
   loadTranscriptEvents,
   replaceSessionEntry,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
+import { captureSessionTarget } from "../../sessions/session-controller.lifecycle.js";
+import { createReplyOperation } from "../../sessions/session-controller.operation.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import { runOpenClawAgentWriteAdmission } from "../../state/openclaw-agent-write-admission.js";
@@ -58,8 +60,6 @@ function context(): GatewayRequestContext {
     loadGatewayModelCatalogSnapshot: vi.fn(async () => ({ entries: [], routeVariants: [] })),
     broadcastToConnIds: vi.fn(),
     getSessionEventSubscriberConnIds: () => new Set(),
-    chatAbortControllers: new Map(),
-    chatQueuedTurns: new Map(),
     dedupe: new Map(),
   } as unknown as GatewayRequestContext;
 }
@@ -164,6 +164,12 @@ describe("sessions.patch archive attribution", () => {
         agentId: "main",
         sessionKey: key,
         sessionId: entry.sessionId,
+        target: captureSessionTarget({
+          storeScope: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+          sessionKey: key,
+          agentId: "main",
+          incarnation: entry.sessionId,
+        }),
         resetTriggered: false,
       });
       operation.abortSignal.addEventListener("abort", () => operation.complete(), { once: true });
@@ -271,6 +277,12 @@ describe("sessions.patch archive attribution", () => {
         agentId: "main",
         sessionKey: grandchild,
         sessionId: grandchild,
+        target: captureSessionTarget({
+          storeScope: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+          sessionKey: grandchild,
+          agentId: "main",
+          incarnation: grandchild,
+        }),
         resetTriggered: false,
       });
       operation.abortSignal.addEventListener("abort", () => operation.complete(), { once: true });
@@ -389,6 +401,12 @@ describe("sessions.patch archive attribution", () => {
           agentId: "main",
           sessionKey: key,
           sessionId: key,
+          target: captureSessionTarget({
+            storeScope: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+            sessionKey: key,
+            agentId: "main",
+            incarnation: key,
+          }),
           resetTriggered: false,
         });
         children.push({ key, entry: committed, operation });

@@ -286,11 +286,10 @@ describe("required maintenance with restart-safe admitted input", () => {
           });
           const restartSafeAdmission = resolveRestartSafeChatAdmission({
             acpMeta: null,
-            activeRunScopeKey: sessionKey,
             agentId: "main",
             cfg,
             clientRunId: runId,
-            context: { chatAbortControllers: new Map(), chatQueuedTurns: new Map() },
+            context: {},
             entry,
             initialSessionEntry: entry,
             lifecycleTimestamps: undefined,

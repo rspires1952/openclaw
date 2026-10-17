@@ -9,28 +9,23 @@ import {
 } from "./subagent-requester-settle-identity.js";
 
 describe("requester settle wake identity", () => {
-  // The control scope must recognize exactly the key dispatch used, or a retried
-  // settle turn loses authority over its own children.
+  // The control scope must recognize exactly the key dispatch used, or a settle
+  // turn loses authority over its own children.
   it.each([
-    { name: "private batch", yieldedFinalDeliverable: undefined, suffix: false, pause: false },
-    {
-      name: "deliverable yielded batch",
-      yieldedFinalDeliverable: true as const,
-      suffix: true,
-      pause: false,
-    },
-    { name: "paused private batch", yieldedFinalDeliverable: undefined, suffix: true, pause: true },
-  ])("matches the dispatched retry key: $name", ({ yieldedFinalDeliverable, suffix, pause }) => {
+    { name: "private batch", yieldedFinalDeliverable: undefined, pause: false },
+    { name: "deliverable yielded batch", yieldedFinalDeliverable: true as const, pause: false },
+    { name: "paused private batch", yieldedFinalDeliverable: undefined, pause: true },
+  ])("matches the dispatched key: $name", ({ yieldedFinalDeliverable, pause }) => {
     const entry = makeSettledChild({
       runId: "run-b",
       requesterAgentId: "main",
       completionTarget: "parent",
       ...(pause ? { pauseReason: "sessions_yield" as const } : {}),
       requesterSettleWake: {
-        status: "dispatching",
+        status: "pending",
+        attemptCount: 0,
         batchRunIds: ["run-b"],
         rearmGeneration: 1,
-        attemptCount: 2,
         ...(pause ? { pauseNotice: { acknowledgment: "Waiting for direction" } } : {}),
         ...(yieldedFinalDeliverable ? { yieldedFinalDeliverable } : {}),
       },
@@ -40,11 +35,8 @@ describe("requester settle wake identity", () => {
       requesterAgentId: "main",
       batchRunIds: ["run-b"],
       rearmGeneration: 1,
-      attemptIndex: 1,
-      sharedAttemptKey: yieldedFinalDeliverable !== true,
       pause,
     }).runId;
-    expect(dispatched.endsWith(":retry-1")).toBe(suffix);
     expect(
       isRequesterSettleWakeForRun({
         entry,
@@ -77,4 +69,46 @@ describe("requester settle wake identity", () => {
       }),
     ).toBe(true);
   });
+
+  it.each(["requester", "agent", "store", "generation"] as const)(
+    "excludes a frozen member rebound to another %s",
+    (difference) => {
+      const entry = makeSettledChild({
+        runId: "run-b",
+        requesterAgentId: "main",
+        requesterStorePath: "/synthetic/requester.sqlite",
+        requesterSettleWake: {
+          status: "pending",
+          attemptCount: 0,
+          batchRunIds: ["run-b", "run-other"],
+          rearmGeneration: 1,
+        },
+      });
+      const other = makeSettledChild({
+        ...entry,
+        runId: "run-other",
+        ...(difference === "requester" ? { requesterSessionKey: "other" } : {}),
+        ...(difference === "agent" ? { requesterAgentId: "other" } : {}),
+        ...(difference === "store" ? { requesterStorePath: "/synthetic/other.sqlite" } : {}),
+        requesterSettleWake: {
+          ...entry.requesterSettleWake,
+          status: "pending",
+          attemptCount: 0,
+          rearmGeneration: difference === "generation" ? 2 : 1,
+        },
+      });
+      expect(
+        isRequesterSettleWakeForRun({
+          entry,
+          runId: "announce:requester-settle:main:agent:main:main:run-b:yield-1",
+          requesterSessionKey: REQUESTER,
+          requesterAgentId: "main",
+          runsById: new Map([
+            [entry.runId, entry],
+            [other.runId, other],
+          ]),
+        }),
+      ).toBe(true);
+    },
+  );
 });

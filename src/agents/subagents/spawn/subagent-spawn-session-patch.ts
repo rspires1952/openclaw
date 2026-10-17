@@ -86,7 +86,7 @@ export async function createInitialSubagentSession(input: {
   outputSchema?: Record<string, unknown>;
   firstAdmission?: { delivery?: DeliveryContext; group: TrustedGroupMetadata };
 }): Promise<
-  | { status: "ok"; entry?: SessionEntry; freshChild?: FreshChildSession }
+  | { status: "ok"; storePath: string; entry?: SessionEntry; freshChild?: FreshChildSession }
   | { status: "error"; error: string }
 > {
   const params = {
@@ -311,6 +311,7 @@ export async function createInitialSubagentSession(input: {
             : await commit();
           return {
             status: "ok" as const,
+            storePath: physicalStorePath,
             entry: entry ?? undefined,
             ...(params.firstAdmission && entry
               ? {

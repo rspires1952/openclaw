@@ -8,10 +8,10 @@ import {
 } from "../../agents/admitted-run-context.js";
 import type { EmbeddedAgentQueueHandle } from "../../agents/embedded-agent-runner/run-state.js";
 import {
-  clearActiveEmbeddedRun,
-  setActiveEmbeddedRun,
-} from "../../agents/embedded-agent-runner/runs.js";
-import { createEmbeddedRunHandle } from "../../agents/embedded-agent-runner/runs.test-support.js";
+  clearTestEmbeddedRun as clearActiveEmbeddedRun,
+  registerTestEmbeddedRun as setActiveEmbeddedRun,
+  createEmbeddedRunHandle,
+} from "../../agents/embedded-agent-runner/runs.test-support.js";
 import { withPreparedEmbeddedRunToolAuthority } from "../../agents/harness/tool-authority.runtime.js";
 import { prepareOperatorModelPolicy } from "../../agents/operator-model-policy.js";
 import {
@@ -22,11 +22,15 @@ import type { AgentRuntimeIdentity } from "../../gateway/agent-runtime-identity-
 import type { GatewayClient, GatewayContextResolver } from "../../gateway/server-methods/types.js";
 import type { GatewayUiCommandTarget } from "../../gateway/ui-command-target.types.js";
 import { clearAgentRunContext, registerAgentRunContext } from "../../infra/agent-run-registry.js";
-import { createQueueTestRun } from "./queue.test-helpers.js";
 import type {
   ReplyBackendQueueMessageOptions,
   ReplyMessageInjectionOutcome,
-} from "./reply-run-registry.contracts.js";
+} from "../../sessions/session-controller.contracts.js";
+import {
+  tryClaimSessionControllerTask,
+  type SessionControllerInput,
+} from "../../sessions/session-controller.mailbox.js";
+import { createQueueTestRun } from "./queue.test-helpers.js";
 import {
   createTestReplyOperation,
   queueCurrentReplyRunMessage,
@@ -130,6 +134,7 @@ export async function withPersonalToolTurn<T>(
     runId?: string;
     admittedRunContext?: AdmittedRunContext;
     gatewayContextResolver?: GatewayContextResolver;
+    controllerInput?: SessionControllerInput;
   },
   test: (turn: {
     steer(
@@ -142,10 +147,12 @@ export async function withPersonalToolTurn<T>(
     admittedRunContext: AdmittedRunContext;
     runtimeIdentity: AgentRuntimeIdentity;
     releaseCounts: Map<string, number>;
+    authorityLeases: Array<{ profileId: string; releases: number }>;
   }) => Promise<T>,
 ): Promise<T> {
   const revoked = new Set<string>();
   const releaseCounts = new Map<string, number>();
+  const authorityLeases: Array<{ profileId: string; releases: number }> = [];
   const run = createQueueTestRun({ prompt: "Arrange my view" });
   const modelPolicy = prepareOperatorModelPolicy({ cfg: {}, policy: {} });
   const authority = (person: Person, scopes = ["operator.read", "operator.write"]) =>
@@ -161,8 +168,14 @@ export async function withPersonalToolTurn<T>(
           throw new Error("Profile access revoked");
         }
       },
-      retain: () => () =>
-        releaseCounts.set(person.profileId, (releaseCounts.get(person.profileId) ?? 0) + 1),
+      retain: () => {
+        const lease = { profileId: person.profileId, releases: 0 };
+        authorityLeases.push(lease);
+        return () => {
+          lease.releases += 1;
+          releaseCounts.set(person.profileId, (releaseCounts.get(person.profileId) ?? 0) + 1);
+        };
+      },
     });
   run.operatorAuthority = authority(params.owner);
   Object.assign(run.run, {
@@ -175,9 +188,16 @@ export async function withPersonalToolTurn<T>(
     clientCaps: ["ui-commands"],
     gatewayUiCommandTarget: params.owner.gatewayUiCommandTarget,
   });
+  const mailboxClaim = params.controllerInput
+    ? tryClaimSessionControllerTask(params.controllerInput)
+    : undefined;
+  if (params.controllerInput && !mailboxClaim) {
+    throw new Error("The test turn controller input is not claimable");
+  }
   const operation = createTestReplyOperation({
     sessionKey: run.run.sessionKey,
     sessionId: run.run.sessionId,
+    mailboxClaim,
   });
   await operation.bindToolAuthoritySnapshotAsync(prepareReplyToolAuthority(run));
   const runId = params.runId ?? "personal-tool-run";
@@ -297,6 +317,7 @@ export async function withPersonalToolTurn<T>(
               admittedRunContext,
               runtimeIdentity,
               releaseCounts,
+              authorityLeases,
               complete: () => operation.complete(),
               revoke: (profileId) => {
                 revoked.add(profileId);

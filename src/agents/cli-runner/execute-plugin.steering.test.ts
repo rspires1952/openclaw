@@ -6,13 +6,9 @@ import { runActiveReplySteer } from "../../auto-reply/reply/agent-runner-steer-a
 import { handleSteerCommand } from "../../auto-reply/reply/commands-steer.js";
 import { buildCommandTestParams } from "../../auto-reply/reply/commands.test-harness.js";
 import { createQueueTestRun } from "../../auto-reply/reply/queue.test-helpers.js";
-import { clearFollowupDrainCallback } from "../../auto-reply/reply/queue/drain.js";
 import { resolveQueueSettingsCore } from "../../auto-reply/reply/queue/settings.js";
 import { clearFollowupQueue } from "../../auto-reply/reply/queue/state.js";
 import type { ReplyOperationRunState } from "../../auto-reply/reply/reply-operation-run-state.js";
-import { beginReplyMessageInjectionTarget } from "../../auto-reply/reply/reply-run-registry.message-injection.js";
-import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.operation.js";
-import { replyRunRegistry } from "../../auto-reply/reply/reply-run-registry.registry.js";
 import { prepareReplyToolAuthority } from "../../auto-reply/reply/reply-tool-authority.js";
 import { resolveFollowupRunToolAuthorityFingerprintAsync } from "../../auto-reply/reply/reply-tool-authority.test-support.js";
 import { createMockTypingController } from "../../auto-reply/reply/test-helpers.js";
@@ -29,6 +25,11 @@ import {
 import * as sessionReads from "../../config/sessions/session-entry-read-runtime.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { CliBackendPlugin } from "../../plugins/cli-backend.types.js";
+import {
+  beginReplyMessageInjectionTarget,
+  captureCurrentReplyMessageInjectionTarget,
+} from "../../sessions/session-controller.message-injection.js";
+import { createReplyOperation } from "../../sessions/session-controller.operation.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { readTranscriptMessages } from "../../sessions/user-turn-transcript.test-support.js";
 import { loadBundledPluginFacade } from "../../test-utils/bundled-plugin-public-surface.js";
@@ -184,7 +185,7 @@ it("steers configured, session and explicit inputs through current authority int
           throw new Error("Native turn ended before readiness");
         }),
       ]);
-      const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(sessionKey);
+      const target = captureCurrentReplyMessageInjectionTarget(sessionKey);
       if (!target) {
         throw new Error("Claude native transport has no registry input sink");
       }
@@ -268,7 +269,6 @@ it("steers configured, session and explicit inputs through current authority int
             opts: { runId: route.text },
             providedReplyOperation: operation,
             queueKey: sessionKey,
-            releaseAdmissionTicket: vi.fn(),
             replyOperationRunState: resultState,
             resolvedQueue,
             restartRecoverySourceTurnId: undefined,
@@ -372,7 +372,6 @@ it("steers configured, session and explicit inputs through current authority int
       await settled;
       operation.complete();
       clearFollowupQueue(sessionKey);
-      clearFollowupDrainCallback(sessionKey);
       await prepared.cleanup?.();
     }
   });

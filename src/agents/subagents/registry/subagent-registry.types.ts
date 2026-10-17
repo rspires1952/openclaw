@@ -130,7 +130,7 @@ export type RequesterSettleWakeState = {
   attemptCount: number;
   /** Ambiguous transport replays made with the current idempotency key. */
   replayCount?: number;
-  /** Persisted retry deadline; restore waits until this instant. */
+  /** Retained retry receipt from an admitted attempt; mailbox admission owns scheduling. */
   nextAttemptAt?: number;
   /** Frozen wave membership after delivery admission or requester-yield re-admission. */
   batchRunIds?: string[];

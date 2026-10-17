@@ -240,7 +240,6 @@ it("refreshes 50 connected mention views after session and viewer changes", asyn
         getRuntimeConfig: () => cfg,
         getSessionEventSubscriberConnIds: () => new Set(),
         broadcastToConnIds: f.broadcast,
-        chatAbortControllers: new Map(),
       };
       const invalidation = vi.spyOn(f.inbox, "invalidateAsync");
       const emit = async (sessionKey = "agent:main:unrelated") => {

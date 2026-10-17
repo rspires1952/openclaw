@@ -307,13 +307,16 @@ export function prepareProjectedSessionPresentation(
     }: Pick<records.MaterializedRow["materialized"]["source"], "entry" | "parsedKey">,
   ) =>
     projectGatewaySessionRunState({ key, entry, parsedKey, now, rowContext: preparedRowContext });
-  const active = (key: string, entry: records.MaterializedRow["entry"], agentId: string) =>
+  const active = (
+    record: Pick<records.MaterializedRow, "key" | "entry" | "agentId" | "storeTarget">,
+  ) =>
     projectRun?.({
-      requestedKey: key,
-      canonicalKey: key,
-      sessionId: entry.sessionId,
-      agentId,
-      defaultAgentId: tryResolveSessionCompatibilityOwnerAgentId(cfg, key),
+      storePath: record.storeTarget.storePath,
+      requestedKey: record.key,
+      canonicalKey: record.key,
+      sessionId: record.entry.sessionId,
+      agentId: record.agentId,
+      defaultAgentId: tryResolveSessionCompatibilityOwnerAgentId(cfg, record.key),
     });
   const target = (query: records.Lookup) => {
     const record = projection.describe(query);
@@ -416,7 +419,7 @@ export function prepareProjectedSessionPresentation(
     record: records.MaterializedRow,
     options: PresentationOptions = {},
   ): GatewaySessionRow | null => {
-    const run = active(record.key, record.entry, record.agentId);
+    const run = active(record);
     const preparedFacts = record.facts?.present();
     const childOwnerSessionKeys = resolveSessionChildOwners({
       key: record.key,

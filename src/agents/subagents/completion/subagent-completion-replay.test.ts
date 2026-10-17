@@ -152,7 +152,7 @@ describe("completed requester delivery replay fence", () => {
       expect(driver.wake).not.toHaveBeenCalled();
     } finally {
       tail.resolve(undefined);
-      driver.controller.clearScheduledResumeTimers();
+      driver.controller.clearRuntimeState();
       await settle();
     }
     await reopenOwners();
@@ -166,8 +166,11 @@ describe("completed requester delivery replay fence", () => {
       expect(input.subagent).toEqual(retained);
 
       // Older persisted ordinary wake markers are not permission to replay.
-      input.subagent.requesterSettleWake = { status: "pending", attemptCount: 0 };
-      saveSubagentRegistryToSqlite(subagentRuns);
+      openOpenClawStateDatabase()
+        .db.prepare(
+          "UPDATE subagent_runs SET payload_json = json_set(payload_json, '$.requesterSettleWake', json('{}')) WHERE run_id = ?",
+        )
+        .run(input.subagent.runId);
       await reopenOwners();
       input.subagent = subagentRuns.get(input.subagent.runId)!;
       restored.controller.resumeRequesterSettleWake(input.subagent.runId, input.subagent);
@@ -187,7 +190,7 @@ describe("completed requester delivery replay fence", () => {
       await restored.run(input.subagent);
       expect(restored.wake).toHaveBeenCalledTimes(1);
     } finally {
-      restored.controller.clearScheduledResumeTimers();
+      restored.controller.clearRuntimeState();
       await settle();
     }
   });
@@ -235,10 +238,8 @@ describe("completed requester delivery replay fence", () => {
         [input.subagent.runId],
         (rows) => {
           const current = rows.get(input.subagent.runId)!;
-          const next = {
-            ...current,
-            requesterSettleWake: { status: "pending" as const, attemptCount: 0 },
-          };
+          const next = structuredClone(current);
+          next.requesterSettleWake = { status: "pending", attemptCount: 0 };
           return { value: undefined, postimages: new Map([[next.runId, next]]) };
         },
         {
@@ -259,7 +260,7 @@ describe("completed requester delivery replay fence", () => {
       expect(driver.wake).not.toHaveBeenCalled();
     } finally {
       release.resolve(undefined);
-      driver.controller.clearScheduledResumeTimers();
+      driver.controller.clearRuntimeState();
       await settle();
     }
   });

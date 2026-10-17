@@ -1,9 +1,9 @@
 import { formatErrorMessage } from "../../../infra/errors.js";
 import { hasSqliteWorkerOutcomeUnknown } from "../../../infra/sqlite-worker-contract.js";
 import {
-  SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS,
-  waitForSessionWorkAdmissionRelease,
-} from "../../../sessions/session-lifecycle-admission.js";
+  SESSION_CONTROLLER_DRAIN_TIMEOUT_MS,
+  waitForSessionControllerSettlement,
+} from "../../../sessions/session-controller.lifecycle.js";
 import type { captureSubagentCommands } from "./subagent-control-commands.js";
 
 /** One native Stop retains acceptance, caller failure, and its cleanup observations. */
@@ -64,9 +64,9 @@ export function createSubagentKillAcceptance(params: {
     try {
       // Signaling can revoke the caller synchronously. Its failed fresh-command
       // guard cannot abandon the admission release already owned by this Stop.
-      released = await waitForSessionWorkAdmissionRelease(
+      released = await waitForSessionControllerSettlement(
         release,
-        SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS,
+        SESSION_CONTROLLER_DRAIN_TIMEOUT_MS,
       );
     } catch (error) {
       throw acceptanceFailure

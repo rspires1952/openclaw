@@ -85,7 +85,7 @@ export function createDirectAnnounceResponseClassifier(context: DirectAnnounceRe
             delivered: false,
             path: "direct",
             reason: "requester_turn_pending",
-            disposition: "retryable",
+            disposition: "session_queued",
           }
         : { delivered: true, path: "direct" };
     }

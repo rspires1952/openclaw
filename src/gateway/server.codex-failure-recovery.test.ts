@@ -494,6 +494,7 @@ it.each(cases)(
     }
     const beforeRecoveryProcesses = nativeProcesses.size;
     const continued = await start("Continue with changed instructions.", "second");
+    let abortRequest: ReturnType<typeof gateway.client.request> | undefined;
     if (exitGate) {
       await withTestTimeout(exitGate.waiting, 10_000, "startup did not wait for physical exit");
       expect(exitGate.child.exitCode).toBeNull();
@@ -502,10 +503,9 @@ it.each(cases)(
       expect(primaryRequests).toHaveLength(1);
       await assertOriginalBinding();
       if (shutdown === "cancelled") {
-        await expect(
-          gateway.client.request("chat.abort", { sessionKey, runId: continued.runId }),
-        ).resolves.toEqual({ ok: true, aborted: true, runIds: [continued.runId] });
-        expect(abortedRuns.has(continued.runId)).toBe(true);
+        abortRequest = gateway.client.request("chat.abort", { sessionKey, runId: continued.runId });
+        void abortRequest.catch(() => {});
+        await vi.waitFor(() => expect(abortedRuns.has(continued.runId)).toBe(true));
         expect(exitGate.child.exitCode).toBeNull();
         expect(exitGate.child.signalCode).toBeNull();
         expect(nodeProcess.kill(exitGate.pid, 0)).toBe(true);
@@ -521,6 +521,13 @@ it.each(cases)(
       }
       exitGate.release();
       await withTestTimeout(exitGate.exited, 10_000, "old native process did not exit");
+      if (abortRequest) {
+        expect(await abortRequest).toEqual({
+          ok: true,
+          aborted: true,
+          runIds: [continued.runId],
+        });
+      }
       if (shutdown !== "delayed") {
         await wait(continued.runId);
         expect(nativeProcesses.size).toBe(beforeRecoveryProcesses);

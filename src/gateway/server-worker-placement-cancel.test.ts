@@ -15,6 +15,7 @@ import {
 import { onAgentEvent } from "../infra/agent-events.js";
 import { clearAgentRunContext } from "../infra/agent-run-registry.js";
 import type { SubsystemLogger } from "../logging/subsystem.js";
+import { rpcSourceTesting } from "../sessions/session-lifecycle-admission.test-support.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import {
   createChatRunState,
@@ -31,6 +32,7 @@ import * as lifecycleState from "./session-lifecycle-state.js";
 import { resolveGatewaySessionStoreTargetInWorker } from "./session-utils-store-worker.js";
 import { resolveCanonicalSessionEntryFromStoreKeys } from "./session-utils-store.js";
 import { closeSessionSqliteDatabasesForTest } from "./session-utils.test-support.js";
+import { claimRpcSourceForTest } from "./test-helpers.rpc-source.js";
 const routing = vi.hoisted(() => ({
   load: vi.fn<
     typeof import("./session-utils-store-worker.js").loadGatewaySessionEntryReadOnlyInWorker
@@ -87,8 +89,6 @@ it.each(["success", "failed-write", "setup-failed-write"] as const)(
     const context = {
       dedupe: new Map(),
       chatRunState,
-      chatAbortControllers: new Map(),
-      chatQueuedTurns: new Map(),
       agentRunSeq: new Map(),
       getRuntimeConfig: () => cfg,
       removeChatRun: vi.fn(),
@@ -158,7 +158,6 @@ it.each(["success", "failed-write", "setup-failed-write"] as const)(
         toolEventRecipients: chatRunState.toolEventRecipients,
         sessionEventSubscribers: createSessionEventSubscriberRegistry(),
         sessionMessageSubscribers: createSessionMessageSubscriberRegistry(),
-        chatAbortControllers: context.chatAbortControllers,
         restartRecoveryCandidates: new Map(),
         refreshConnectedUserProfiles: vi.fn(),
       });
@@ -168,7 +167,12 @@ it.each(["success", "failed-write", "setup-failed-write"] as const)(
         throw new Error("active admission missing");
       }
       const owned = active.value;
+      let releaseClaim: (() => void) | undefined;
       if (outcome !== "setup-failed-write") {
+        if (!owned.activeRunAbort.entry) {
+          throw new Error("Missing worker source");
+        }
+        releaseClaim = await claimRpcSourceForTest(owned.activeRunAbort.entry);
         expect(owned.activeRunAbort.markExecutionStarted()).toBe(true);
       }
       await replaceSessionEntry(target, {
@@ -180,6 +184,7 @@ it.each(["success", "failed-write", "setup-failed-write"] as const)(
         "abort",
         () => {
           if (outcome !== "setup-failed-write") {
+            releaseClaim?.();
             owned.cleanupAdmittedRun();
           }
           abortObserved.resolve();
@@ -238,19 +243,15 @@ it.each(["success", "failed-write", "setup-failed-write"] as const)(
         },
       });
       await abortObserved.promise;
-      expect(context.chatAbortControllers.has(runId)).toBe(true);
-      expect(owned.activeRunAbort.entry?.projectSessionTerminalPersistence).toBeInstanceOf(Promise);
+      expect(rpcSourceTesting.has(runId)).toBe(true);
+      expect(owned.activeRunAbort.entry?.adapter.projectSessionTerminalPersistence).toBeInstanceOf(
+        Promise,
+      );
       expect(reclaimEffectStarted).toBe(false);
       expect(loadSessionEntry(target)?.status).toBeUndefined();
       const late = await admit("during-terminal-write");
       expect(late.ok).toBe(false);
-      expect(
-        (
-          context.dedupe.get("chat:during-terminal-write")?.payload as
-            | { summary?: string }
-            | undefined
-        )?.summary,
-      ).toBe("aborted");
+      expect(context.dedupe.get("chat:during-terminal-write")).toBeUndefined();
       if (outcome === "setup-failed-write") {
         expect(owned.restartSafeAdmission).toBeUndefined();
         await handleChatSendSetupError({
@@ -261,11 +262,11 @@ it.each(["success", "failed-write", "setup-failed-write"] as const)(
           session: { agentId: "main", clientRunId: runId, sessionKey: target.sessionKey },
           terminalizeRestartSafeAdmission: vi.fn(async () => false),
         });
-        expect(context.chatAbortControllers.get(runId)).toBe(owned.activeRunAbort.entry);
+        expect(rpcSourceTesting.has(runId)).toBe(false);
         expect(reclaimEffectStarted).toBe(false);
       }
       if (outcome !== "success") {
-        const rejected = expect(reclaim).rejects.toThrow("Session cancellation did not persist");
+        const rejected = expect(reclaim).rejects.toThrow("terminal store unavailable");
         terminalWrite.reject(new Error("terminal store unavailable"));
         releaseWriter.resolve();
         await heldWriter;
@@ -280,7 +281,7 @@ it.each(["success", "failed-write", "setup-failed-write"] as const)(
       expect(events.filter((event) => event.phase === "end")).toEqual([
         { phase: "end", status: "cancelled", aborted: true, stopReason: "rpc" },
       ]);
-      expect(context.chatAbortControllers.has(runId)).toBe(false);
+      expect(rpcSourceTesting.has(runId)).toBe(false);
       await closeSessionSqliteDatabasesForTest();
       const persisted = loadSessionEntry({ ...target, readConsistency: "latest" });
       expect(persisted).toMatchObject({ status: "killed", lastRunId: runId, abortedLastRun: true });

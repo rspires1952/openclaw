@@ -12,7 +12,6 @@ export type NodeEventContext = Pick<
   | "broadcastVoiceWakeChanged"
   | "addChatRun"
   | "removeChatRun"
-  | "chatAbortControllers"
   | "dedupe"
   | "agentRunSeq"
   | "getHealthCache"

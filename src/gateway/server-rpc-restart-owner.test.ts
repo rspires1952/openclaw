@@ -1,16 +1,21 @@
 import { createServer } from "node:http";
 import { afterEach, expect, it, vi } from "vitest";
 import { writeOpenAiResponsesText } from "../../test/helpers/openai-responses-sse.js";
-import { createDeferred, withinTest } from "../../test/helpers/promise.js";
-import { replyRunRegistry } from "../auto-reply/reply/reply-run-registry.js";
+import {
+  awaitGateBeforeSettlement,
+  createDeferred,
+  withinTest,
+} from "../../test/helpers/promise.js";
 import * as sessionAccessor from "../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { getSessionControllerOperation } from "../sessions/session-controller.js";
 import {
-  captureGatewaySessionWorkAdmissions,
-  getSessionWorkAdmissionRelease,
-} from "../sessions/session-lifecycle-admission.js";
+  captureGatewaySessionControllerWork,
+  captureSessionControllerSettlement,
+} from "../sessions/session-controller.lifecycle.js";
+import * as rpcSources from "../sessions/session-controller.rpc-sources.js";
+import { rpcSourceTesting } from "../sessions/session-lifecycle-admission.test-support.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import * as queuedChatTurns from "./chat-queued-turns.js";
 import * as sourceFinalization from "./server-methods/chat-send-source-finalization.js";
 import type { GatewayContextResolver, GatewayRequestContext } from "./server-methods/types.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "./test-helpers.e2e.js";
@@ -45,7 +50,8 @@ it(
     const firstGate = createDeferred();
     const finalGate = createDeferred();
     const finalReached = createDeferred();
-    const queuedRunRegistered = createDeferred();
+    const queuedSourceRegistered = createDeferred<rpcSources.RpcSourceRef>();
+    const recoveryMarked = createDeferred();
     let firstReceived = false;
     let followupReceived = false;
     const tasks = new Set<Promise<void>>();
@@ -89,15 +95,24 @@ it(
     let replyReleased: Promise<void> | undefined;
     let hostResolver: GatewayContextResolver | undefined;
     let context: GatewayRequestContext | undefined;
-    const registerQueuedTurn = queuedChatTurns.registerQueuedChatTurn;
+    const registerSource = rpcSources.registerRpcSource;
     const registrationSpy = vi
-      .spyOn(queuedChatTurns, "registerQueuedChatTurn")
-      .mockImplementation((params) => {
-        const registered = registerQueuedTurn(params);
-        if (registered && params.runId === "rpc-queued") {
-          queuedRunRegistered.resolve();
+      .spyOn(rpcSources, "registerRpcSource")
+      .mockImplementation((runId, source, onRemoved) => {
+        registerSource(runId, source, onRemoved);
+        if (runId === "rpc-queued") {
+          queuedSourceRegistered.resolve(source);
         }
-        return registered;
+      });
+    const recovery =
+      await import("../agents/main-session-recovery/main-session-restart-recovery.js");
+    const markRestartAbortedMainSessions = recovery.markRestartAbortedMainSessions;
+    const markerSpy = vi
+      .spyOn(recovery, "markRestartAbortedMainSessions")
+      .mockImplementation(async (params) => {
+        const result = await markRestartAbortedMainSessions(params);
+        recoveryMarked.resolve();
+        return result;
       });
     const kernel = await import("./server-kernel-request-runtime.js");
     const prepare = kernel.prepareGatewayKernelRequestRuntime;
@@ -128,6 +143,7 @@ it(
         startupSpy.mockRestore();
         registrationSpy.mockRestore();
         finalizationSpy.mockRestore();
+        markerSpy.mockRestore();
         firstGate.resolve();
         finalGate.resolve();
         if (gateway) {
@@ -198,14 +214,15 @@ it(
       });
       // The queued input stays pending until delivery, so wait for its actual
       // registration before releasing the first reply that currently blocks it.
-      await withinTest(queuedRunRegistered.promise, signal);
+      const queuedSource = await withinTest(queuedSourceRegistered.promise, signal);
       await expect(
         withinTest(
           gateway.client.request("agent.wait", { runId: "rpc-queued", timeoutMs: 30_000 }),
           signal,
         ),
       ).resolves.toMatchObject({ runId: "rpc-queued", status: "pending", timeoutPhase: "queue" });
-      expect(context?.chatQueuedTurns.has("rpc-queued")).toBe(true);
+      expect(rpcSourceTesting.get("rpc-queued")).toBe(queuedSource);
+      expect(queuedSource.input.claim).toBeUndefined();
       firstGate.resolve();
       await withinTest(finalReached.promise, signal);
       expect(followupReceived).toBe(true);
@@ -224,35 +241,52 @@ it(
       if (!context || !hostResolver || !context.resolveGatewayContext) {
         throw new Error("Missing actual Gateway resolver");
       }
-      const storePath = state.statePath("agents", "main", "sessions", "sessions.json");
+      const sourceTarget = queuedSource.input.target;
+      if (!sourceTarget) {
+        throw new Error("Real RPC did not capture its session target");
+      }
+      const storePath = sourceTarget.storeScope;
       const entry = sessionAccessor.loadSessionEntry({ storePath, sessionKey });
       if (!entry) {
         throw new Error("Real RPC did not create a session");
       }
-      const target = { scope: storePath, sessionKey, sessionId: entry.sessionId };
-      replyReleased = getSessionWorkAdmissionRelease({
+      const target = {
         scope: storePath,
-        identities: [sessionKey],
-      });
-      expect(captureGatewaySessionWorkAdmissions(() => context).isActive(target)).toBe(false);
+        sessionKey,
+        sessionId: entry.sessionId,
+        agentId: sourceTarget.agentId,
+      };
+      replyReleased = captureSessionControllerSettlement({ target: sourceTarget });
+      expect(captureGatewaySessionControllerWork(() => context).isActive(target)).toBe(false);
       console.log(
         "RPC_OWNER_BEFORE_CLOSE",
         JSON.stringify({
           status: entry.status,
-          operation: replyRunRegistry.get(sessionKey)?.turnKind,
-          activeChatRuns: context.chatAbortControllers.size,
-          queued: context.chatQueuedTurns.size,
-          hostCaptured: captureGatewaySessionWorkAdmissions(hostResolver).isActive(target),
-          rpcCaptured: captureGatewaySessionWorkAdmissions(context.resolveGatewayContext).isActive(
+          operation: getSessionControllerOperation(sessionKey)?.turnKind,
+          activeChatRuns: rpcSourceTesting.size,
+          queued: rpcSourceTesting.size,
+          hostCaptured: captureGatewaySessionControllerWork(hostResolver).isActive(target),
+          rpcCaptured: captureGatewaySessionControllerWork(context.resolveGatewayContext).isActive(
             target,
           ),
         }),
       );
-      await gateway.server.close({
+      const closing = gateway.server.close({
         reason: "synthetic queued reply restart",
         restartExpectedMs: 123,
         drainTimeoutMs: 0,
       });
+      // The real marker must capture this source before its held finalizer settles.
+      await withinTest(
+        awaitGateBeforeSettlement(
+          recoveryMarked.promise,
+          closing,
+          "Gateway closed before recording the queued reply for recovery",
+        ),
+        signal,
+      );
+      finalGate.resolve();
+      await withinTest(closing, signal);
       closed = true;
       const after = sessionAccessor.loadSessionEntry({ storePath, sessionKey });
       console.log(

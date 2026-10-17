@@ -55,7 +55,6 @@ const context = {
   broadcast: vi.fn(),
   broadcastToConnIds: vi.fn(),
   getSessionEventSubscriberConnIds: () => new Set<string>(),
-  chatAbortControllers: new Map(),
   logGateway: { warn: vi.fn() },
 } as unknown as GatewayRequestContext;
 

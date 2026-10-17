@@ -63,7 +63,7 @@ async function createRecoveryFixture(state: OpenClawTestState, options: FixtureO
 
   const { admitReplyTurn } = await import("../../auto-reply/reply/reply-turn-admission.js");
   const { waitForReplyRunSuccessorAdmission } =
-    await import("../../auto-reply/reply/reply-run-registry.js");
+    await import("../../sessions/session-controller.wait.js");
   let replyOperation: PreparedEmbeddedRunInput["runParams"]["replyOperation"];
 
   const memoryManager = options.inMemory ? SessionManager.inMemory(state.workspaceDir) : undefined;
@@ -214,7 +214,11 @@ async function createRecoveryFixture(state: OpenClawTestState, options: FixtureO
       expect(writerFence).toBeUndefined();
     } else {
       expect(writerFence?.expectedWriterRunId).toBe(runId);
-      runParams.sessionTarget = { ...target, ...writerFence };
+      runParams.sessionTarget = {
+        ...target,
+        expectedLifecycleRevision: writerFence?.expectedLifecycleRevision,
+        expectedWriterRunId: writerFence?.expectedWriterRunId,
+      };
     }
     if (options.replyAdmission) {
       const reply = await admitReplyTurn({
@@ -243,9 +247,14 @@ async function createRecoveryFixture(state: OpenClawTestState, options: FixtureO
         forgetActiveSessionForShutdown(accepted.sessionId);
       }
     };
+    // The worker accepts only the exact fence fields carried by an admitted run target.
+    const fencedTarget = {
+      ...target,
+      expectedLifecycleRevision: writerFence?.expectedLifecycleRevision,
+      expectedWriterRunId: writerFence?.expectedWriterRunId,
+    };
     const openWriter = async () =>
-      memoryManager ??
-      (await SessionManager.openAsync({ ...target, ...writerFence }, state.workspaceDir));
+      memoryManager ?? (await SessionManager.openAsync(fencedTarget, state.workspaceDir));
     const commitCompaction = async () => {
       await (
         await openWriter()

@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
-import {
-  setActiveEmbeddedRun,
-  type EmbeddedAgentQueueMessageOptions,
-} from "../../agents/embedded-agent-runner/runs.js";
+import type { EmbeddedAgentQueueMessageOptions } from "../../agents/embedded-agent-runner/runs.js";
 import {
   createEmbeddedRunHandle,
+  registerTestEmbeddedRun as setActiveEmbeddedRun,
   testing,
 } from "../../agents/embedded-agent-runner/runs.test-support.js";
 import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
@@ -49,6 +47,7 @@ function startRun(
   queueMessage: (text: string, options?: EmbeddedAgentQueueMessageOptions) => Promise<void>,
   available = true,
   runId = "steered-run",
+  storeScope?: string,
 ) {
   const claimPendingUserInputAnswer = vi.fn(async () => true);
   setActiveEmbeddedRun(
@@ -63,6 +62,11 @@ function startRun(
       },
     },
     sessionKey,
+    undefined,
+    "main",
+    undefined,
+    undefined,
+    { storeScope },
   );
   return claimPendingUserInputAnswer;
 }
@@ -104,7 +108,7 @@ describe("plugin active-run steering", () => {
           modelInput.push(text);
         },
       );
-      startRun(queueMessage);
+      startRun(queueMessage, true, "steered-run", target.storePath);
       const input = {
         sessionKey,
         text: "Use the corrected result.",
@@ -117,7 +121,7 @@ describe("plugin active-run steering", () => {
       release.resolve();
       expect(await first).toEqual({ steered: true, runId: "steered-run" });
       if (delivery === "successor-run" || delivery === "successor-run-receipt") {
-        startRun(queueMessage, true, "successor-run");
+        startRun(queueMessage, true, "successor-run", target.storePath);
       }
       expect(await (second ?? api.session.workflow.steerActiveRun(input))).toEqual(
         delivery === "successor-run"

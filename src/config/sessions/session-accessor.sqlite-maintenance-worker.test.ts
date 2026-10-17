@@ -8,9 +8,9 @@ import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
 import { clearAgentRunContext, registerAgentRunContext } from "../../infra/agent-run-registry.js";
 import { requireNodeSqlite } from "../../infra/node-sqlite.js";
 import {
-  beginSessionWorkAdmission,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
+  beginSessionEffect,
+  runSessionMutation,
+} from "../../sessions/session-controller.lifecycle.js";
 import {
   onSessionIdentityMutation,
   type SessionIdentityMutation,
@@ -381,13 +381,13 @@ describe("automatic worker planning protections", () => {
     } else {
       const identity = protection.endsWith("-key") ? protectedKey : protectedId;
       if (protection.startsWith("lifecycle")) {
-        await runExclusiveSessionLifecycleMutation("archive", {
+        await runSessionMutation({
           scope: storePath,
           identities: [identity],
           run,
         });
       } else {
-        const lease = await beginSessionWorkAdmission({
+        const lease = await beginSessionEffect({
           scope: storePath,
           identities: [identity],
           assertAllowed: () => {},

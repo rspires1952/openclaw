@@ -1,6 +1,7 @@
 // Real WebSocket coverage for delivery settlement after an acknowledged abort.
 import path from "node:path";
 import { rawDataToString } from "@openclaw/gateway-client/websocket-data";
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import { closeGatewayTestWebSocket } from "../../test/helpers/gateway-websocket.js";
 import { createDeferred, withinTest } from "../../test/helpers/promise.js";
@@ -9,10 +10,18 @@ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { dispatchInboundMessage } from "../auto-reply/dispatch.js";
 import type { GetReplyOptions } from "../auto-reply/get-reply-options.types.js";
 import type { InternalGetReplyOptions } from "../auto-reply/reply/get-reply.types.js";
-import { createReplyOperation } from "../auto-reply/reply/reply-run-registry.js";
+import { readReplySourceInput } from "../auto-reply/reply/reply-source-binding.js";
 import { clearConfigCache } from "../config/config.js";
+import { bindGatewayContextResolver } from "../plugins/runtime/gateway-request-scope.js";
+import { createReplyOperation } from "../sessions/session-controller.js";
+import { captureSessionTarget } from "../sessions/session-controller.lifecycle.js";
+import { retireSessionControllerInput } from "../sessions/session-controller.mailbox.js";
 import { observeGatewayRunExecution } from "./agent-command.test-helpers.js";
 import { observeGatewayConnectionWork } from "./server-held-work.test-support.js";
+import {
+  createQueuedFollowupFixtureForTest,
+  settleQueuedFollowupRunForTest,
+} from "./server-methods/queued-followup-fixtures.test-support.js";
 import {
   connectOk,
   createGatewaySuiteHarness,
@@ -33,6 +42,9 @@ type GatewaySocket = Awaited<ReturnType<GatewayHarness["openWs"]>>;
 let gateway: GatewayHarness;
 const connectionReleases: Promise<void>[] = [];
 let restoreConnectionObserver: (() => void) | undefined;
+let gatewayContext: NonNullable<
+  Awaited<ReturnType<typeof observeGatewayConnectionWork>>["context"]
+>;
 
 function trackChatTerminalStates(socket: GatewaySocket, runId: string): string[] {
   const terminalStates: string[] = [];
@@ -63,6 +75,7 @@ beforeAll(async () => {
   restoreConnectionObserver = observer.restore;
   try {
     gateway = await createGatewaySuiteHarness();
+    gatewayContext = expectDefined(observer.context, "Gateway fixture context");
   } finally {
     observer.stopCapture();
   }
@@ -125,8 +138,11 @@ describe("gateway WebSocket chat abort settlement", () => {
       let waitSettled = false;
       let queuedLifecycle: GetReplyOptions["turnAdoptionLifecycle"];
       let queuedReply: InternalGetReplyOptions["onQueuedFollowupReplyBatch"];
+      const queuedFixture = createQueuedFollowupFixtureForTest(testState.sessionStorePath);
+      let queuedRun: ReturnType<typeof queuedFixture.bind> | undefined;
       let injectionOperation: ReturnType<typeof createReplyOperation> | undefined;
       let injectionSignal: AbortSignal | undefined;
+      let injectionSettled = false;
       const injectionWork: Promise<void>[] = [];
       const waitForAgentJob = agentJobs.waitForAgentJob;
       const waitObserver = vi.spyOn(agentJobs, "waitForAgentJob").mockImplementation((params) => {
@@ -153,8 +169,15 @@ describe("gateway WebSocket chat abort settlement", () => {
           injectionOperation = createReplyOperation({
             sessionKey: "agent:main:main",
             sessionId: "sess-main",
+            target: captureSessionTarget({
+              storeScope: testState.sessionStorePath!,
+              sessionKey: "agent:main:main",
+              incarnation: "sess-main",
+              agentId: "main",
+            }),
             resetTriggered: false,
           });
+          bindGatewayContextResolver(injectionOperation, gatewayContext.resolveGatewayContext);
           const fingerprint = "accepted-steer-tools";
           injectionOperation.bindToolAuthoritySnapshot({
             fingerprint: () => fingerprint,
@@ -167,6 +190,7 @@ describe("gateway WebSocket chat abort settlement", () => {
           injectionOperation.setPhase("running");
           injectionOperation.attachBackend({
             kind: "embedded",
+            supportsTranscriptCommitWait: true,
             runId: "accepted-steer-backing-run",
             toolAuthorityFingerprint: fingerprint,
             cancel: () => {},
@@ -177,7 +201,9 @@ describe("gateway WebSocket chat abort settlement", () => {
                 assertCurrent();
                 injectionSignal = options?.abortSignal;
                 options?.onQueueAccepted?.(true);
-                const work = dispatchRelease.promise.then(() => {});
+                const work = dispatchRelease.promise.then(() => {
+                  injectionSettled = true;
+                });
                 injectionWork.push(work);
                 return work;
               },
@@ -222,10 +248,12 @@ describe("gateway WebSocket chat abort settlement", () => {
           expect(dispatchInboundMessageMock).toHaveBeenCalledOnce();
         }
 
-        if (settlement === "queued-dispatch-settled") {
-          expect(queuedLifecycle?.onDeferred?.()).toBe(true);
-          dispatchRelease.resolve();
-          await withinTest(requestExecution.waitForDispatch(runId), signal);
+        if (settlement === "queued-dispatch-settled" || settlement === "accepted-injection") {
+          if (settlement === "queued-dispatch-settled") {
+            queuedRun = queuedFixture.bind(queuedLifecycle, "abort this dispatched message");
+            dispatchRelease.resolve();
+            await withinTest(requestExecution.waitForDispatch(runId), signal);
+          }
           await expect(
             rpcReq(socket, "agent.wait", { runId, timeoutMs: 0 }),
           ).resolves.toMatchObject({
@@ -238,7 +266,7 @@ describe("gateway WebSocket chat abort settlement", () => {
         // Hold the wait deadline while real abort and persistence work establishes ordering.
         vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
         let waitResponse =
-          settlement === "queued-dispatch-settled"
+          settlement === "queued-dispatch-settled" || settlement === "accepted-injection"
             ? undefined
             : rpcReq(socket, "agent.wait", { runId, timeoutMs: 2_000 });
         if (waitResponse) {
@@ -247,7 +275,7 @@ describe("gateway WebSocket chat abort settlement", () => {
           await withinTest(waitInstalled.promise, signal);
         }
         if (waitResponse && settlement.startsWith("queued-")) {
-          expect(queuedLifecycle?.onDeferred?.()).toBe(true);
+          queuedRun = queuedFixture.bind(queuedLifecycle, "abort this dispatched message");
           await expect(withinTest(waitResponse, signal)).resolves.toMatchObject({
             ok: true,
             payload: { runId, status: "pending", timeoutPhase: "queue", providerStarted: false },
@@ -266,10 +294,29 @@ describe("gateway WebSocket chat abort settlement", () => {
         );
         frames.push(abortedFrame);
         void abortedFrame.catch(() => {});
-        const aborted = await rpcReq(socket, "chat.abort", {
+        const abortResponse = rpcReq(socket, "chat.abort", {
           sessionKey: "main",
           runId,
         });
+        frames.push(abortResponse);
+        let abortResponded = false;
+        void abortResponse.then(
+          () => {
+            abortResponded = true;
+          },
+          () => {
+            abortResponded = true;
+          },
+        );
+        if (settlement === "accepted-injection") {
+          await withinTest(abortedFrame, signal);
+          expect(injectionSignal?.aborted).toBe(true);
+          expect(injectionSettled).toBe(false);
+          expect(abortResponded).toBe(false);
+          dispatchRelease.resolve();
+          await withinTest(Promise.all(injectionWork), signal);
+        }
+        const aborted = await withinTest(abortResponse, signal);
         expect(aborted.ok).toBe(true);
         expect(aborted.payload).toMatchObject({ ok: true, aborted: true, runIds: [runId] });
         await expect(withinTest(abortedFrame, signal)).resolves.toMatchObject({
@@ -278,18 +325,17 @@ describe("gateway WebSocket chat abort settlement", () => {
         const outcome = {
           runId,
           status: "error",
-          stopReason: settlement === "queued-dispatch-settled" ? "aborted" : "rpc",
+          stopReason: "rpc",
           endedAt: expect.any(Number),
         };
         if (settlement.startsWith("queued-")) {
           expect(queuedLifecycle?.abortSignal?.aborted).toBe(true);
-          await expect(queuedLifecycle?.onAdopted()).rejects.toBeDefined();
+          await expect(async () => queuedLifecycle?.onAdopted()).rejects.toBeDefined();
+        } else if (settlement === "accepted-injection") {
+          await withinTest(requestExecution.waitForDispatch(runId), signal);
         } else {
           expect(waitSettled).toBe(false);
           dispatchRelease.resolve();
-        }
-        if (settlement === "accepted-injection") {
-          expect(injectionSignal?.aborted).toBe(true);
         }
 
         const terminalResponse = await withinTest(
@@ -299,8 +345,10 @@ describe("gateway WebSocket chat abort settlement", () => {
         expect(terminalResponse).toMatchObject({ ok: true, payload: outcome });
         dispatchRelease.resolve();
         vi.useRealTimers();
-        await withinTest(requestExecution.waitForDispatch(runId), signal);
-        queuedLifecycle?.onSettled?.();
+        if (settlement !== "accepted-injection") {
+          await withinTest(requestExecution.waitForDispatch(runId), signal);
+        }
+        await queuedLifecycle?.onSettled?.();
         await queuedReply?.({
           kind: "queued-followup",
           runId: "late-consumer-after-abort",
@@ -326,7 +374,14 @@ describe("gateway WebSocket chat abort settlement", () => {
           () => closeGatewayTestWebSocket(socket),
           async () => {
             await Promise.allSettled([...dispatches, ...injectionWork]);
-            queuedLifecycle?.onSettled?.();
+            const input = readReplySourceInput({ turnAdoptionLifecycle: queuedLifecycle });
+            if (input) {
+              retireSessionControllerInput(input);
+            }
+            if (queuedRun) {
+              await settleQueuedFollowupRunForTest(queuedRun);
+            }
+            await queuedLifecycle?.onSettled?.();
             await Promise.allSettled([
               ...frames,
               waitWork,

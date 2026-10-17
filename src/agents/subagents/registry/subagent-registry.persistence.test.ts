@@ -11,7 +11,6 @@ import { replaceSessionEntry } from "../../../config/sessions/session-accessor.j
 import * as sessionReads from "../../../config/sessions/session-entry-read-runtime.js";
 import type { SessionEntry } from "../../../config/sessions/types.js";
 import { callGateway } from "../../../gateway/call.js";
-import type { ChatAbortControllerEntry } from "../../../gateway/chat-abort.types.js";
 import { sessionSharingTestContext } from "../../../gateway/server-methods/sessions-sharing.test-support.js";
 import * as agentEvents from "../../../infra/agent-events.js";
 import { bindGatewayContextResolver } from "../../../plugins/runtime/gateway-request-scope.js";
@@ -154,7 +153,6 @@ describe("subagent registry persistence", () => {
     const recoveryRuntime = createSubagentPersistenceRuntime(callGateway);
     const gateway = {
       recoveryRuntime,
-      chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
       resolveGatewayContext: () => gateway as never,
     };
     await activateSubagentRegistry(() => gateway as never);

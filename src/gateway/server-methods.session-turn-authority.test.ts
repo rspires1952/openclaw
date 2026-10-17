@@ -98,8 +98,6 @@ describe("session file turn authority", () => {
             });
           }
         }
-        expect(context.chatAbortControllers.size).toBe(0);
-        expect(context.chatQueuedTurns.size).toBe(0);
         expect(context.addChatRun).not.toHaveBeenCalled();
       } finally {
         projection.dispose();

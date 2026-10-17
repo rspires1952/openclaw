@@ -7,16 +7,16 @@ import {
   validateAgentRunDelegatedAuthority,
   type AgentRunDelegatedAuthority,
 } from "../../infra/agent-run-registry.js";
-import { ACTIVE_EMBEDDED_RUNS } from "./run-state.js";
+import { resolveSessionRunProgressState } from "../../sessions/session-controller.queries.js";
+import { getActiveNativeAttempt } from "./run-state.js";
 import { withAuthorizedPermissionChange } from "./run/permission-change.js";
-import { resolveEmbeddedAgentRunProgressState } from "./runs.js";
 
 /** Captures one exact live runtime; a later run must never inherit this update. */
 export function prepareEmbeddedRunPermissionChange(sessionId: string) {
-  if (!resolveEmbeddedAgentRunProgressState(sessionId)) {
+  if (!resolveSessionRunProgressState(sessionId)) {
     return { kind: "idle" as const };
   }
-  const handle = ACTIVE_EMBEDDED_RUNS.get(sessionId);
+  const handle = getActiveNativeAttempt(sessionId);
   if (!handle?.applyPermissionMode) {
     return { kind: "unsupported" as const };
   }
@@ -25,7 +25,7 @@ export function prepareEmbeddedRunPermissionChange(sessionId: string) {
   const owner = handle.permissionChangeOwner;
   const authority = handle.runId ? getAgentRunContext(handle.runId)?.delegatedAuthority : undefined;
   const ownsRuntime = () => {
-    const current = ACTIVE_EMBEDDED_RUNS.get(sessionId);
+    const current = getActiveNativeAttempt(sessionId);
     return (
       isAgentEventLifecycleGenerationCurrent(generation) &&
       (current === handle || (owner !== undefined && current?.permissionChangeOwner === owner))
@@ -35,7 +35,7 @@ export function prepareEmbeddedRunPermissionChange(sessionId: string) {
     kind: "active" as const,
     stop: () => {
       if (ownsRuntime()) {
-        ACTIVE_EMBEDDED_RUNS.get(sessionId)?.abort();
+        getActiveNativeAttempt(sessionId)?.abort();
       }
     },
     apply: async (
@@ -58,7 +58,7 @@ export function prepareEmbeddedRunPermissionChange(sessionId: string) {
       return (
         applied &&
         isAgentEventLifecycleGenerationCurrent(generation) &&
-        (!ACTIVE_EMBEDDED_RUNS.has(sessionId) || ownsRuntime())
+        (!getActiveNativeAttempt(sessionId) || ownsRuntime())
       );
     },
   };

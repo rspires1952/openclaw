@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
-import { beginSessionWorkAdmission } from "../sessions/session-lifecycle-admission.js";
+import { beginSessionEffect } from "../sessions/session-controller.lifecycle.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { createGatewayWorkerPlacementReclaimBarriers } from "./server-worker-placement-reclaim.js";
@@ -64,9 +64,10 @@ async function fixture(
   });
   const run = vi.fn(async () => ({ ...placement, state: "reclaimed" as const }) as never);
   const admit = (onInterrupt?: () => void) =>
-    beginSessionWorkAdmission({
+    beginSessionEffect({
       scope: target.storePath,
       identities: [request.sessionKey, request.sessionId],
+      agentId: request.agentId,
       assertAllowed: () => {},
       onInterrupt,
     });

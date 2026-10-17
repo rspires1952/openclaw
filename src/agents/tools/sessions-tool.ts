@@ -19,7 +19,10 @@ import { formatErrorMessage } from "../../infra/errors.js";
 import { isTransientNetworkError } from "../../infra/unhandled-rejections.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { isIncognitoSessionKey, parseAgentSessionKey } from "../../routing/session-key.js";
-import { getSessionWorkAdmissionRelease } from "../../sessions/session-lifecycle-admission.js";
+import {
+  captureSessionControllerSettlement,
+  captureSessionTarget,
+} from "../../sessions/session-controller.lifecycle.js";
 import type { AdmittedRunOperatorAuthority } from "../admitted-run-context.js";
 import { resolveSessionAgentId } from "../agent-scope.js";
 import type { AnyAgentTool } from "./common.js";
@@ -537,9 +540,13 @@ export function createSessionsTool(opts: SessionsToolOptions = {}): AnyAgentTool
             sessionKey: key,
             storePath,
           });
-          const released = getSessionWorkAdmissionRelease({
-            scope: storePath,
-            identities: [key, currentEntry?.sessionId],
+          const released = captureSessionControllerSettlement({
+            target: captureSessionTarget({
+              storeScope: storePath,
+              sessionKey: key,
+              incarnation: currentEntry?.sessionId,
+              agentId,
+            }),
           });
 
           if (
@@ -576,7 +583,12 @@ export function createSessionsTool(opts: SessionsToolOptions = {}): AnyAgentTool
             void runWithGatewayToolContinuationContext(() =>
               released
                 .then(async () => {
-                  const archiveIdentities = [key, expectedSessionIdentity.expectedSessionId];
+                  const archiveTarget = captureSessionTarget({
+                    storeScope: storePath,
+                    sessionKey: key,
+                    incarnation: expectedSessionIdentity.expectedSessionId,
+                    agentId,
+                  });
                   const archivePatch = {
                     key,
                     ...agentScope,
@@ -584,9 +596,8 @@ export function createSessionsTool(opts: SessionsToolOptions = {}): AnyAgentTool
                     ...expectedSessionIdentity,
                   };
                   while (true) {
-                    const competingRelease = getSessionWorkAdmissionRelease({
-                      scope: storePath,
-                      identities: archiveIdentities,
+                    const competingRelease = captureSessionControllerSettlement({
+                      target: archiveTarget,
                     });
                     if (competingRelease) {
                       await competingRelease;
@@ -611,9 +622,8 @@ export function createSessionsTool(opts: SessionsToolOptions = {}): AnyAgentTool
                       if (!retryableGatewayFailure) {
                         throw error;
                       }
-                      const retryAfterRelease = getSessionWorkAdmissionRelease({
-                        scope: storePath,
-                        identities: archiveIdentities,
+                      const retryAfterRelease = captureSessionControllerSettlement({
+                        target: archiveTarget,
                       });
                       if (!retryAfterRelease) {
                         throw error;

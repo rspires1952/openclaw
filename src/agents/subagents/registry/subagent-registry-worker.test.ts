@@ -472,7 +472,7 @@ it("serializes opposite multi-row orders without a lock-order deadlock", async (
   ]);
 });
 
-it("settles a requester cohort while many children finish, wake, and one is killed", async () => {
+it("settles a requester cohort while many children finish and one is killed", async () => {
   const children = Array.from({ length: 18 }, (_, index) => ({
     ...entry(`child-${index}`),
     completion: { required: true },
@@ -555,7 +555,7 @@ it("settles a requester cohort while many children finish, wake, and one is kill
     reason: "synthetic kill",
     suppressTaskDelivery: true,
   });
-  const results = await Promise.allSettled([...completions, ...wakes, settlement, killed]);
+  const results = await Promise.allSettled([...completions, settlement, killed]);
   expect(results.filter((result) => result.status === "rejected")).toEqual([]);
   const saved = loadSubagentRegistryFromSqlite();
   expect(saved.size).toBe(children.length + 1);

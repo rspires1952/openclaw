@@ -10,13 +10,16 @@ import {
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { setRpcSourceProjectSessionActive } from "../../sessions/session-controller.rpc-sources.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import * as terminalLifecycle from "../chat-abort-lifecycle-internal.js";
 import { registerChatAbortController } from "../chat-abort.js";
 import { createAgentEventTestHarness } from "../server-chat.agent-events.test-harness.js";
 import { handleGatewayRequest } from "../server-methods.js";
 import { roleClient, rolePolicyConfig } from "../session-sharing.test-utils.js";
+import { claimRpcSourceForTest } from "../test-helpers.rpc-source.js";
 import { createHistoryReadContext } from "./chat-history.test-helpers.js";
+import { captureRpcTargetForTest } from "./rpc-source-fixtures.test-support.js";
 import { disposeSessionReadContexts } from "./sessions-read-cache.test-support.js";
 import type { GatewayClient, GatewayRequestContext, RespondFn } from "./types.js";
 
@@ -174,12 +177,14 @@ describe("registered chat.predict", () => {
           lifecycleRunId: runId,
         }));
         const registration = registerChatAbortController({
-          chatAbortControllers: f.context.chatAbortControllers,
+          target: captureRpcTargetForTest(f.scope),
           runId,
           ...f.scope,
           timeoutMs: 60_000,
         });
         const entry = expectDefined(registration.entry, "registered prediction run");
+        const releaseSource = await claimRpcSourceForTest(entry);
+        registration.initializeTiming();
         registration.markExecutionStarted();
         const releaseWrite = createDeferred();
         const writeEntered = createDeferred();
@@ -198,13 +203,13 @@ describe("registered chat.predict", () => {
           trackTrackedRunTerminalPersistence: ({ persistence }) => {
             // Attach the event handler's exact write to its real run registration.
             terminalWrite = persistence;
-            entry.projectSessionActive = false;
-            entry.projectSessionTerminalPending = true;
-            entry.projectSessionTerminalPersistence = persistence;
+            setRpcSourceProjectSessionActive(entry, false);
+            entry.adapter.projectSessionTerminalPending = true;
+            entry.adapter.projectSessionTerminalPersistence = persistence;
             void persistence.then(() => {
-              entry.projectSessionTerminalPending = false;
-              entry.projectSessionTerminalPersistence = undefined;
-              entry.projectSessionTerminalPersisted = true;
+              entry.adapter.projectSessionTerminalPending = false;
+              entry.adapter.projectSessionTerminalPersistence = undefined;
+              entry.adapter.projectSessionTerminalPersisted = true;
             });
           },
         });
@@ -262,8 +267,49 @@ describe("registered chat.predict", () => {
           await terminalWrite;
           await prediction;
           waitSpy.mockRestore();
+          releaseSource();
           registration.cleanup();
           await h.handler.dispose();
+        }
+      });
+    },
+  );
+
+  it.each(["store", "gateway"] as const)(
+    "does not join terminal persistence owned by another %s",
+    async (otherOwner) => {
+      await withPredictionTest(async () => {
+        const f = await fixture();
+        if (otherOwner === "gateway") {
+          f.context.resolveGatewayContext = () => f.context;
+        }
+        const registration = registerChatAbortController({
+          target: captureRpcTargetForTest({
+            ...f.scope,
+            ...(otherOwner === "store" ? { storeScope: "/synthetic/other-store" } : {}),
+          }),
+          runId: "completed",
+          ...f.scope,
+          timeoutMs: 60_000,
+        });
+        const entry = expectDefined(registration.entry, "foreign prediction run");
+        entry.adapter.projectSessionTerminalPending = true;
+        entry.adapter.projectSessionTerminalPersistence = Promise.resolve();
+        const wait = vi
+          .spyOn(terminalLifecycle, "waitForChatAbortTerminalPersistence")
+          .mockResolvedValue();
+        try {
+          expect(await request(f.context, f.client)).toMatchObject([
+            true,
+            { text: "What should I try next?" },
+          ]);
+          expect(wait).not.toHaveBeenCalled();
+          expect(complete).toHaveBeenCalledOnce();
+        } finally {
+          entry.adapter.projectSessionTerminalPending = false;
+          entry.adapter.projectSessionTerminalPersistence = undefined;
+          registration.cleanup();
+          wait.mockRestore();
         }
       });
     },

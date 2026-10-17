@@ -44,6 +44,7 @@ it.each([
   "required-timeout",
   "ordinary-error",
   "parent-cancel",
+  "dispose-failure",
 ] as const)(
   "keeps candidate registration and cleanup within execution authority for %s",
   async (mode) => {
@@ -55,7 +56,12 @@ it.each([
     const records = new Map<string, Registration>();
     Object.defineProperty(globalThis, fixtureKey, {
       configurable: true,
-      value: { records, next: 0, deferred: createDeferred },
+      value: {
+        records,
+        next: 0,
+        deferred: createDeferred,
+        failDispose: mode === "dispose-failure",
+      },
     });
     const cleanupStarted = createDeferred();
     const finishCleanup = createDeferred();
@@ -74,6 +80,7 @@ it.each([
     let workSignal: AbortSignal | undefined;
     let logical: Promise<EmbeddedAgentRunResult> | undefined;
     let actualCleanup: Promise<void> | undefined;
+    let cleanupSettlement: Promise<void> | undefined;
     let admission: ReturnType<typeof prepareSystemAgentRunAdmission> | undefined;
     const cliResources = mode === "parent-cancel" ? new CliPluginInvocationResources() : undefined;
     let parentSignal: AbortSignal | undefined;
@@ -104,6 +111,7 @@ it.each([
           record.disposed++;
           db.close();
           record.close.resolve();
+          if (state.failDispose) throw new Error("candidate dispose failure");
         } });
       } };`,
       );
@@ -150,6 +158,7 @@ it.each([
       };
       setRuntimeConfigSnapshot(cfg);
       loop.mockImplementation(async (_refresh, input) => {
+        cleanupSettlement = input.runParams.runCleanupSettlement;
         const prepared = input.preparedModelRuntime;
         if (!prepared) {
           throw new Error("Runner did not supply its prepared candidate runtime");
@@ -291,7 +300,7 @@ it.each([
           throw new Error("Run completed before cleanup started");
         }),
       ]);
-      if (mode === "ordinary-error") {
+      if (mode === "ordinary-error" || mode === "dispose-failure") {
         finishCleanup.resolve();
       }
       if (mode === "required-timeout" || mode === "ordinary-error") {
@@ -307,11 +316,16 @@ it.each([
         throw new Error("Candidate registry source was not selected");
       }
       admission.close();
+      const generationCleanup = cleanupSettlement;
+      expect(generationCleanup).toBeInstanceOf(Promise);
+      if (!generationCleanup) {
+        throw new Error("Attempt did not receive its generation cleanup settlement");
+      }
       signalAbortedAtLogicalResult = workSignal?.aborted;
       expect.soft(selected.disposed).toBe(0);
       expect.soft(signalAbortedAtLogicalResult ?? false).toBe(false);
-      expect(cleanupScope.outcome).toBe("uncertain");
-      if (mode !== "ordinary-error") {
+      expect(cleanupScope.outcome).toBe(mode === "dispose-failure" ? "closed" : "uncertain");
+      if (mode !== "ordinary-error" && mode !== "dispose-failure") {
         expect(
           warnings.some((warning) => warning.includes("step=candidate-fixture timeoutMs=25")),
         ).toBe(true);
@@ -347,8 +361,20 @@ it.each([
       if (cliResources) {
         expect(parentClosed).toBe(true);
       }
+      if (mode === "dispose-failure") {
+        await expect(generationCleanup).rejects.toThrow(
+          "Prepared plugin generation cleanup failed",
+        );
+        const embeddedRunState = Reflect.get(
+          globalThis,
+          Symbol.for("openclaw.embeddedRunState"),
+        ) as { pendingCleanupOwners?: Set<{ runId: string }> } | undefined;
+        expect(embeddedRunState?.pendingCleanupOwners).toBeUndefined();
+      } else {
+        await generationCleanup;
+      }
       expect(selected.disposed).toBe(1);
-      expect(cleanupScope.outcome).toBe("uncertain");
+      expect(cleanupScope.outcome).toBe(mode === "dispose-failure" ? "closed" : "uncertain");
       if (mode === "late-failure") {
         expect(
           warnings.some(

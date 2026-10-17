@@ -109,7 +109,7 @@ export async function runCopilotExecution(context: {
   let bridge: ReturnType<typeof attachEventBridge> | undefined;
   let transcriptJournal: AttemptTranscriptJournal | undefined;
   let initialSdkUserValidated = false;
-  let activeRunHandleRef: ReturnType<typeof registerCopilotActiveRun> | undefined;
+  let activeRunRegistrationRef: ReturnType<typeof registerCopilotActiveRun> | undefined;
   let userInputBridgeRef: CopilotUserInputBridge | undefined;
   let cleanupToolBridge: (() => void) | undefined;
   let releaseError: Error | undefined;
@@ -462,7 +462,7 @@ export async function runCopilotExecution(context: {
       if (!userInputBridge) {
         throw new Error("[copilot-attempt] ordinary attempts require a user-input bridge");
       }
-      activeRunHandleRef = registerCopilotActiveRun({
+      activeRunRegistrationRef = registerCopilotActiveRun({
         abortActiveSession,
         agentId: sessionAgentId,
         bridge,
@@ -547,13 +547,15 @@ export async function runCopilotExecution(context: {
       promptError = toCopilotError(transcriptError);
     }
     userInputBridgeRef?.cancelPending();
-    if (activeRunHandleRef) {
-      input.replyOperation?.detachBackend(activeRunHandleRef);
+    if (activeRunRegistrationRef) {
+      const { attachment, handle: activeRunHandle } = activeRunRegistrationRef;
       clearActiveEmbeddedRun(
         input.sessionId,
-        activeRunHandleRef,
+        activeRunHandle,
         input.sessionKey,
         input.sessionFile,
+        undefined,
+        attachment,
       );
     }
     const journalSnapshot = transcriptJournal?.snapshot();

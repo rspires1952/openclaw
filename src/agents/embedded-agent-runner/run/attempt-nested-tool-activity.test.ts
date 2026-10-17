@@ -25,7 +25,6 @@ import {
   registerAgentSessionLoopTestLifecycle,
 } from "../../sessions/agent-session-loop-correctness.test-support.js";
 import { SessionManager } from "../../sessions/session-manager.js";
-import { ACTIVE_EMBEDDED_RUNS } from "../run-state.js";
 
 const mocks = vi.hoisted(() => ({
   clearActiveRun: vi.fn(),
@@ -66,9 +65,11 @@ describe("nested tool activity ownership", () => {
   });
   beforeEach(async () => {
     vi.clearAllMocks();
-    ACTIVE_EMBEDDED_RUNS.clear();
     const runs = await vi.importActual<typeof import("../runs.js")>("../runs.js");
-    mocks.setActiveRun.mockImplementation(runs.setActiveEmbeddedRun);
+    vi.doUnmock("../runs.js");
+    const { testing, registerTestEmbeddedRun } = await import("../runs.test-support.js");
+    testing.resetActiveEmbeddedRuns();
+    mocks.setActiveRun.mockImplementation(registerTestEmbeddedRun);
     mocks.clearActiveRun.mockImplementation(runs.clearActiveEmbeddedRun);
     mocks.subscribe.mockReturnValue(createCatalogSubscription());
     mocks.runBeforeFinalizeHook.mockResolvedValue({ action: "continue" });

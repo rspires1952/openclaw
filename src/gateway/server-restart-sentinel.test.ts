@@ -3,7 +3,9 @@ import path from "node:path";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSolidPngBuffer } from "../../test/helpers/image-fixtures.js";
+import { awaitGateBeforeSettlement, createDeferred } from "../../test/helpers/promise.js";
 import type { RuntimeContextFragment } from "../agents/internal-runtime-context.js";
+import type { SubagentRunRecord } from "../agents/subagents/registry/subagent-registry.types.js";
 import type { ChannelPlugin } from "../channels/plugins/types.plugin.js";
 import { buildRestartRecoveryClaimCleanupPatch } from "../config/sessions/restart-recovery-state.js";
 import {
@@ -91,6 +93,7 @@ const mocks = vi.hoisted(() => {
 
   return {
     resolveSessionAgentId: vi.fn(() => "agent-from-key"),
+    reserveSubagentCompletionControllerSource: vi.fn(),
     setInitialOutboundDelivery(value: Record<string, unknown> | null) {
       state.initialOutboundDelivery = value;
     },
@@ -229,6 +232,16 @@ const mocks = vi.hoisted(() => {
 
 vi.unmock("./server-restart-sentinel.js");
 vi.resetModules();
+
+vi.mock(
+  "../agents/subagents/announce/subagent-announce-controller-source.js",
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import("../agents/subagents/announce/subagent-announce-controller-source.js")
+    >()),
+    reserveSubagentCompletionControllerSource: mocks.reserveSubagentCompletionControllerSource,
+  }),
+);
 
 vi.mock(
   "../agents/subagents/completion/subagent-completion-delivery.js",
@@ -536,6 +549,7 @@ const {
   scheduleRestartSentinelWake,
   settleQueuedSessionDelivery,
 } = await import("./server-restart-sentinel.js");
+const { subagentRuns } = await import("../agents/subagents/registry/subagent-registry-memory.js");
 const { resetGatewayWorkAdmission } = await import("../process/gateway-work-admission.js");
 const actualRestartUpdateRun = await vi.importActual<
   typeof import("./server-restart-update-run.js")
@@ -1033,7 +1047,6 @@ describe("scheduleRestartSentinelWake", () => {
       broadcastToConnIds,
       sessionEventSubscribers: { getAll: () => subscribers },
       sessionMessageSubscribers: { get: () => subscribers },
-      chatAbortControllers: new Map(),
     });
     const publications: ReturnType<typeof publish>[] = [];
     const publicationErrors: unknown[] = [];
@@ -1495,6 +1508,25 @@ describe("scheduleRestartSentinelWake", () => {
   });
 
   it("fails closed when a terminal agent turn has no replayable result", async () => {
+    const deadlineAt = Date.now() + 60_000;
+    const completionOwner: SubagentRunRecord = {
+      runId: "run-terminal-owner",
+      childSessionKey: "agent:main:subagent:terminal-owner",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "generate media",
+      cleanup: "keep",
+      createdAt: 1,
+      execution: { status: "terminal", startedAt: 2, endedAt: 3, outcome: { status: "ok" } },
+      expectsCompletionMessage: true,
+      completion: { required: true, resultText: "generated media ready" },
+      delivery: {
+        status: "in_progress",
+        queueId: "session-delivery-media-terminal",
+        generation: 0,
+        deadlineAt,
+      },
+    };
     mocks.dispatchGatewayMethodInProcess.mockResolvedValueOnce({ status: "ok" });
     mocks.loadSessionEntryAsync.mockResolvedValue(
       sessionFixture("agent:main:main", {
@@ -1503,14 +1535,101 @@ describe("scheduleRestartSentinelWake", () => {
         updatedAt: 1,
       }),
     );
+    subagentRuns.set(completionOwner.runId, completionOwner);
+    try {
+      await expect(
+        deliverGeneratedMedia({
+          id: "session-delivery-media-terminal",
+          messageId: "image:task-terminal:agent-loop",
+          expectedMediaUrls: ["/tmp/proof.png"],
+          owner: {
+            kind: "subagent_completion",
+            runId: completionOwner.runId,
+            taskId: completionOwner.runId,
+            generation: 0,
+            deadlineAt,
+          },
+        }),
+      ).rejects.toThrow("dead-lettered without durable terminal evidence");
+      expect(mocks.reserveSubagentCompletionControllerSource).not.toHaveBeenCalled();
+    } finally {
+      subagentRuns.delete(completionOwner.runId);
+    }
+  });
 
-    await expect(
-      deliverGeneratedMedia({
-        id: "session-delivery-media-terminal",
-        messageId: "image:task-terminal:agent-loop",
-        expectedMediaUrls: ["/tmp/proof.png"],
+  it("awaits completion source custody and retires it when Gateway admission fails", async () => {
+    const { reserveSessionControllerSource, retireSessionControllerInput } =
+      await import("../sessions/session-controller.mailbox.js");
+    const { captureSessionTarget } = await import("../sessions/session-controller.lifecycle.js");
+    const input = reserveSessionControllerSource("agent:main:main", {
+      target: captureSessionTarget({
+        storeScope: "/tmp/sessions.json",
+        sessionKey: "agent:main:main",
+        agentId: "main",
+        incarnation: "agent:main:main",
       }),
-    ).rejects.toThrow("dead-lettered without durable terminal evidence");
+      policy: { mode: "followup" },
+    });
+    const reserved = createDeferred<typeof input>();
+    const entered = createDeferred();
+    const deadlineAt = Date.now() + 60_000;
+    const completionOwner: SubagentRunRecord = {
+      runId: "run-reserved-completion",
+      childSessionKey: "agent:main:subagent:reserved-completion",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "generate media",
+      cleanup: "keep",
+      createdAt: 1,
+      execution: { status: "terminal", startedAt: 2, endedAt: 3, outcome: { status: "ok" } },
+      delivery: {
+        status: "in_progress",
+        queueId: "session-delivery-reserved-completion",
+        generation: 0,
+        deadlineAt,
+      },
+    };
+    mocks.reserveSubagentCompletionControllerSource.mockImplementationOnce(() => {
+      entered.resolve();
+      return reserved.promise;
+    });
+    mocks.dispatchGatewayMethodInProcess.mockRejectedValueOnce(new Error("gateway unavailable"));
+    subagentRuns.set(completionOwner.runId, completionOwner);
+    try {
+      const delivery = expect(
+        deliverGeneratedMedia({
+          id: "session-delivery-reserved-completion",
+          messageId: "image:reserved-completion:agent-loop",
+          expectedMediaUrls: ["/tmp/proof.png"],
+          owner: {
+            kind: "subagent_completion",
+            runId: completionOwner.runId,
+            taskId: completionOwner.runId,
+            generation: 0,
+            deadlineAt,
+          },
+        }),
+      ).rejects.toThrow("failed before gateway acceptance");
+      await awaitGateBeforeSettlement(
+        entered.promise,
+        delivery,
+        "Completion delivery settled before reserving controller custody",
+      );
+      expect(mocks.dispatchGatewayMethodInProcess).not.toHaveBeenCalled();
+      reserved.resolve(input);
+      await delivery;
+      expect(mocks.dispatchGatewayMethodInProcess).toHaveBeenCalledWith(
+        "agent",
+        expect.any(Object),
+        expect.objectContaining({ controllerInput: input }),
+      );
+      expect(input.retirementRequested).toBe(true);
+      await input.settlement.promise;
+    } finally {
+      reserved.resolve(input);
+      retireSessionControllerInput(input);
+      subagentRuns.delete(completionOwner.runId);
+    }
   });
 
   it("retries a captured empty terminal result instead of dead-lettering it", async () => {

@@ -9,13 +9,13 @@ import {
   createDeferred,
   withinTest,
 } from "../../test/helpers/promise.js";
-import { waitForEmbeddedAgentRunEnd } from "../agents/embedded-agent-runner/active-run-projections.js";
 import * as workspaceReadiness from "../agents/workspace-readiness.js";
 import { requireGit } from "../agents/worktrees/git.js";
 import { ManagedWorktreeService } from "../agents/worktrees/service.js";
 import type { CreateManagedWorktreeParams } from "../agents/worktrees/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { areHeartbeatsEnabled, setHeartbeatsEnabled } from "../infra/heartbeat-wake.js";
+import { waitForSessionRunEnd } from "../sessions/session-controller.native-runtime.js";
 import type { Deferred } from "../shared/deferred.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "./test-helpers.e2e.js";
@@ -560,7 +560,7 @@ it(
           );
           expect(deliveries.filter((delivery) => delivery.to === name)).toEqual([]);
           await expect(fs.access(canary)).rejects.toMatchObject({ code: "ENOENT" });
-          const runEnded = waitForEmbeddedAgentRunEnd(started.sessionId, null);
+          const runEnded = waitForSessionRunEnd(started.sessionId, null);
           if (revoked) {
             expect(
               await gateway.client.request("chat.abort", {

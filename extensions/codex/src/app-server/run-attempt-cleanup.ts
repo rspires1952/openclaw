@@ -73,6 +73,7 @@ export async function cleanupCodexAttempt(
       terminateCodexBackgroundTerminals(resourceState.client, resourceState.thread.threadId, true),
     );
   }
+  let retainedOrdinaryThread: boolean | undefined;
   try {
     await state.pluginRuntimeRefreshStop;
     steeringQueueRef.current?.cancel();
@@ -115,7 +116,7 @@ export async function cleanupCodexAttempt(
     // Incognito retains its creation policy without idle eviction.
     // Ordinary failed turns keep loaded configuration too: native unsubscribe delays unload.
     // Retain that configuration owner so later input can reuse the same thread.
-    const retainedOrdinaryThread =
+    retainedOrdinaryThread =
       !pluginRuntimeRefreshing &&
       ((retainLiveIncognitoThread &&
         resourceState.thread.liveThreadEphemeralPolicy !== undefined) ||
@@ -183,9 +184,9 @@ export async function cleanupCodexAttempt(
       }
     }
   } finally {
-    if (resourceState.thread.liveThreadOwnership) {
-      // A failed retention/finalization still owes settlement of its warm claim.
-      // Already-retained or released subscriptions are no-ops at the resource owner.
+    if (resourceState.thread.liveThreadOwnership || retainedOrdinaryThread === undefined) {
+      // Failed retention still owes the fresh subscription; warm claims also need
+      // settlement after later failures. Settled subscriptions need no further cleanup.
       await runCleanupStep("codex-unsettled-subscription", async () => {
         await releaseThreadSubscription();
       });
@@ -232,11 +233,15 @@ export async function cleanupCodexAttempt(
       runAbortController.signal.removeEventListener("abort", abortListener);
     });
     await runCleanupStep("codex-steering-cancel", () => steeringQueueRef.current?.cancel());
-    await runCleanupStep("codex-reply-backend-detach", () =>
-      params.replyOperation?.detachBackend(handle),
-    );
     await runCleanupStep("codex-active-run-clear", () => {
-      clearActiveEmbeddedRun(params.sessionId, handle, params.sessionKey, params.sessionFile);
+      clearActiveEmbeddedRun(
+        params.sessionId,
+        handle,
+        params.sessionKey,
+        params.sessionFile,
+        undefined,
+        activeTurn.activeRunAttachment,
+      );
     });
   }
   await state.abortCleanup;

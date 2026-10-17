@@ -13,7 +13,7 @@ import {
   bindGatewayContextResolver,
   getGatewayContextResolver,
 } from "../../../plugins/runtime/gateway-request-scope.js";
-import { beginSessionWorkAdmission } from "../../../sessions/session-lifecycle-admission.js";
+import { beginSessionEffect } from "../../../sessions/session-controller.lifecycle.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
 import { restartRecoveryTestHarness } from "./subagent-registry-restart-recovery.test-support.js";
 import { createSubagentSweeperHarness } from "./subagent-registry-sweeper.test-support.js";
@@ -41,8 +41,10 @@ describe("subagent registry restart recovery", () => {
           : {}),
       });
       const before = structuredClone(entry);
-      const { sweeper, runs, finalizeInterruptedSubagentRun, resumeRequesterSettleWake } =
-        createSubagentSweeperHarness({ current: gatewayRuntime }, entry);
+      const { sweeper, runs, finalizeInterruptedSubagentRun } = createSubagentSweeperHarness(
+        { current: gatewayRuntime },
+        entry,
+      );
 
       await sweeper.recoverInterruptedRuns();
       await sweeper.sweepOnce();
@@ -50,7 +52,6 @@ describe("subagent registry restart recovery", () => {
       expect(mocks.loadSessionEntry).not.toHaveBeenCalled();
       expect(finalizeInterruptedSubagentRun).not.toHaveBeenCalled();
       expect(dispatchAgent).not.toHaveBeenCalled();
-      expect(resumeRequesterSettleWake).toHaveBeenCalledTimes(pendingWake ? 1 : 0);
       expect(runs.get(entry.runId)).toEqual(before);
     },
   );
@@ -178,7 +179,7 @@ describe("subagent registry restart recovery", () => {
       );
       const lease =
         owner === "admission"
-          ? await beginSessionWorkAdmission({
+          ? await beginSessionEffect({
               scope: mocks.storePath,
               identities: [childSessionKey, "session-id"],
               assertAllowed: () => {},
@@ -383,7 +384,7 @@ describe("subagent registry restart recovery", () => {
         });
         const lease =
           owner === "admission"
-            ? await beginSessionWorkAdmission({
+            ? await beginSessionEffect({
                 scope: mocks.storePath,
                 identities: [childSessionKey, "session-id"],
                 assertAllowed: () => {},
@@ -561,7 +562,6 @@ describe("interrupted requester-settle continuation ownership", () => {
       requesterAgentId: "main",
       batchRunIds: [child.runId],
       rearmGeneration: quiet ? undefined : 1,
-      sharedAttemptKey: quiet,
     });
     const worker = run({ runId, taskRunId: "original-task" });
     worker.execution.status = "interrupted";
@@ -582,34 +582,25 @@ describe("interrupted requester-settle continuation ownership", () => {
   }
 
   it.each([
-    { backoff: 0, privateCompletion: false, physicalLocator: false, quiet: false, legacy: false },
-    { backoff: 0, privateCompletion: false, physicalLocator: true, quiet: false, legacy: false },
+    { privateCompletion: false, physicalLocator: false, quiet: false, legacy: false },
+    { privateCompletion: false, physicalLocator: true, quiet: false, legacy: false },
     {
-      backoff: 120_000,
-      privateCompletion: false,
-      physicalLocator: false,
-      quiet: false,
-      legacy: false,
-    },
-    {
-      backoff: 120_000,
       privateCompletion: true,
       physicalLocator: false,
       quiet: false,
       legacy: false,
     },
-    { backoff: 0, privateCompletion: true, physicalLocator: true, quiet: true, legacy: false },
+    { privateCompletion: true, physicalLocator: true, quiet: true, legacy: false },
     {
-      backoff: 120_000,
       privateCompletion: true,
       physicalLocator: false,
       quiet: true,
       legacy: false,
     },
-    { backoff: 0, privateCompletion: false, physicalLocator: false, quiet: false, legacy: true },
+    { privateCompletion: false, physicalLocator: false, quiet: false, legacy: true },
   ])(
-    "keeps the exact saved wake owned before admission (backoff $backoff, private $privateCompletion, physical locator $physicalLocator, quiet $quiet, legacy $legacy)",
-    async ({ backoff, privateCompletion, physicalLocator, quiet, legacy }) => {
+    "keeps the exact saved wake owned before admission (private $privateCompletion, physical locator $physicalLocator, quiet $quiet, legacy $legacy)",
+    async ({ privateCompletion, physicalLocator, quiet, legacy }) => {
       const { child, worker } = cohort(quiet);
       if (legacy) {
         worker.childSessionIdentity = undefined;
@@ -617,10 +608,8 @@ describe("interrupted requester-settle continuation ownership", () => {
       if (physicalLocator) {
         mocks.storePath = child.requesterStorePath!;
       }
-      child.requesterSettleWake!.nextAttemptAt = Date.now() + backoff;
       if (privateCompletion) {
         child.completionTarget = "parent";
-        child.requesterSettleWake!.attemptCount = 2;
       }
       expect(await recover(worker)).toEqual({ status: "handled" });
       expect(worker.execution.outcome).toBeUndefined();
@@ -630,7 +619,6 @@ describe("interrupted requester-settle continuation ownership", () => {
   );
 
   it.each([
-    "different attempt",
     "non-cohort batch",
     "rearmed",
     "unstarted",
@@ -651,9 +639,6 @@ describe("interrupted requester-settle continuation ownership", () => {
     if (scenario === "non-cohort batch") {
       child.requesterSettleWake!.requesterYieldBatch = undefined;
       child.requesterSettleWake!.rearmGeneration = undefined;
-    }
-    if (scenario === "different attempt") {
-      child.requesterSettleWake!.attemptCount++;
     }
     if (scenario === "rearmed") {
       child.requesterSettleWake!.rearmGeneration!++;

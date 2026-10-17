@@ -18,8 +18,6 @@ describe("sessions.patchMany orchestration", () => {
       loadGatewayModelCatalog: vi.fn(async () => []),
       broadcastToConnIds: vi.fn(),
       getSessionEventSubscriberConnIds: () => new Set(),
-      chatAbortControllers: new Map(),
-      chatQueuedTurns: new Map(),
       dedupe: new Map(),
       ...overrides,
     }) as never;

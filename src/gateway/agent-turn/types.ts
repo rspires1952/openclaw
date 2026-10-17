@@ -2,12 +2,16 @@ import type { AgentRunTerminalDeliverySnapshot } from "../../agents/agent-run-te
 import type { AgentRunTerminalOutcome } from "../../agents/agent-run-terminal-outcome.js";
 import type { AgentRunTerminalReceipt } from "../../agents/agent-run-terminal-receipt.js";
 import type { AgentRunTerminalReplySnapshot } from "../../agents/agent-run-terminal-reply.types.js";
-import type { ChatAbortControllerEntry } from "../chat-abort.js";
+import type { ReplyExpectation } from "../../agents/reply-completion.js";
+import type { SessionControllerInput } from "../../sessions/session-controller.mailbox.js";
+import type { RpcSourceRef } from "../../sessions/session-controller.rpc-sources.js";
 import type {
   GatewayClient,
   GatewayRequestContext,
   RespondFn,
 } from "../server-methods/shared-types.js";
+import type { AgentRequestPreflight } from "./agent-request-preflight.js";
+import type { RequesterSettleWakeReplay } from "./internal-facade.types.js";
 
 export type AgentTurnFrame = readonly [
   ok: Parameters<RespondFn>[0],
@@ -18,7 +22,7 @@ export type AgentTurnFrame = readonly [
 export type AgentTurnIo = {
   emitAcceptance: (acceptance: AgentTurnFrame, meta?: Parameters<RespondFn>[3]) => void;
   /** Publishes the exact controller before asynchronous runtime preparation. */
-  emitStartOwner?: (runId: string, entry: ChatAbortControllerEntry) => void;
+  emitStartOwner?: (runId: string, entry: RpcSourceRef) => void;
   /** Internal lifecycle observer; public transports do not expose this callback. */
   emitExecutionStarted?: () => void;
   emitFinal: (final: AgentTurnFrame, meta?: Parameters<RespondFn>[3]) => void;
@@ -37,6 +41,21 @@ export type AgentTurnPrincipal = Pick<
   | "sharedGatewaySessionGeneration"
 >;
 
+export type AgentTurnStartRequest = {
+  controllerInput?: SessionControllerInput;
+  privateCompletion?: true;
+  /** Trusted input-owner policy; not accepted from the wire request. */
+  replyExpectation?: ReplyExpectation;
+  settleWakeReplay?: RequesterSettleWakeReplay;
+  assertAdmissionCurrent?: () => void;
+  assertInputCommitAllowed?: () => void;
+  hasCurrentClientAuthority?: () => boolean;
+  preflight: AgentRequestPreflight;
+  principal: AgentTurnPrincipal | null;
+  io: AgentTurnIo;
+  onRunObserved?: (runId: string) => void;
+};
+
 export type AgentTurnContext = Pick<
   GatewayRequestContext,
   | "addChatRun"
@@ -44,8 +63,6 @@ export type AgentTurnContext = Pick<
   | "broadcast"
   | "broadcastToConnIds"
   | "cancelRunBoundApprovals"
-  | "chatAbortControllers"
-  | "chatQueuedTurns"
   | "chatRunState"
   | "dedupe"
   | "deps"

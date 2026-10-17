@@ -6,6 +6,8 @@ import {
 import type { SessionEntry } from "../../../config/sessions/types.js";
 import { callGateway } from "../../../gateway/call.js";
 import type { GatewayRequestContext } from "../../../gateway/server-methods/types.js";
+import { createGatewayRequestContext } from "../../../gateway/server-request-context.js";
+import { makeContextParams } from "../../../gateway/server-request-context.test-support.js";
 import { maybeSpawnVisibleSession } from "../../tools/sessions-spawn-visible.js";
 import type { SessionStoreEntry } from "./subagent-registry.lifecycle-fixture.test-support.js";
 import * as registry from "./subagent-registry.test-helpers.js";
@@ -28,11 +30,10 @@ export function createGatewayContext() {
       throw new Error("Unexpected recovery notice");
     },
   };
-  const context = {
+  const context = Object.assign(createGatewayRequestContext(makeContextParams()), {
     recoveryRuntime,
-    chatAbortControllers: new Map(),
     localEmbedded: true,
-  } as GatewayRequestContext;
+  });
   context.resolveGatewayContext = () => context;
   return context;
 }

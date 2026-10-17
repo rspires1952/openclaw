@@ -4,15 +4,18 @@ import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, it, vi, type Mock } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { loadSessionEntry } from "../../../config/sessions/session-accessor.js";
-import {
-  removeChatAbortControllerEntry,
-  type ChatAbortControllerEntry,
-} from "../../../gateway/chat-abort.js";
 import type { createGatewayInstanceRuntime } from "../../../gateway/server-instance-runtime.js";
 import type { GatewayRequestContext } from "../../../gateway/server-methods/types.js";
 import { prepareGatewayRunShutdown } from "../../../gateway/server-run-shutdown.js";
 import { withTimeout } from "../../../infra/fs-safe.js";
 import type { SqliteWorkerCommand } from "../../../infra/sqlite-worker-contract.js";
+import { reserveSessionControllerSource } from "../../../sessions/session-controller.mailbox.js";
+import {
+  getRpcSourceIdentity,
+  requestRpcSourceCancellation,
+  type RpcSourceRef,
+} from "../../../sessions/session-controller.rpc-sources.js";
+import { rpcSourceTesting } from "../../../sessions/session-lifecycle-admission.test-support.js";
 import { AsyncWorkScope } from "../../../shared/async-work-scope.js";
 import { closeOpenClawStateDatabaseByPathAsync } from "../../../state/openclaw-state-db-cache.js";
 import { captureOpenClawStateWorkerContext } from "../../../state/openclaw-state-worker-context.js";
@@ -184,16 +187,16 @@ export function registerOperatorSpawnRollbackCases(options: {
             childRunId = record.run_id;
             expect(subagentRuns.has(record.run_id)).toBe(false);
             const acceptedRun = expectDefined(
-              context.chatAbortControllers.get(record.run_id),
+              rpcSourceTesting.get(record.run_id),
               "accepted child execution owner",
             );
-            expect(acceptedRun.sessionKey).toBe(record.child_session_key);
+            expect(getRpcSourceIdentity(acceptedRun).sessionKey).toBe(record.child_session_key);
             if (phase === "uncertain registration") {
               await embeddedStarted.promise;
               expect(expectDefined(embeddedSignal, "running child abort signal").aborted).toBe(
                 false,
               );
-              expect(context.chatAbortControllers.get(record.run_id)).toBe(acceptedRun);
+              expect(rpcSourceTesting.get(record.run_id)).toBe(acceptedRun);
               const childEntry = expectDefined(
                 loadSessionEntry({
                   storePath: bound.storePath,
@@ -205,7 +208,7 @@ export function registerOperatorSpawnRollbackCases(options: {
                 sessionId: childEntry.sessionId,
                 lifecycleRevision: childEntry.lifecycleRevision,
               };
-              expect(acceptedRun).toMatchObject({
+              expect(getRpcSourceIdentity(acceptedRun)).toMatchObject({
                 sessionKey: record.child_session_key,
                 sessionId: childEntry.sessionId,
               });
@@ -275,7 +278,7 @@ export function registerOperatorSpawnRollbackCases(options: {
           expect(options.runEmbeddedAgent).not.toHaveBeenCalled();
         } else {
           const runId = expectDefined(childRunId, "accepted child run");
-          expect(context.chatAbortControllers.has(runId)).toBe(false);
+          expect(rpcSourceTesting.has(runId)).toBe(false);
           expect(context.dedupe.get(`agent:${runId}`)).toMatchObject({
             payload: { runId, status: expect.stringMatching(/^(error|timeout)$/) },
           });
@@ -293,9 +296,9 @@ export function registerOperatorSpawnRollbackCases(options: {
         embeddedStarted.resolve();
         spawnTesting.setDepsForTest();
         registrationWrite?.restore();
-        for (const entry of context.chatAbortControllers.values()) {
+        for (const entry of rpcSourceTesting.values()) {
           if (entry !== bound.parent.entry) {
-            entry.controller.abort(new Error("spawn rollback fixture cleanup"));
+            requestRpcSourceCancellation(entry, new Error("spawn rollback fixture cleanup"));
           }
         }
         if (preserveSession) {
@@ -353,11 +356,11 @@ export function registerOperatorSpawnRollbackCases(options: {
         | {
             runId: string;
             sessionKey: string;
-            entry: ChatAbortControllerEntry;
+            entry: RpcSourceRef;
             sessionIdentity: { sessionId: string; lifecycleRevision?: string };
           }
         | undefined;
-      let replacement: ChatAbortControllerEntry | undefined;
+      let replacement: RpcSourceRef | undefined;
       let embeddedSignal: AbortSignal | undefined;
       let embeddedSettled = false;
       let retrySignal: AbortSignal | undefined;
@@ -374,8 +377,6 @@ export function registerOperatorSpawnRollbackCases(options: {
         runtime.close();
         await prepareGatewayRunShutdown({
           resolveGatewayContext: () => bound.gatewayBinding.current,
-          chatAbortControllers: context.chatAbortControllers,
-          chatQueuedTurns: context.chatQueuedTurns,
           chatRunState: context.chatRunState,
           removeChatRun: context.removeChatRun,
           agentRunSeq: context.agentRunSeq,
@@ -432,7 +433,7 @@ export function registerOperatorSpawnRollbackCases(options: {
         async (record, workerContext) => {
           registrationAdmission = workerContext.admission;
           const entry = expectDefined(
-            context.chatAbortControllers.get(record.run_id),
+            rpcSourceTesting.get(record.run_id),
             "accepted child execution owner",
           );
           const session = expectDefined(
@@ -475,7 +476,7 @@ export function registerOperatorSpawnRollbackCases(options: {
         expect(retrySignal?.aborted).toBe(false);
         expect(signal.aborted).toBe(false);
         expect(embeddedSettled).toBe(false);
-        expect(context.chatAbortControllers.get(accepted.runId)).toBe(accepted.entry);
+        expect(rpcSourceTesting.get(accepted.runId)).toBe(accepted.entry);
         expect(subagentRuns.has(accepted.runId)).toBe(false);
 
         const otherSpawn = invoke("capacity-during-uncertain-cleanup");
@@ -490,15 +491,22 @@ export function registerOperatorSpawnRollbackCases(options: {
 
         if (transition === "reassign") {
           replacement = {
-            ...accepted.entry,
-            controller: new AbortController(),
-            operationalRunInstance: createOperationalRunInstanceRef(accepted.runId),
-            agentRunDelegatedAuthority: undefined,
+            input: reserveSessionControllerSource(accepted.sessionKey, {
+              target: accepted.entry.input.target,
+              protocolRunId: accepted.runId,
+              sourceSessionId: accepted.entry.input.sourceSessionId,
+              policy: accepted.entry.input.policy,
+            }),
+            adapter: {
+              ...accepted.entry.adapter,
+              operationalRunInstance: createOperationalRunInstanceRef(accepted.runId),
+              agentRunDelegatedAuthority: undefined,
+            },
           };
-          expect(replacement.operationalRunInstance).not.toBe(
-            accepted.entry.operationalRunInstance,
+          expect(replacement.adapter.operationalRunInstance).not.toBe(
+            accepted.entry.adapter.operationalRunInstance,
           );
-          context.chatAbortControllers.set(accepted.runId, replacement);
+          rpcSourceTesting.set(accepted.runId, replacement);
         } else if (transition === "database-retirement") {
           const admission = expectDefined(registrationAdmission, "registration database admission");
           await closeOpenClawStateDatabaseByPathAsync(admission.databasePath);
@@ -508,7 +516,7 @@ export function registerOperatorSpawnRollbackCases(options: {
           expect(current.identity.key).toBe(admission.identity.key);
           expect(current.assertCurrent).not.toThrow();
           expect(runtime.isAvailable()).toBe(true);
-          expect(context.chatAbortControllers.get(accepted.runId)).toBe(accepted.entry);
+          expect(rpcSourceTesting.get(accepted.runId)).toBe(accepted.entry);
           expect(signal.aborted).toBe(false);
           expect(retrySignal?.aborted).toBe(false);
         } else if (transition === "shutdown") {
@@ -533,7 +541,7 @@ export function registerOperatorSpawnRollbackCases(options: {
             status: "forbidden",
             error: expect.stringContaining("max active children"),
           });
-          expect(context.chatAbortControllers.get(accepted.runId)).toBe(accepted.entry);
+          expect(rpcSourceTesting.get(accepted.runId)).toBe(accepted.entry);
           expect(signal.aborted).toBe(false);
           expect(embeddedSettled).toBe(false);
           expect(retrySignal?.aborted).toBe(false);
@@ -542,11 +550,14 @@ export function registerOperatorSpawnRollbackCases(options: {
           expect(retrySignal?.aborted).toBe(true);
         }
         if (replacement) {
-          expect(context.chatAbortControllers.get(accepted.runId)).toBe(replacement);
-          expect(replacement.controller.signal.aborted).toBe(false);
+          expect(rpcSourceTesting.get(accepted.runId)).toBe(replacement);
+          expect(replacement.input.abortSignal.aborted).toBe(false);
           expect(signal.aborted).toBe(false);
           // The displaced synthetic producer is ours; the successor remains untouched.
-          accepted.entry.controller.abort(new Error("reassigned fixture producer cleanup"));
+          requestRpcSourceCancellation(
+            accepted.entry,
+            new Error("reassigned fixture producer cleanup"),
+          );
         }
         await AsyncWorkScope.runWhenAllIdle(
           () => [bound.execution],
@@ -556,10 +567,10 @@ export function registerOperatorSpawnRollbackCases(options: {
         expect(embeddedSettled).toBe(true);
         expect(abortAttempts).toBe(2);
         if (replacement) {
-          expect(context.chatAbortControllers.get(accepted.runId)).toBe(replacement);
-          expect(replacement.controller.signal.aborted).toBe(false);
+          expect(rpcSourceTesting.get(accepted.runId)).toBe(replacement);
+          expect(replacement.input.abortSignal.aborted).toBe(false);
         } else {
-          expect(context.chatAbortControllers.has(accepted.runId)).toBe(false);
+          expect(rpcSourceTesting.has(accepted.runId)).toBe(false);
         }
         expect(
           loadSessionEntry({ storePath: bound.storePath, sessionKey: accepted.sessionKey }),
@@ -590,14 +601,16 @@ export function registerOperatorSpawnRollbackCases(options: {
       } finally {
         embeddedStarted.resolve();
         releaseRetry.resolve();
-        child?.entry.controller.abort(new Error("uncertain spawn fixture cleanup"));
-        for (const entry of context.chatAbortControllers.values()) {
+        if (child) {
+          requestRpcSourceCancellation(child.entry, new Error("uncertain spawn fixture cleanup"));
+        }
+        for (const entry of rpcSourceTesting.values()) {
           if (entry !== bound.parent.entry && entry !== replacement) {
-            entry.controller.abort(new Error("uncertain spawn fixture cleanup"));
+            requestRpcSourceCancellation(entry, new Error("uncertain spawn fixture cleanup"));
           }
         }
         if (child && replacement) {
-          removeChatAbortControllerEntry(context.chatAbortControllers, child.runId, replacement);
+          rpcSourceTesting.deleteExpected(child.runId, replacement);
         }
         registrationWrite.restore();
         const settled = await Promise.allSettled(invocations);

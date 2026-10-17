@@ -13,13 +13,9 @@ import {
   getFollowupQueueDepth,
   scheduleFollowupDrain,
 } from "../../auto-reply/reply/queue.js";
-import { clearFollowupDrainCallback } from "../../auto-reply/reply/queue/drain.js";
 import { resetRecentQueuedMessageIdDedupe } from "../../auto-reply/reply/queue/recent-message-ids.test-support.js";
 import { clearFollowupQueue } from "../../auto-reply/reply/queue/state.js";
 import type { ReplyOperationRunState } from "../../auto-reply/reply/reply-operation-run-state.js";
-import type { ReplyBackendHandle } from "../../auto-reply/reply/reply-run-registry.contracts.js";
-import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.js";
-import { testing as replyRunTesting } from "../../auto-reply/reply/reply-run-registry.test-support.js";
 import { prepareReplyToolAuthority } from "../../auto-reply/reply/reply-tool-authority.js";
 import {
   createMockFollowupRun,
@@ -27,14 +23,17 @@ import {
 } from "../../auto-reply/reply/test-helpers.js";
 import { createTypingSignaler } from "../../auto-reply/reply/typing-mode.js";
 import type { TemplateContext } from "../../auto-reply/templating.js";
+import type { ReplyBackendHandle } from "../../sessions/session-controller.contracts.js";
+import { createReplyOperation } from "../../sessions/session-controller.js";
+import { testing as replyRunTesting } from "../../sessions/session-controller.test-support.js";
 import type { EmbeddedAgentQueueHandle } from "../embedded-agent-runner/run-state.js";
 import { steerActiveSessionWithOptionalDeliveryWait } from "../embedded-agent-runner/run/attempt-queue-message.js";
 import {
-  clearActiveEmbeddedRun,
-  queueEmbeddedAgentMessageWithOutcomeAsync,
-  setActiveEmbeddedRun,
-} from "../embedded-agent-runner/runs.js";
-import { testing as embeddedRunsTesting } from "../embedded-agent-runner/runs.test-support.js";
+  clearTestEmbeddedRun as clearActiveEmbeddedRun,
+  registerTestEmbeddedRun as setActiveEmbeddedRun,
+  testing as embeddedRunsTesting,
+  steerTestSessionTurn,
+} from "../embedded-agent-runner/runs.test-support.js";
 import {
   createAssistant,
   createAssistantResultStream,
@@ -79,7 +78,7 @@ describe("AgentSession handoff adoption integration", () => {
       releaseOwner = resolve;
     });
     embeddedRunsTesting.resetActiveEmbeddedRuns();
-    replyRunTesting.resetReplyRunRegistry();
+    replyRunTesting.resetSessionControllerForTest();
     resetRecentQueuedMessageIdDedupe();
     let resolveSteerEnqueued!: () => void;
     const steerEnqueued = new Promise<void>((resolve) => {
@@ -204,18 +203,8 @@ describe("AgentSession handoff adoption integration", () => {
       supportsQueueMessageImages: true,
       messageInjection: {
         isAvailable: () => true,
-        queueMessage: async (text, options) => {
-          const outcome = await queueEmbeddedAgentMessageWithOutcomeAsync(sessionId, text, options);
-          if (!outcome.queued) {
-            throw new Error(outcome.errorMessage ?? outcome.reason);
-          }
-          return outcome.transcriptCommit === "unconfirmed"
-            ? {
-                transcriptCommit: outcome.transcriptCommit,
-                errorMessage: outcome.errorMessage ?? "transcript commitment unconfirmed",
-              }
-            : undefined;
-        },
+        // The reply backend forwards to the exact native attempt it fronts.
+        queueMessage: (text, options) => queueMessage(text, options),
       },
       cancel: () => {},
     };
@@ -224,11 +213,16 @@ describe("AgentSession handoff adoption integration", () => {
     const runState: ReplyOperationRunState = {};
     const runFollowup = async (queued: typeof followupRun) => {
       await ownerReleased;
+      const mailboxClaim = queued.controllerInput?.claim;
+      if (!mailboxClaim) {
+        throw new Error("follow-up has no selected controller mailbox claim");
+      }
       const followupOperation = createReplyOperation({
         sessionKey: queueKey,
         sessionId,
         turnKind: "queued_followup",
         resetTriggered: false,
+        mailboxClaim,
       });
       followupOperation.setPhase("running");
       followupOperations.push(followupOperation.turnKind);
@@ -304,10 +298,11 @@ describe("AgentSession handoff adoption integration", () => {
 
       clearActiveEmbeddedRun(sessionId, queueHandle, queueKey);
       await expect(
-        queueEmbeddedAgentMessageWithOutcomeAsync(sessionId, "stale owner probe", {
-          waitForTranscriptCommit: true,
-        }),
-      ).resolves.toMatchObject({ queued: false, reason: "transcript_commit_wait_unsupported" });
+        steerTestSessionTurn(sessionId, "stale owner probe", { waitForTranscriptCommit: true }),
+      ).resolves.toMatchObject({
+        status: "rejected",
+        reason: "injection_unavailable",
+      });
       activeOperation.complete();
       releaseOwner();
       await vi.waitFor(() => expect(finalDelivery).toHaveBeenCalledExactlyOnceWith(finalText));
@@ -352,9 +347,8 @@ describe("AgentSession handoff adoption integration", () => {
       activeOperation.complete();
       clearActiveEmbeddedRun(sessionId, queueHandle, queueKey);
       clearFollowupQueue(queueKey);
-      clearFollowupDrainCallback(queueKey);
       embeddedRunsTesting.resetActiveEmbeddedRuns();
-      replyRunTesting.resetReplyRunRegistry();
+      replyRunTesting.resetSessionControllerForTest();
       resetRecentQueuedMessageIdDedupe();
       session.agent.clearAllQueues();
     }

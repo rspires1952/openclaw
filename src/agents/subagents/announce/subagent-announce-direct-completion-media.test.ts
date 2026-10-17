@@ -36,12 +36,6 @@ async function deliver(params: {
   onDeliveryError?: Parameters<typeof deliverSubagentAnnouncement>[0]["onDeliveryError"];
 }) {
   const sendMessage = params.sendMessage ?? vi.fn<SendMessage>(async () => sent);
-  const queue = vi.fn((sessionId: string) => ({
-    queued: false as const,
-    reason: "no_active_run" as const,
-    gatewayHealth: "live" as const,
-    sessionId,
-  }));
   testing.setDepsForTest({
     callGateway: vi.fn(async () => {
       if (params.event?.status === "error") {
@@ -50,7 +44,6 @@ async function deliver(params: {
       return { result: { payloads: params.payloads ?? [] } };
     }),
     getRequesterSessionActivity: () => ({ sessionId: "requester-session", isActive: true }),
-    queueEmbeddedAgentMessageWithOutcome: queue,
     getRuntimeConfig: () => ({}),
     sendMessage,
   });
@@ -79,7 +72,6 @@ async function deliver(params: {
     onDeliveryResult: params.onDeliveryResult,
     onDeliveryError: params.onDeliveryError,
   });
-  expect(queue).toHaveBeenCalled();
   return { result, sendMessage: vi.mocked(sendMessage) };
 }
 

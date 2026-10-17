@@ -245,6 +245,7 @@ describe("main session recovery store", () => {
       );
       await reserve();
       const restorePrevious = await admitAgentRestartRecovery({
+        activeRunAbort: { controller: new AbortController() },
         lifecycleGeneration,
         runId: "recovery-1",
         sessionId: "session-1",
@@ -278,6 +279,7 @@ describe("main session recovery store", () => {
         restartRecoveryDeliveryRunId: successorRunId,
       }));
       const restoreSuccessor = await admitAgentRestartRecovery({
+        activeRunAbort: { controller: new AbortController() },
         lifecycleGeneration,
         runId: successorRunId,
         sessionId: "session-1",
@@ -311,6 +313,7 @@ describe("main session recovery store", () => {
     );
     await reserve();
     const restore = await admitAgentRestartRecovery({
+      activeRunAbort: { controller: new AbortController() },
       lifecycleGeneration,
       runId: "recovery-1",
       sessionId: "session-1",

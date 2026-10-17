@@ -19,7 +19,11 @@ import { sqliteWorkerOwnerProbe as probe } from "../infra/sqlite-worker-owner-pr
 import { readLoggingConfig } from "../logging/config.js";
 import { applyLoggingConfig } from "../logging/logger.js";
 import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
-import { getSessionWorkAdmissionRelease } from "../sessions/session-lifecycle-admission.js";
+import { captureSessionControllerSettlement } from "../sessions/session-controller.lifecycle.js";
+import {
+  getRpcSource,
+  requestRpcSourceCancellation,
+} from "../sessions/session-controller.rpc-sources.js";
 import { onSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { runOutsideStoreWriterContext } from "../shared/store-writer-queue.js";
 import { invalidateGatewayDeviceRevocation } from "./device-revocation.js";
@@ -274,12 +278,11 @@ test("persists and dispatches concurrent Gateway inputs while participant writes
     expect(dispatch.start).toHaveBeenCalledTimes(inputs.length);
   } finally {
     await Promise.all(competingWrites);
-    const released = getSessionWorkAdmissionRelease({
+    const released = captureSessionControllerSettlement({
       scope: storePath,
       identities: inputs.map((input) => input.key),
     });
     for (const [turn] of dispatch.start.mock.calls) {
-      turn.replyAdmissionTicket?.release();
       turn.admission.cleanupAdmittedRun();
       clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
     }
@@ -359,9 +362,9 @@ test.for([
         }
         const options = expectDefined(initial, "initial request");
         const runId = String(options.params.idempotencyKey);
-        const run = expectDefined(options.context.chatAbortControllers.get(runId), "admitted run");
-        run.abortStopReason = "restart";
-        run.controller.abort(failure);
+        const run = expectDefined(getRpcSource(runId), "admitted run");
+        run.adapter.abortStopReason = "restart";
+        requestRpcSourceCancellation(run, failure);
       };
     }
     dispatch.start.mockClear();
@@ -383,7 +386,7 @@ test.for([
             JSON.stringify({ type: "req", id: requestId, method: "sessions.create", params }),
           );
           await withinTest(initialSettled.promise, signal);
-          await getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
+          await captureSessionControllerSettlement({ scope: storePath, identities: [key] });
           const closed = once(ws, "close");
           ws.close();
           await withinTest(closed, signal);
@@ -452,9 +455,8 @@ test.for([
       turnBoundary.afterPrepare = undefined;
       refuse.mockRestore();
       intercept.mockRestore();
-      const released = getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
+      const released = captureSessionControllerSettlement({ scope: storePath, identities: [key] });
       for (const [turn] of dispatch.start.mock.calls) {
-        turn.replyAdmissionTicket?.release();
         turn.admission.cleanupAdmittedRun();
         clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
       }
@@ -498,9 +500,9 @@ test.for(["lost-worker-response", "restart-before-ack"] as const)(
         return;
       }
       hit();
-      const run = expectDefined(options.context.chatAbortControllers.get(runId), "committed run");
-      run.abortStopReason = "restart";
-      run.controller.abort();
+      const run = expectDefined(getRpcSource(runId), "committed run");
+      run.adapter.abortStopReason = "restart";
+      requestRpcSourceCancellation(run);
     });
     if (fault === "lost-worker-response") {
       turnBoundary.afterCommit = () => {
@@ -538,9 +540,8 @@ test.for(["lost-worker-response", "restart-before-ack"] as const)(
       });
       const scope = { ...target, sessionId: before.sessionId };
       expect(await listSessionPendingInputs(scope)).toEqual({ items: [], total: 0 });
-      const released = getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
+      const released = captureSessionControllerSettlement({ scope: storePath, identities: [key] });
       for (const [turn] of dispatch.start.mock.calls) {
-        turn.replyAdmissionTicket?.release();
         turn.admission.cleanupAdmittedRun();
         clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
       }
@@ -565,12 +566,11 @@ test.for(["lost-worker-response", "restart-before-ack"] as const)(
         expect(retried.ok, JSON.stringify(retried)).toBe(true);
         expect(retried.payload?.status).toBe("started");
         expect(dispatch.start).toHaveBeenCalledOnce();
-        const retriedRelease = getSessionWorkAdmissionRelease({
+        const retriedRelease = captureSessionControllerSettlement({
           scope: storePath,
           identities: [key],
         });
         const [turn] = dispatch.start.mock.calls[0]!;
-        turn.replyAdmissionTicket?.release();
         turn.admission.cleanupAdmittedRun();
         clearAgentRunContext(runId, turn.admission.lifecycleGeneration);
         await retriedRelease;
@@ -602,7 +602,6 @@ test.for(["lost-worker-response", "restart-before-ack"] as const)(
       stop();
       intercept.mockRestore();
       for (const [turn] of dispatch.start.mock.calls) {
-        turn.replyAdmissionTicket?.release();
         turn.admission.cleanupAdmittedRun();
         clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
       }
@@ -636,7 +635,7 @@ test("retries idle chat input after its atomic commit is refused", async () => {
     expect(created.ok, JSON.stringify(created)).toBe(true);
     const sent = await rpcReq(ws, "chat.send", { sessionKey: key, message, idempotencyKey: runId });
     expect(sent.ok).toBe(false);
-    await getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
+    await captureSessionControllerSettlement({ scope: storePath, identities: [key] });
     expect(refused).toHaveBeenCalledOnce();
     expect(dispatch.start).not.toHaveBeenCalled();
     const entry = expectDefined(loadSessionEntry(target), "idle session");
@@ -672,9 +671,8 @@ test("retries idle chat input after its atomic commit is refused", async () => {
     expect(dispatch.start).toHaveBeenCalledOnce();
   } finally {
     refuse.mockRestore();
-    const released = getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
+    const released = captureSessionControllerSettlement({ scope: storePath, identities: [key] });
     for (const [turn] of dispatch.start.mock.calls) {
-      turn.replyAdmissionTicket?.release();
       turn.admission.cleanupAdmittedRun();
       clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
     }
@@ -721,9 +719,8 @@ test("dispatches the original bytes of a committed initial input", async () => {
     expect(JSON.stringify(history.payload?.messages)).toContain("initial-secret");
     expect(JSON.stringify(history.payload?.messages)).toContain(JSON.stringify(persisted.content));
   } finally {
-    const released = getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
+    const released = captureSessionControllerSettlement({ scope: storePath, identities: [key] });
     for (const [turn] of dispatch.start.mock.calls) {
-      turn.replyAdmissionTicket?.release();
       turn.admission.cleanupAdmittedRun();
       clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
     }
@@ -824,9 +821,8 @@ test.for([
         expect(JSON.stringify(pending.payload?.pendingInputs.items)).toContain(followup);
       }
       // Drop process-only dispatches; do not run their terminal/error persistence.
-      const released = getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
+      const released = captureSessionControllerSettlement({ scope: storePath, identities: [key] });
       for (const [turn] of dispatch.start.mock.calls) {
-        turn.replyAdmissionTicket?.release();
         turn.admission.cleanupAdmittedRun();
         clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
       }
@@ -869,7 +865,6 @@ test.for([
     } finally {
       chatDiagnostics.current = undefined;
       for (const [turn] of dispatch.start.mock.calls) {
-        turn.replyAdmissionTicket?.release();
         turn.admission.cleanupAdmittedRun();
         clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
       }

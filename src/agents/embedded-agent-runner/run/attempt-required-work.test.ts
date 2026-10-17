@@ -1,5 +1,6 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { RunExit, SpawnInput } from "../../../process/supervisor/types.js";
+import { createReplyOperation, type ReplyOperation } from "../../../sessions/session-controller.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import { resetProcessRegistryForTests } from "../../bash-process-registry.test-support.js";
 import { createExecTool } from "../../bash-tools.exec-run.js";
@@ -47,11 +48,20 @@ vi.mock("../../bash-tools.exec-host-gateway.js", () => ({
 }));
 
 registerAgentSessionLoopTestLifecycle();
+let replyOperation: ReplyOperation;
+beforeEach(() => {
+  replyOperation = createReplyOperation({
+    sessionId: "session-output-schema",
+    sessionKey: "agent:main:main",
+    resetTriggered: false,
+  });
+});
 afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   await resetCodeModeTestState();
   resetProcessRegistryForTests();
+  replyOperation.complete();
 });
 
 it.each(["direct", "cell", "nested", "detached"] as const)(
@@ -85,7 +95,7 @@ it.each(["direct", "cell", "nested", "detached"] as const)(
       applyCodeModeCatalog({ ...h.ctx, tools: [...h.tools, shell] });
     }
     const { session } = await createTestSession({ customTools: nested ? h.tools : [shell] });
-    const prepared = prepareCatalogExecutor({ activeSession: session });
+    const prepared = prepareCatalogExecutor({ activeSession: session, replyOperation });
     const finalRequested = createDeferredCore();
     let requests = 0;
     let finished = false;

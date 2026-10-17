@@ -9,7 +9,6 @@ import {
   type SessionsRewindParams,
 } from "../../../packages/gateway-protocol/src/index.js";
 import type { ErrorCode } from "../../../packages/gateway-protocol/src/schema/error-codes.js";
-import { clearSessionLifecycleQueues } from "../../auto-reply/reply/queue/cleanup.js";
 import type {
   SessionBranchSwitchMutationResult,
   SessionMessageCutMutationResult,
@@ -23,12 +22,18 @@ import {
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { isIncognitoSessionKey } from "../../routing/session-key.js";
 import { ModelSelectionLockedError } from "../../sessions/model-overrides.js";
+import {
+  captureSessionTarget,
+  isCompetingSessionControllerWorkActive,
+  runSessionMutation,
+} from "../../sessions/session-controller.lifecycle.js";
+import {
+  cancelCapturedSessionControllerSource,
+  captureSessionControllerStop,
+  type SessionControllerStopCapture,
+} from "../../sessions/session-controller.stop.js";
 import { recordSessionCreated } from "../../sessions/session-created.js";
 import { withSessionInitializationSource } from "../../sessions/session-initialization.js";
-import {
-  isCompetingSessionWorkAdmissionActive,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
 import {
   captureSessionUpstreamLinkReadSource,
   prepareSessionUpstreamPresence,
@@ -254,28 +259,46 @@ async function mutatePreparedSessionAtMessage({
     signal: options.signal,
   });
   let blockedByActiveRun = false;
-  await runExclusiveSessionLifecycleMutation(action, {
-    scope: initial.storePath,
-    identities: lifecycleIdentities,
+  const controllerTarget = captureSessionTarget({
+    storeScope: initial.storePath,
+    sessionKey: initial.canonicalKey ?? sessionKey,
+    aliases: lifecycleIdentities,
+    incarnation: initialSessionId,
+    agentId: requestedAgentId,
+  });
+  let queuedWork: SessionControllerStopCapture | undefined;
+  await runSessionMutation({
+    target: controllerTarget,
     prepare: async () => {
       const current = await loadCurrent();
       // A message cut cannot disturb its source or invalidate queued work on failure.
       // Reject live work before transcript mutation instead of interrupting it.
       blockedByActiveRun =
         !terminalSettled ||
-        isCompetingSessionWorkAdmissionActive(initial.storePath, lifecycleIdentities) ||
+        isCompetingSessionControllerWorkActive(
+          initial.storePath,
+          lifecycleIdentities,
+          controllerTarget.agentId,
+        ) ||
         (getWorkerInferenceSessionControl(context.workerEnvironmentService)?.hasSession(
           initialSessionId,
         ) ??
           false) ||
         resolveVisibleActiveSessionRunState({
-          context,
+          storePath: current.storePath,
+          resolveGatewayContext: context.resolveGatewayContext,
           requestedKey: sessionKey,
           canonicalKey: current.canonicalKey,
           sessionId: initialSessionId,
           agentId: requestedAgentId,
           defaultAgentId: tryResolveSessionCompatibilityOwnerAgentId(cfg, sessionKey),
         }).active;
+      queuedWork = captureSessionControllerStop({
+        targets: [controllerTarget],
+        includeActive: false,
+        includeQueued: true,
+        resolveGatewayContext: context.resolveGatewayContext,
+      });
     },
     run: async () => {
       // A queued sharing mutation can revoke participation without rotating the source identity.
@@ -619,14 +642,10 @@ async function mutatePreparedSessionAtMessage({
                 )),
               ];
         if (action !== "fork") {
-          clearSessionLifecycleQueues({
-            keys: lifecycleIdentities,
-            agentId: current.agentId,
-            sessionKey: current.canonicalKey,
-            sessionId: initialSessionId,
-            // History is committed; settling its original queues must finish after revocation.
-            assertCurrent: () => {},
-          });
+          // The committed cut retires captured inputs while the mutation still fences claims.
+          if (queuedWork) {
+            cancelCapturedSessionControllerSource(queuedWork);
+          }
         } else {
           await recordSessionCreated(cfg, {
             sessionKey: committedResult.key,

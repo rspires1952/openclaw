@@ -6,12 +6,12 @@ import {
 } from "../process/gateway-work-admission.js";
 import {
   SESSION_EVENT_IDLE_RETRY_MS,
-  deferSessionEventWakePoll,
   getSessionEventWakeAbortSignal,
   isSessionEventWakePollDeferred,
   markSessionEventWakeWorkStarted,
   requestSessionEventWake,
   requestSessionEventWakeAndWait,
+  retireRefusedSessionEventWakePoll,
   setSessionEventWakeHandler as setRuntimeSessionEventWakeHandler,
 } from "./session-event-wake.js";
 
@@ -30,6 +30,12 @@ describe("session event wake disposition and preemption", () => {
     const source = reason === "manual" ? "manual" : "exec-event";
     const intent = reason === "manual" ? "manual" : "event";
     return { source, intent, reason, ...opts } satisfies WakeRequest;
+  }
+
+  // Heartbeat dispatch retires a refused poll; the scheduler then reads the disposition.
+  function retireRefusedPoll(): boolean {
+    retireRefusedSessionEventWakePoll();
+    return isSessionEventWakePollDeferred();
   }
 
   function nativePoll(overrides: Partial<WakeRequest> = {}): WakeRequest {
@@ -66,7 +72,7 @@ describe("session event wake disposition and preemption", () => {
 
   it("keeps private dispositions and started work separate across concurrent targets", async () => {
     expect(getSessionEventWakeAbortSignal()).toBeUndefined();
-    expect(deferSessionEventWakePoll()).toBe(false);
+    expect(retireRefusedPoll()).toBe(false);
     expect(isSessionEventWakePollDeferred()).toBe(false);
     expect(() => markSessionEventWakeWorkStarted()).not.toThrow();
     const bothStarted = createDeferred();
@@ -86,14 +92,13 @@ describe("session event wake disposition and preemption", () => {
       await bothStarted.promise;
       expect(getSessionEventWakeAbortSignal()).toBe(signal);
       if (!admitted) {
-        expect(deferSessionEventWakePoll()).toBe(true);
+        expect(retireRefusedPoll()).toBe(true);
         expect(isSessionEventWakePollDeferred()).toBe(true);
         pollDeferred.resolve();
         return skipped;
       }
       await pollDeferred.promise;
       expect(isSessionEventWakePollDeferred()).toBe(false);
-      expect(deferSessionEventWakePoll()).toBe(false);
       expect(getSessionEventWakeAbortSignal()).toBe(signal);
       return terminalFailure;
     });
@@ -134,15 +139,11 @@ describe("session event wake disposition and preemption", () => {
       const handler = vi.fn<WakeHandler>(async () => {
         dispositions.push([
           isSessionEventWakePollDeferred(),
-          deferSessionEventWakePoll(),
+          retireRefusedPoll(),
           isSessionEventWakePollDeferred(),
         ]);
         return dispositions.length === 1
-          ? {
-              status: "skipped",
-              reason:
-                retryMs === SESSION_EVENT_IDLE_RETRY_MS ? "requests-in-flight" : "cron-in-progress",
-            }
+          ? { status: "skipped", reason: "requests-in-flight", retryAtMs: Date.now() + retryMs }
           : terminalFailure;
       });
       setSessionEventWakeHandler(handler);
@@ -207,7 +208,7 @@ describe("session event wake disposition and preemption", () => {
       const replacement = vi.fn<WakeHandler>(async () => {
         dispositions.push([
           isSessionEventWakePollDeferred(),
-          deferSessionEventWakePoll(),
+          retireRefusedPoll(),
           isSessionEventWakePollDeferred(),
         ]);
         return dispositions.length === 1
@@ -246,9 +247,9 @@ describe("session event wake disposition and preemption", () => {
           await finishFirst.promise;
           return { status: "skipped", reason: "preempted" };
         }
-        dispositions.push(deferSessionEventWakePoll());
+        dispositions.push(retireRefusedPoll());
         return dispositions.length === 1
-          ? { status: "skipped", reason: "cron-in-progress" }
+          ? { status: "skipped", reason: "requests-in-flight", retryAtMs: Date.now() + 1_000 }
           : terminalFailure;
       });
       setSessionEventWakeHandler(handler);
@@ -290,32 +291,37 @@ describe("session event wake disposition and preemption", () => {
     },
   );
 
-  it("revokes a tentative poll disposition when work starts in the same attempt", async () => {
-    const dispositions: boolean[] = [];
+  it.each([
+    { name: "native poll", request: {}, startedBefore: false, retired: true },
+    { name: "native poll retry", request: {}, startedBefore: true, retired: false },
+    {
+      name: "task turn",
+      request: { intent: "task", tasks: [task] },
+      startedBefore: false,
+      retired: false,
+    },
+  ] as const)("retires a refused $name only before earlier work: $retired", async (params) => {
+    const skipped = { status: "skipped" as const, reason: "requests-in-flight" };
     const handler = vi.fn<WakeHandler>(async () => {
-      if (handler.mock.calls.length === 1) {
-        dispositions.push(deferSessionEventWakePoll());
-        markSessionEventWakeWorkStarted();
-        dispositions.push(isSessionEventWakePollDeferred(), deferSessionEventWakePoll());
-        return { status: "skipped", reason: "active-run" };
+      markSessionEventWakeWorkStarted();
+      // The refused attempt follows one admitted attempt when earlier work started.
+      const refusal = handler.mock.calls.length - (params.startedBefore ? 1 : 0);
+      if (refusal === 0) {
+        return { status: "skipped", reason: "preempted" };
       }
-      dispositions.push(deferSessionEventWakePoll());
-      return terminalFailure;
+      if (refusal > 1) {
+        return terminalFailure;
+      }
+      retireRefusedSessionEventWakePoll();
+      return skipped;
     });
     setSessionEventWakeHandler(handler);
-    const settled = vi.fn();
-    const result = requestSessionEventWakeAndWait(nativePoll());
-    void result.then(settled);
+    const result = requestSessionEventWakeAndWait(nativePoll(params.request));
 
-    await vi.advanceTimersByTimeAsync(1);
-    expect(dispositions).toEqual([true, false, false]);
-    expect(settled).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(SESSION_EVENT_IDLE_RETRY_MS);
-    expect(handler).toHaveBeenCalledTimes(2);
-    expect(dispositions).toEqual([true, false, false, false]);
-    expect(settled).toHaveBeenCalledExactlyOnceWith(terminalFailure);
-    expect(await result).toBe(terminalFailure);
+    await vi.advanceTimersByTimeAsync(2 * SESSION_EVENT_IDLE_RETRY_MS + 1);
+    const attempts = (params.startedBefore ? 1 : 0) + (params.retired ? 1 : 2);
+    expect(handler).toHaveBeenCalledTimes(attempts);
+    expect(await result).toBe(params.retired ? skipped : terminalFailure);
   });
 
   it("does not carry a tentative poll disposition across a thrown attempt", async () => {
@@ -323,11 +329,11 @@ describe("session event wake disposition and preemption", () => {
     const handler = vi.fn<WakeHandler>(async (): ReturnType<WakeHandler> => {
       dispositions.push(isSessionEventWakePollDeferred());
       if (handler.mock.calls.length === 1) {
-        dispositions.push(deferSessionEventWakePoll());
+        dispositions.push(retireRefusedPoll());
         throw new Error("test-attempt-interrupted");
       }
       return handler.mock.calls.length === 2
-        ? { status: "skipped", reason: "cron-in-progress" }
+        ? { status: "skipped", reason: "requests-in-flight", retryAtMs: Date.now() + 1_000 }
         : terminalFailure;
     });
     setSessionEventWakeHandler(handler);
@@ -354,7 +360,7 @@ describe("session event wake disposition and preemption", () => {
     const dispositions: boolean[] = [];
     const handler = vi.fn<WakeHandler>(async () => {
       await finish.promise;
-      dispositions.push(deferSessionEventWakePoll());
+      dispositions.push(retireRefusedPoll());
       return skipped;
     });
     setSessionEventWakeHandler(handler);

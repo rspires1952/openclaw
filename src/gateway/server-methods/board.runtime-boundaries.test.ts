@@ -233,25 +233,33 @@ describe("board gateway runtime boundaries", () => {
           responded = true;
           return response;
         });
-      await started.promise;
-      expect(responded).toBe(false);
-      expect(harness.broadcast).not.toHaveBeenCalled();
-      if (outcome === "retired") {
-        harness.context.resolveGatewayContext = () => undefined;
-      }
-      release.resolve();
-      const response = await pending;
-      const snapshot = await harness.store.getSnapshot({ sessionKey: "session", agentId: "main" });
-      expect(response.mock.calls[0]?.[0]).toBe(outcome === "commit");
-      expect(snapshot.tabs).toHaveLength(outcome === "commit" ? 1 : 0);
-      if (outcome === "commit") {
-        expect(harness.broadcast).toHaveBeenCalledWith(
-          "board.changed",
-          { sessionKey: "agent:main:session", revision: snapshot.revision },
-          { sessionKeys: ["agent:main:session"], agentId: "main" },
-        );
-      } else {
+      try {
+        await started.promise;
+        expect(responded).toBe(false);
         expect(harness.broadcast).not.toHaveBeenCalled();
+        if (outcome === "retired") {
+          harness.context.resolveGatewayContext = () => undefined;
+        }
+        release.resolve();
+        const response = await pending;
+        const snapshot = await harness.store.getSnapshot({
+          sessionKey: "session",
+          agentId: "main",
+        });
+        expect(response.mock.calls[0]?.[0]).toBe(outcome === "commit");
+        expect(snapshot.tabs).toHaveLength(outcome === "commit" ? 1 : 0);
+        if (outcome === "commit") {
+          expect(harness.broadcast).toHaveBeenCalledWith(
+            "board.changed",
+            { sessionKey: "agent:main:session", revision: snapshot.revision },
+            { sessionKeys: ["agent:main:session"], agentId: "main" },
+          );
+        } else {
+          expect(harness.broadcast).not.toHaveBeenCalled();
+        }
+      } finally {
+        release.resolve();
+        await Promise.allSettled([pending]);
       }
     },
   );
@@ -274,13 +282,18 @@ describe("board gateway runtime boundaries", () => {
       responded = true;
       return response;
     });
-    await started.promise;
-    expect(responded).toBe(false);
-    harness.context.resolveGatewayContext = () => undefined;
-    release.resolve();
-    const response = await pending;
-    expect(response.mock.calls[0]?.[0]).toBe(false);
-    expect(response.mock.calls[0]?.[2]).toMatchObject({ code: "UNAVAILABLE" });
+    try {
+      await started.promise;
+      expect(responded).toBe(false);
+      harness.context.resolveGatewayContext = () => undefined;
+      release.resolve();
+      const response = await pending;
+      expect(response.mock.calls[0]?.[0]).toBe(false);
+      expect(response.mock.calls[0]?.[2]).toMatchObject({ code: "UNAVAILABLE" });
+    } finally {
+      release.resolve();
+      await Promise.allSettled([pending]);
+    }
   });
 
   it("fences awaited board mutation through Gateway dispatch when its root retires", async () => {
@@ -400,6 +413,7 @@ describe("board gateway runtime boundaries", () => {
       onHelloOk: () => connected.resolve(),
       onConnectError: (error) => connected.reject(error),
     });
+    let requestOutcome: Promise<{ error: unknown }> | undefined;
     try {
       client.start();
       await connected.promise;
@@ -412,7 +426,7 @@ describe("board gateway runtime boundaries", () => {
         },
         { timeoutMs: null },
       );
-      const requestOutcome = request.then(
+      requestOutcome = request.then(
         () => ({ error: undefined }),
         (error: unknown) => ({ error }),
       );
@@ -439,6 +453,8 @@ describe("board gateway runtime boundaries", () => {
       ).toMatchObject([{ name: "live" }]);
       expect(events).toContain("board.changed");
     } finally {
+      releaseDocument.resolve({ html: "<p>canvas</p>", cspSandbox: "scripts" });
+      await Promise.allSettled(requestOutcome ? [requestOutcome] : []);
       client.stop();
       gatewayClients.clear();
       for (const socket of server.clients) {

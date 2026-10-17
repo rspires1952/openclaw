@@ -140,6 +140,7 @@ export const databaseWorkerCoreTestFiles = [
   "src/plugin-sdk/session-store-runtime.writer-claim.test.ts",
   "src/talk/client-voice-session.digest-retry.test.ts",
   "src/talk/voice-consult-transcript-race.test.ts",
+  "src/infra/heartbeat-runner.exact-session-busy.test.ts",
   "src/infra/heartbeat-runner.wake-owner-resolution.test.ts",
   "src/infra/heartbeat-exec-session-event.test.ts",
   "src/infra/heartbeat-runner.restart-continuation.test.ts",
@@ -214,6 +215,7 @@ export const databaseWorkerCoreTestFiles = [
   "src/state/openclaw-agent-pending-inputs-schema.test.ts",
   "src/agents/bash-tools.visible-subagent-notify.test.ts",
   "src/agents/agent-command.admission-failure.test.ts",
+  "src/agents/agent-command.cancellation.test.ts",
   "src/agents/agent-command.compaction-rotation.test.ts",
   "src/agents/agent-command.compaction-custody.test.ts",
   "src/agents/agent-command.harness-compaction-custody.test.ts",
@@ -233,6 +235,7 @@ export const databaseWorkerCoreTestFiles = [
   "src/agents/embedded-agent-runner/run.recovery-deadline.test.ts",
   "src/agents/embedded-agent-runner/run.session-permissions.test.ts",
   "src/agents/embedded-agent-runner/run.session-prompt-state.test.ts",
+  "src/agents/embedded-agent-runner/run.terminal-timeout-delivery.integration.test.ts",
   "src/agents/embedded-agent-runner/run/attempt-execution-phase.test.ts",
   "src/agents/embedded-agent-runner/run/attempt-native-provider-authority.test.ts",
   "src/agents/embedded-agent-runner/run/attempt-native-video-transcript.test.ts",
@@ -589,6 +592,8 @@ export const databaseWorkerCoreTestFiles = [
   "src/auto-reply/reply/agent-runner-required-maintenance.pending-input.test.ts",
   "src/auto-reply/reply/agent-runner-compaction-fallback.test.ts",
   "src/auto-reply/reply/abort.acp-boundary.test.ts",
+  "src/auto-reply/reply/commands-acp.controller.test.ts",
+  "src/gateway/session-reset-acp.controller.test.ts",
   "src/auto-reply/reply/abort.test.ts",
   "src/auto-reply/reply/dispatch-from-config.pending-restart.test.ts",
   "src/auto-reply/reply/session.acp-reset-routing.test.ts",
@@ -1300,6 +1305,7 @@ const databaseWorkerCoreTestFileSet = new Set(databaseWorkerCoreTestFiles);
 
 // Preserve watch admission for consumers previously inferred into fast lanes.
 export const databaseWorkerCoreFormerFastKinds = new Map([
+  ["src/infra/heartbeat-runner.exact-session-busy.test.ts", "unitFast"],
   ["src/commands/doctor/shared/xai-auto-retirement.test.ts", "unitFast"],
   ["src/agents/auth-profiles/session-override.model-endpoint.test.ts", "unitFast"],
   ["src/agents/harness/execution-environment.worker.test.ts", "unitFastIsolated"],

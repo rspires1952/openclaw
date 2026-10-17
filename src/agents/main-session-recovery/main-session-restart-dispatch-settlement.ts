@@ -1,11 +1,79 @@
 import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { InternalSessionEntry as SessionEntry } from "../../config/sessions.js";
 import { hasRestartRecoveryTerminalRun } from "../../config/sessions/restart-recovery-state.js";
 import { applySessionEntryReplacements } from "../../config/sessions/session-accessor.js";
 import { buildMainSessionRecoverySettlementPatch } from "./main-session-recovery-clear.js";
-import type { MainSessionRecoveryReservation } from "./main-session-recovery-state.js";
-import { commitMainSessionRecovery } from "./main-session-recovery-store.js";
+import {
+  retryMainSessionRecoveryMutation,
+  scheduleMainSessionRecoveryMutation,
+} from "./main-session-recovery-lifecycle.js";
+import { scheduleMainSessionRecoveryPendingTarget } from "./main-session-recovery-owner-release.js";
+import {
+  isMainSessionRecoveryPending,
+  type MainSessionRecoveryReservation,
+} from "./main-session-recovery-state.js";
+import {
+  commitMainSessionRecovery,
+  type MainSessionRecoveryStoreTarget,
+} from "./main-session-recovery-store.js";
 import type { RestartRecoveryTerminalStatus } from "./main-session-restart-dispatch-start.js";
+import { mainSessionRecoveryLog as log } from "./main-session-restart-recovery-shared.js";
+
+export async function rollbackRestartRecoveryReservation(
+  params: MainSessionRecoveryStoreTarget & {
+    kind: "abandon_reservation" | "cancel_reservation";
+    reservation: MainSessionRecoveryReservation;
+  },
+) {
+  return await retryMainSessionRecoveryMutation(async () =>
+    commitMainSessionRecovery({
+      command: { kind: params.kind, reservation: params.reservation },
+      requireWriteSuccess: true,
+      target: params,
+    }),
+  );
+}
+
+export function scheduleRestartRecoveryReservationRollback(
+  params: Parameters<typeof rollbackRestartRecoveryReservation>[0],
+): void {
+  // Keep the exact reservation token alive after transient store outages.
+  // A Gateway restart safely retires the timer and its stale-generation slot.
+  scheduleMainSessionRecoveryMutation({
+    mutation: () => rollbackRestartRecoveryReservation(params),
+    onError: (error) => {
+      log.warn(
+        `failed delayed restart recovery reservation rollback ${params.sessionKey}: ${String(error)}`,
+      );
+    },
+    onSuccess: ({ entry, sessionKey }) => {
+      if (
+        entry?.sessionId === params.reservation.sessionId &&
+        sessionKey &&
+        isMainSessionRecoveryPending(entry, sessionKey)
+      ) {
+        scheduleMainSessionRecoveryPendingTarget({
+          agentId: params.agentId,
+          sessionId: entry.sessionId,
+          sessionKey,
+          storePath: params.storePath,
+        });
+      }
+    },
+  });
+}
+
+// The run's own post-run cleanup can release its claim before this settlement. A run
+// that never started then leaves its admitted lifecycle identity without a status.
+function isReleasedRecoveryRun(entry: SessionEntry, runId: string): boolean {
+  return (
+    entry.status === undefined &&
+    normalizeOptionalString(entry.restartRecoveryDeliveryRunId) === undefined &&
+    entry.lifecycleRunId === runId &&
+    hasRestartRecoveryTerminalRun(entry, runId)
+  );
+}
 
 async function settleRestartRecoveryDispatch(params: {
   agentId?: string;
@@ -29,10 +97,12 @@ async function settleRestartRecoveryDispatch(params: {
         .filter(
           ({ entry }) =>
             entry.sessionId === params.expectedSessionId &&
-            normalizeOptionalString(entry.restartRecoveryDeliveryRunId) ===
+            ((normalizeOptionalString(entry.restartRecoveryDeliveryRunId) ===
               params.expectedRecoveryRunId &&
-            normalizeOptionalString(entry.restartRecoveryDeliverySourceRunId) ===
-              params.expectedRecoverySourceRunId,
+              normalizeOptionalString(entry.restartRecoveryDeliverySourceRunId) ===
+                params.expectedRecoverySourceRunId) ||
+              (params.terminalStatus !== undefined &&
+                isReleasedRecoveryRun(entry, params.expectedRecoveryRunId))),
         )
         .toSorted((a, b) => (b.entry.updatedAt ?? 0) - (a.entry.updatedAt ?? 0))[0];
       if (!current) {
@@ -83,13 +153,14 @@ function isExactRestartRecoveryDispatchAdmission(params: {
   const entry = params.admission.entry;
   return (
     entry?.sessionId === params.sessionId &&
-    ((entry.abortedLastRun === false &&
-      normalizeOptionalString(entry.restartRecoveryDeliveryRunId) === params.recoveryRunId &&
-      entry.restartRecoveryRuns?.some(
-        (run) =>
-          run.runId === params.recoveryRunId &&
-          run.lifecycleGeneration === params.lifecycleGeneration,
-      ) === true) ||
+    ((params.terminalStatus !== undefined && isReleasedRecoveryRun(entry, params.recoveryRunId)) ||
+      (entry.abortedLastRun === false &&
+        normalizeOptionalString(entry.restartRecoveryDeliveryRunId) === params.recoveryRunId &&
+        entry.restartRecoveryRuns?.some(
+          (run) =>
+            run.runId === params.recoveryRunId &&
+            run.lifecycleGeneration === params.lifecycleGeneration,
+        ) === true) ||
       (hasRestartRecoveryTerminalRun(entry, params.recoveryRunId) &&
         ((params.terminalStatus === "ok" && entry.status === "done") ||
           (params.terminalStatus === "error" && entry.status === "failed") ||

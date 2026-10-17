@@ -21,7 +21,7 @@ import { drainPendingSessionDelivery } from "../infra/session-delivery-queue-rec
 import * as queueRuntime from "../infra/session-delivery-queue-runtime.js";
 import * as queue from "../infra/session-delivery-queue-storage.js";
 import { SessionDeliveryDeadLetteredError } from "../infra/session-delivery-queue.records.js";
-import { beginSessionWorkAdmission } from "../sessions/session-lifecycle-admission.js";
+import { beginSessionEffect } from "../sessions/session-controller.lifecycle.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
 import {
@@ -126,9 +126,9 @@ describe("original requester media handoff", () => {
     async (ownerTiming) => {
       await withMediaSession(
         async ({ lifecycle, handle, scope, mediaPath, queueContext, dispatch, drain }) => {
-          let owner: Awaited<ReturnType<typeof beginSessionWorkAdmission>> | undefined;
+          let owner: Awaited<ReturnType<typeof beginSessionEffect>> | undefined;
           const acquire = () =>
-            beginSessionWorkAdmission({
+            beginSessionEffect({
               scope: scope.storePath,
               identities: [scope.sessionKey, "original-requester"],
               assertAllowed: () => {},
@@ -426,7 +426,7 @@ describe("queued media completion past the handoff deadline", () => {
               },
             });
           }
-          const originalOwner = await beginSessionWorkAdmission({
+          const originalOwner = await beginSessionEffect({
             scope: scope.storePath,
             identities: [scope.sessionKey, "original-requester"],
             assertAllowed: () => {},

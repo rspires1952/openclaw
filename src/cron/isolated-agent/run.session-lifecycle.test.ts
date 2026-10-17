@@ -7,7 +7,7 @@ import type { RunCliAgentParams } from "../../agents/cli-runner/types.js";
 import { createAttemptNestedToolActivityState } from "../../agents/embedded-agent-runner/run/attempt-nested-tool-activity.js";
 import { prepareEmbeddedAttemptStream } from "../../agents/embedded-agent-runner/run/attempt-stream-prepare.js";
 import type { RunEmbeddedAgentParams } from "../../agents/embedded-agent-runner/run/params.js";
-import { clearActiveEmbeddedRun } from "../../agents/embedded-agent-runner/runs.js";
+import { clearTestEmbeddedRun as clearActiveEmbeddedRun } from "../../agents/embedded-agent-runner/runs.test-support.js";
 import { createStubSessionHarness } from "../../agents/embedded-agent-subscribe.e2e-harness.js";
 import { FailoverError } from "../../agents/failover-error.js";
 import { GENERIC_EXTERNAL_RUN_FAILURE_TEXT } from "../../agents/failover/user-copy.js";
@@ -36,10 +36,11 @@ import { createDiagnosticEmbeddedRunOwner } from "../../logging/diagnostic-run-a
 import * as diagnostic from "../../logging/diagnostic.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import {
-  interruptSessionWorkAdmissions,
-  isSessionWorkAdmissionActive,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
+  getCurrentSessionControllerOwner,
+  interruptSessionControllerEffects,
+  isSessionControllerWorkActive,
+  runSessionMutation,
+} from "../../sessions/session-controller.lifecycle.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.types.js";
 import { useSessionStoreTempDirs } from "../../test-utils/session-state-cleanup.js";
 import { makeIsolatedAgentJobFixture, makeIsolatedAgentParamsFixture } from "./job-fixtures.js";
@@ -146,6 +147,7 @@ describe("runCronIsolatedAgentTurn session lifecycle", () => {
     const result = await runCronIsolatedAgentTurn(
       makeIsolatedAgentParamsFixture({
         agentId: "main",
+        cfg: { session: { store: storePath } },
         sessionKey: `cron:${jobId}`,
         job: makeIsolatedAgentJobFixture({
           id: jobId,
@@ -285,6 +287,7 @@ describe("runCronIsolatedAgentTurn session lifecycle", () => {
       const result = await runCronIsolatedAgentTurn(
         makeIsolatedAgentParamsFixture({
           agentId: "main",
+          cfg: { session: { store: target.storePath } },
           // The scheduler's cron key enables the hidden exact-run continuation.
           sessionKey: "cron:binding-settlement",
           job: makeIsolatedAgentJobFixture({
@@ -353,7 +356,7 @@ describe("runCronIsolatedAgentTurn session lifecycle", () => {
       }),
     );
     await preflightStarted.promise;
-    const sessionIsProtectedDuringPreflight = isSessionWorkAdmissionActive(inMemoryStorePath, [
+    const sessionIsProtectedDuringPreflight = isSessionControllerWorkActive(inMemoryStorePath, [
       sessionKey,
       "previous-session",
       "isolated-session",
@@ -401,10 +404,10 @@ describe("runCronIsolatedAgentTurn session lifecycle", () => {
     const run = runCronIsolatedAgentTurn(makePersistentCronParams(sessionKey));
     await runnerStarted.promise;
     let mutationCommitted = false;
-    const mutation = runExclusiveSessionLifecycleMutation("patch", {
+    const mutation = runSessionMutation({
       ...admissionScope,
       prepare: async () => {
-        await interruptSessionWorkAdmissions(admissionScope);
+        await interruptSessionControllerEffects(admissionScope);
       },
       run: async () => {
         mutationCommitted = true;
@@ -443,7 +446,7 @@ describe("runCronIsolatedAgentTurn session lifecycle", () => {
       await expect(runCronIsolatedAgentTurn(makePersistentCronParams(sessionKey))).rejects.toThrow(
         "simulated final lifecycle failure",
       );
-      expect(isSessionWorkAdmissionActive(inMemoryStorePath, [sessionKey, sessionId])).toBe(false);
+      expect(isSessionControllerWorkActive(inMemoryStorePath, [sessionKey, sessionId])).toBe(false);
     } finally {
       logSessionStateChangeSpy.mockRestore();
     }
@@ -504,7 +507,7 @@ describe("runCronIsolatedAgentTurn session lifecycle", () => {
       );
       let admissionActiveDuringDelete = true;
       callGatewayMock.mockImplementationOnce(async () => {
-        admissionActiveDuringDelete = isSessionWorkAdmissionActive(storePath, [
+        admissionActiveDuringDelete = isSessionControllerWorkActive(storePath, [
           sessionKey,
           sessionId,
         ]);
@@ -527,7 +530,7 @@ describe("runCronIsolatedAgentTurn session lifecycle", () => {
       if (!failed) {
         expect(admissionActiveDuringDelete).toBe(false);
       }
-      expect(isSessionWorkAdmissionActive(storePath, [sessionKey, sessionId])).toBe(false);
+      expect(isSessionControllerWorkActive(storePath, [sessionKey, sessionId])).toBe(false);
     },
   );
 
@@ -725,6 +728,8 @@ describe("runCronIsolatedAgentTurn terminal lifecycle", () => {
             trigger: runParams.trigger,
             abortSignal: runParams.abortSignal,
             deferTerminalLifecycle: runParams.deferTerminalLifecycle,
+            // The real native runner borrows the admitted cron turn before registration.
+            replyOperation: getCurrentSessionControllerOwner(),
             onAgentEvent: runParams.onAgentEvent,
             admittedRunContext,
             provider,

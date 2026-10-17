@@ -7,14 +7,11 @@ import {
 } from "../../../infra/exec-request-context.js";
 import { listRegisteredPluginAgentPromptGuidance } from "../../../plugins/command-registry-state.js";
 import { getCanonicalGatewayContextResolver } from "../../../plugins/runtime/gateway-request-scope.js";
+import { captureSessionTarget } from "../../../sessions/session-controller.lifecycle.js";
 import { hasDeliveryTargetFields } from "../../../utils/delivery-context.shared.js";
 import { runWithAgentToolSourceExecutionScope } from "../../agent-tool-source-execution-guard.js";
 import { prepareNativeDelegatedToolPolicy } from "../../delegated-tool-policy.js";
-import {
-  runSpawnPipeline,
-  summarizeSpawnError,
-  type SpawnBackendAdapter,
-} from "../../spawn-pipeline.js";
+import { runSpawnPipeline, type SpawnBackendAdapter } from "../../spawn-pipeline.js";
 import { withGatewayToolOperatorContinuation } from "../../tools/gateway-caller-context.js";
 import { cleanupMaterializedSubagentAttachments } from "../subagent-attachment-cleanup.js";
 import { activateSwarmRun } from "../swarm/swarm-scheduler.js";
@@ -58,6 +55,7 @@ import {
   recordSubagentSessionSetup,
 } from "./subagent-spawn-lifecycle.js";
 import { resolveSubagentSpawnRequest } from "./subagent-spawn-request.js";
+import { buildSubagentSpawnFailureResult } from "./subagent-spawn-result.js";
 import { createInitialSubagentSession } from "./subagent-spawn-session-patch.js";
 import { bindThreadForSubagentSpawn } from "./subagent-spawn-thread-binding.js";
 import { emitSessionLifecycleEvent, mergeDeliveryContext } from "./subagent-spawn.runtime.js";
@@ -227,6 +225,12 @@ export async function spawnSubagentDirect(
         (!params.collect && cleanupContext && cleanupContext.localEmbedded !== true))
         ? bindSubagentSpawnCleanup({
             childSessionKey,
+            target: captureSessionTarget({
+              storeScope: initialSession.storePath,
+              sessionKey: childSessionKey,
+              agentId: targetAgentId,
+              incarnation: initialSession.entry?.sessionId,
+            }),
             resolveGatewayContext: gatewayContextResolver,
             isCurrent: ownsCleanup,
             canAbortAcceptedRun: ownsAcceptedRun,
@@ -589,24 +593,11 @@ export async function spawnSubagentDirect(
       },
     });
     if (!pipelineResult.ok) {
-      const runId = pipelineResult.runId ?? childIdem;
-      const spawnStatus =
-        pipelineResult.error && typeof pipelineResult.error === "object"
-          ? (pipelineResult.error as { spawnStatus?: unknown }).spawnStatus
-          : undefined;
-      return {
-        status: spawnStatus === "forbidden" ? "forbidden" : "error",
-        error: [
-          pipelineResult.phase === "register" && spawnStatus !== "forbidden"
-            ? `Failed to register subagent run: ${summarizeSpawnError(pipelineResult.error)}`
-            : summarizeSpawnError(pipelineResult.error),
-          acceptedRunCleanupError,
-        ]
-          .filter(Boolean)
-          .join(" "),
+      return buildSubagentSpawnFailureResult(pipelineResult, {
         childSessionKey,
-        ...(pipelineResult.phase === "initialize" ? {} : { runId }),
-      };
+        fallbackRunId: childIdem,
+        acceptedRunCleanupError,
+      });
     }
     const childRunId = pipelineResult.runId;
     let collectorSessionKey: string | undefined;

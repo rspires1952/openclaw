@@ -1,6 +1,7 @@
 import type { GatewayClientCap } from "../../packages/gateway-protocol/src/client-info.js";
 import type { LiveTextProjectionText } from "./live-text-continuity.js";
 import type { GatewayClient } from "./server-methods/client-types.js";
+import type { VisibleActiveSessionRunProjector } from "./server-methods/session-active-runs.js";
 import type { SessionAncestorReferences } from "./session-ancestor-references.js";
 
 export type SessionEventProjection = {
@@ -27,13 +28,7 @@ type SessionEventProjectionContext = {
   forgetAncestors: (key?: string) => void;
   references: (client: GatewayClient) => SessionAncestorReferences;
   forgetConnectionAncestors: (client: GatewayClient) => void;
-  createRunProjector: () => (selection: {
-    requestedKey: string;
-    canonicalKey: string;
-    sessionId?: string;
-    agentId?: string;
-    defaultAgentId?: string;
-  }) => { active: boolean; runIds?: string[]; status?: "queued" };
+  createRunProjector: () => VisibleActiveSessionRunProjector;
 };
 
 export type PrepareSessionEventProjection = (

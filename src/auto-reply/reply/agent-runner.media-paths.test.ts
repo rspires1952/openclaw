@@ -1,7 +1,8 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setRuntimeConfigSnapshot } from "../../config/config.js";
+import { createReplyOperation as createRegisteredReplyOperation } from "../../sessions/session-controller.js";
 import type { TemplateContext } from "../templating.js";
 import type { AgentTurnParams } from "./agent-runner-execution.types.js";
 import {
@@ -9,10 +10,11 @@ import {
   createReplyMediaContextRuntimeMock,
   enqueueFollowupRunMock,
   makeRunReplyAgentParams,
-  parkSteerCandidateMock,
+  reserveSteerCandidateMock,
   parkedSteerConsumeMock,
   parkedSteerFallbackMock,
-  queueEmbeddedAgentMessageWithOutcomeAsyncMock,
+  backendQueueMessageMock,
+  resolveOutboundAttachmentFromUrlMock,
   runEmbeddedAgentMock,
   runReplyAgent,
   tempDirs,
@@ -21,7 +23,6 @@ import {
   cleanupAgentRunnerMediaTestState,
 } from "./agent-runner.media-paths.test-harness.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
-import { createReplyOperation as createRegisteredReplyOperation } from "./reply-run-registry.js";
 import { prepareReplyToolAuthority } from "./reply-tool-authority.js";
 
 describe("runReplyAgent media path normalization", () => {
@@ -31,14 +32,12 @@ describe("runReplyAgent media path normalization", () => {
   it.each(["device-a", "device-b"])(
     "steers active non-streaming prompts from reviewer %s in steer queue mode",
     async (approvalReviewerDeviceId) => {
-      queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(
-        async (sessionId: string) => ({
-          queued: true,
-          sessionId,
-          target: "embedded_run",
-          gatewayHealth: "live",
-        }),
-      );
+      backendQueueMessageMock.mockImplementation(async (sessionId: string) => ({
+        queued: true,
+        sessionId,
+        target: "embedded_run",
+        gatewayHealth: "live",
+      }));
       const followupRun = createMediaFollowupRun({ prompt: "generate chart" });
       followupRun.run.taskSuggestionDeliveryMode = "gateway";
       followupRun.run.approvalReviewerDeviceId = "device-a";
@@ -55,10 +54,7 @@ describe("runReplyAgent media path normalization", () => {
       await runReplyAgent(params);
 
       expect(
-        queueEmbeddedAgentMessageWithOutcomeAsyncMock.mock.calls.map(([sessionId, prompt]) => [
-          sessionId,
-          prompt,
-        ]),
+        backendQueueMessageMock.mock.calls.map(([sessionId, prompt]) => [sessionId, prompt]),
       ).toEqual([["session", "generate chart"]]);
       expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
       expect(parkedSteerConsumeMock).toHaveBeenCalledOnce();
@@ -104,14 +100,16 @@ describe("runReplyAgent media path normalization", () => {
 
       await runReplyAgent(params);
 
-      expect(queueEmbeddedAgentMessageWithOutcomeAsyncMock).not.toHaveBeenCalled();
-      expect(parkedSteerFallbackMock).toHaveBeenCalledOnce();
-      expect(parkSteerCandidateMock).toHaveBeenCalledWith(
+      expect(backendQueueMessageMock).not.toHaveBeenCalled();
+      expect(reserveSteerCandidateMock).toHaveBeenCalledExactlyOnceWith(
         params.queueKey,
         followupRun,
         params.resolvedQueue,
         expect.any(Function),
       );
+      expect(parkedSteerFallbackMock).toHaveBeenCalledOnce();
+      expect(parkedSteerConsumeMock).not.toHaveBeenCalled();
+      expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
     },
   );
 
@@ -141,12 +139,12 @@ describe("runReplyAgent media path normalization", () => {
       expect.any(Function),
       false,
     );
-    expect(parkSteerCandidateMock).not.toHaveBeenCalled();
-    expect(queueEmbeddedAgentMessageWithOutcomeAsyncMock).not.toHaveBeenCalled();
+    expect(reserveSteerCandidateMock).not.toHaveBeenCalled();
+    expect(backendQueueMessageMock).not.toHaveBeenCalled();
   });
 
   it("steers ordered current-turn images and quoted context with the active prompt", async () => {
-    queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
+    backendQueueMessageMock.mockImplementation(async (sessionId: string) => ({
       queued: true,
       sessionId,
       target: "embedded_run",
@@ -177,12 +175,9 @@ describe("runReplyAgent media path normalization", () => {
     );
 
     expect(
-      queueEmbeddedAgentMessageWithOutcomeAsyncMock.mock.calls.map(([sessionId, prompt]) => [
-        sessionId,
-        prompt,
-      ]),
+      backendQueueMessageMock.mock.calls.map(([sessionId, prompt]) => [sessionId, prompt]),
     ).toEqual([["session", "compare these"]]);
-    expect(queueEmbeddedAgentMessageWithOutcomeAsyncMock.mock.calls[0]?.[2]).toMatchObject({
+    expect(backendQueueMessageMock.mock.calls[0]?.[2]).toMatchObject({
       images,
       media: followupRun.media,
       currentInboundContext: followupRun.currentInboundContext,
@@ -193,7 +188,7 @@ describe("runReplyAgent media path normalization", () => {
   });
 
   it("defers the complete image turn when the active runtime cannot preserve images", async () => {
-    queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
+    backendQueueMessageMock.mockImplementation(async (sessionId: string) => ({
       queued: false,
       sessionId,
       reason: "image_input_unsupported",
@@ -213,7 +208,12 @@ describe("runReplyAgent media path normalization", () => {
       }),
     );
 
-    expect(parkSteerCandidateMock).toHaveBeenCalledWith(
+    expect(backendQueueMessageMock).toHaveBeenCalledExactlyOnceWith(
+      "session",
+      "inspect this",
+      expect.objectContaining({ images }),
+    );
+    expect(reserveSteerCandidateMock).toHaveBeenCalledWith(
       "main",
       followupRun,
       expect.objectContaining({ mode: "steer" }),
@@ -239,7 +239,7 @@ describe("runReplyAgent media path normalization", () => {
     expect(operation.acceptedSteeredInboundAudio).toBe(false);
     // An answer sent before this steer must not count as answering it.
     operation.markSourceReplyDelivered();
-    queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
+    backendQueueMessageMock.mockImplementation(async (sessionId: string) => ({
       queued: true,
       sessionId,
       target: "embedded_run",
@@ -261,10 +261,7 @@ describe("runReplyAgent media path normalization", () => {
     expect(operation.acceptedSteeredInboundAudio).toBe(true);
     expect(operation.sourceReplyDelivered).toBe(false);
     expect(
-      queueEmbeddedAgentMessageWithOutcomeAsyncMock.mock.calls.map(([sessionId, prompt]) => [
-        sessionId,
-        prompt,
-      ]),
+      backendQueueMessageMock.mock.calls.map(([sessionId, prompt]) => [sessionId, prompt]),
     ).toEqual([["session", "summarize the audio"]]);
     expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
     expect(parkedSteerConsumeMock).toHaveBeenCalledOnce();
@@ -282,10 +279,81 @@ describe("runReplyAgent media path normalization", () => {
       }),
     );
 
-    expect(queueEmbeddedAgentMessageWithOutcomeAsyncMock).not.toHaveBeenCalled();
-    expect(parkSteerCandidateMock).not.toHaveBeenCalled();
+    expect(backendQueueMessageMock).not.toHaveBeenCalled();
+    expect(reserveSteerCandidateMock).not.toHaveBeenCalled();
     expect(enqueueFollowupRunMock).toHaveBeenCalledOnce();
     expect(enqueueFollowupRunMock.mock.calls[0]?.[1].prompt).toBe("generate chart");
+  });
+
+  it("falls back to a queued followup when active steering is rejected", async () => {
+    backendQueueMessageMock.mockImplementation(async (sessionId: string) => ({
+      queued: false,
+      sessionId,
+      reason: "runtime_rejected",
+      gatewayHealth: "live",
+      errorMessage: "cannot steer a compact turn",
+    }));
+
+    await runReplyAgent(
+      await makeRunReplyAgentParams({
+        resolvedQueue: { mode: "steer" } as QueueSettings,
+        shouldSteer: true,
+        shouldFollowup: true,
+        isActive: true,
+        isRunActive: () => true,
+      }),
+    );
+
+    expect(backendQueueMessageMock).toHaveBeenCalledOnce();
+    expect(reserveSteerCandidateMock).toHaveBeenCalledWith(
+      "main",
+      expect.objectContaining({ prompt: "generate chart" }),
+      expect.objectContaining({ mode: "steer" }),
+      expect.any(Function),
+    );
+    expect(parkedSteerFallbackMock).toHaveBeenCalledOnce();
+    expect(parkedSteerConsumeMock).not.toHaveBeenCalled();
+    expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
+  });
+
+  it("shares one media cache between block accumulation and final payload delivery", async () => {
+    const { createReplyMediaContext } =
+      await vi.importActual<typeof import("./reply-media-paths.js")>("./reply-media-paths.js");
+    const mediaContext = createReplyMediaContext({
+      cfg: {},
+      sessionKey: "main",
+      workspaceDir: testWorkspaceDir,
+      messageProvider: "telegram",
+      accountId: "default",
+    });
+    let stagedIndex = 0;
+    resolveOutboundAttachmentFromUrlMock.mockImplementation(async (mediaUrl: string) => {
+      stagedIndex += 1;
+      return {
+        path: path.join("/tmp/outbound-media", `${stagedIndex}-${path.basename(mediaUrl)}`),
+      };
+    });
+
+    const blockPayload = await mediaContext.normalizePayload({
+      text: "here is the chart",
+      mediaUrl: "./out/chart.png",
+      mediaUrls: ["./out/chart.png"],
+    });
+    const finalPayload = await mediaContext.normalizePayload({
+      text: "here is the chart",
+      mediaUrl: "./out/chart.png",
+      mediaUrls: ["./out/chart.png"],
+    });
+
+    expect(blockPayload).toEqual({
+      text: "here is the chart",
+      mediaUrl: "/tmp/outbound-media/1-chart.png",
+      mediaUrls: ["/tmp/outbound-media/1-chart.png"],
+      attachments: [{ name: "chart.png", mimeType: "image/png", trustedLocalMedia: true }],
+      trustedLocalMedia: true,
+    });
+    expect(finalPayload).toEqual(blockPayload);
+    expect(resolveOutboundAttachmentFromUrlMock).toHaveBeenCalledTimes(1);
   });
 
   async function runAgentTurnWithSessionContext(

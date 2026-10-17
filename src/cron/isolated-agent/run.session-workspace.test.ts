@@ -4,9 +4,9 @@ import { createDeferred } from "../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { ManagedWorktreeRecord } from "../../agents/worktrees/types.js";
 import {
-  interruptSessionWorkAdmissions,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
+  interruptSessionControllerEffects,
+  runSessionMutation,
+} from "../../sessions/session-controller.lifecycle.js";
 import { makeIsolatedAgentJobFixture, makeIsolatedAgentParamsFixture } from "./job-fixtures.js";
 import { setupRunCronIsolatedAgentTurnSuite } from "./run.suite-helpers.js";
 import {
@@ -146,10 +146,10 @@ describe("session-bound cron workspace", () => {
       identities: [sessionKey, entry.sessionId],
     };
     let bindingRemoved = false;
-    const mutation = runExclusiveSessionLifecycleMutation("patch", {
+    const mutation = runSessionMutation({
       ...target,
       prepare: async () => {
-        const drained = interruptSessionWorkAdmissions(target);
+        const drained = interruptSessionControllerEffects(target);
         expect(bindingRemoved).toBe(false);
         finishRead.resolve();
         await drained;

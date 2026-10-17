@@ -17,9 +17,9 @@ import { deleteSessionEntryLifecycle } from "../../config/sessions/session-acces
 import type { SessionEntry } from "../../config/sessions/types.js";
 import * as gitExec from "../../infra/git-exec.js";
 import {
-  isSessionLifecycleMutationActive,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
+  isSessionMutationActive,
+  runSessionMutation,
+} from "../../sessions/session-controller.lifecycle.js";
 import {
   removeSessionWorktree,
   restoreSessionWorktree,
@@ -138,9 +138,10 @@ it("releases session mutation admission during Git while the registry claim fenc
   const identities = [sessionKey, entry.sessionId];
   try {
     await waitForStage(entered.promise, "snapshot capture");
-    expect(isSessionLifecycleMutationActive(storePath, identities)).toBe(false);
+    expect(isSessionMutationActive(storePath, identities)).toBe(false);
     await expect(acquireWorktreeRunLease(record.id, { env })).rejects.toThrow(/remov/i);
-    await runExclusiveSessionLifecycleMutation("restore", {
+    await runSessionMutation({
+      policy: "wait",
       scope: storePath,
       identities,
       run: async () => {
@@ -158,7 +159,9 @@ it("releases session mutation admission during Git while the registry claim fenc
     });
     release.resolve();
     await waitForStage(checkoutRemoved.promise, "checkout removal");
-    await runExclusiveSessionLifecycleMutation("delete", {
+    await runSessionMutation({
+      kind: "delete",
+      policy: "wait",
       scope: storePath,
       identities,
       run: async () => {
@@ -185,7 +188,7 @@ it("releases session mutation admission during Git while the registry claim fenc
     await cleanup;
   }
   expect((await cleanup).removed).toEqual([record.id]);
-  expect(isSessionLifecycleMutationActive(storePath, identities)).toBe(false);
+  expect(isSessionMutationActive(storePath, identities)).toBe(false);
   const removed = getRegistryWorktree(env, record.id)!;
   expect(removed.removedAt).toBe(2);
   expect(await requireGit(repoRoot, ["show", `${removed.snapshotRef}:draft.txt`])).toBe(

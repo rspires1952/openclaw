@@ -4,14 +4,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { GatewaySuspendPrepareResultSchema } from "../../packages/gateway-protocol/src/index.js";
 import type { EmbeddedAgentQueueHandle } from "../agents/embedded-agent-runner/run-state.js";
 import {
-  clearActiveEmbeddedRun,
-  setActiveEmbeddedRun,
-} from "../agents/embedded-agent-runner/runs.js";
-import {
-  clearCommandLane,
-  enqueueCommandInLane,
-  setCommandLaneConcurrency,
-} from "../process/command-queue.js";
+  clearTestEmbeddedRun as clearActiveEmbeddedRun,
+  registerTestEmbeddedRun as setActiveEmbeddedRun,
+} from "../agents/embedded-agent-runner/runs.test-support.js";
+import { enqueueCommandInLane, setCommandLaneConcurrency } from "../process/command-queue.js";
 import {
   resetGatewayWorkAdmission,
   tryBeginGatewayRootWorkAdmission,
@@ -155,10 +151,12 @@ describe("waitForGatewayActiveWork", () => {
   });
 
   it("names the command lane holding queued work", async () => {
-    const lane = "session:shutdown-queued-owner";
+    const lane = "shutdown-queued-owner";
+    const cancellation = new AbortController();
+    const reason = new Error("queued owner stopped");
     setCommandLaneConcurrency(lane, 0);
-    const queued = enqueueCommandInLane(lane, async () => {});
-    const rejected = expect(queued).rejects.toThrow("cleared");
+    const queued = enqueueCommandInLane(lane, async () => {}, { abortSignal: cancellation.signal });
+    const rejected = expect(queued).rejects.toBe(reason);
     try {
       const result = await waitForGatewayActiveWork(0);
       expect(result.snapshot.blockers).toContainEqual({
@@ -167,7 +165,7 @@ describe("waitForGatewayActiveWork", () => {
         message: `1 queued or active operation(s): ${lane} (active=0, queued=1)`,
       });
     } finally {
-      clearCommandLane(lane);
+      cancellation.abort(reason);
       await rejected;
     }
   });

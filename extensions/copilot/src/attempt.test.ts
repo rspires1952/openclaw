@@ -33,12 +33,12 @@ import { createOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerCopilotCleanupTests } from "./attempt-cleanup.test-support.js";
 import { registerCopilotWorkspaceTests } from "./attempt-workspace.test-support.js";
-import { runCopilotAttempt } from "./attempt.js";
 import {
   makeAssistantMessageEvent,
   makeFakePool,
   makeFakeSdk,
   projectAgentRunAttemptTerminal,
+  runCopilotAttempt,
   type FakeSdk,
   type FakeSession,
   type SessionEventShape,
@@ -1404,11 +1404,8 @@ describe("runCopilotAttempt", () => {
     });
     const pool = makeFakePool(sdk);
 
-    const toolAuthorityFingerprint = "ask-user-authority";
-    const attempt = runCopilotAttempt(
-      makeParams({ abortSignal: controller.signal, onBlockReply, toolAuthorityFingerprint }),
-      { pool },
-    );
+    const params = makeParams({ abortSignal: controller.signal, onBlockReply });
+    const attempt = runCopilotAttempt(params, { pool });
     const settledAttempt = attempt.catch(() => undefined);
 
     try {
@@ -1418,7 +1415,7 @@ describe("runCopilotAttempt", () => {
       expect(
         queueAgentHarnessMessage("session-1", "2", {
           isInboundUserMessage: true,
-          toolAuthorityFingerprint,
+          toolAuthorityFingerprint: params.toolAuthorityFingerprint,
         }),
       ).toBe(true);
       const result = await vi.waitFor(() => attempt);

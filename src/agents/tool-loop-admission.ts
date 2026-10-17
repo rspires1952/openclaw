@@ -260,6 +260,7 @@ export async function admitToolCallBatch(
       warningThreshold,
     });
     markDiagnosticArgumentChurnObservation({
+      watchdogAttempt: ctx.watchdogAttempt,
       sessionKey: ctx.sessionKey,
       sessionId: ctx.sessionId,
       runId: ctx.runId,

@@ -1,3 +1,8 @@
+import {
+  isRpcSourceExecuting,
+  requestRpcSourceCancellation,
+} from "../sessions/session-controller.rpc-sources.js";
+import { rpcSourceTesting } from "../sessions/session-lifecycle-admission.test-support.js";
 import "../agents/subagents/spawn/subagent-spawn-model.mocks.shared.js";
 // Preserve module setup before modules that consume it.
 // oxfmt-ignore
@@ -181,32 +186,29 @@ describe("queued collector native admission", () => {
           "pending native collector",
         );
         const admission = expectDefined(
-          context.chatAbortControllers.get(entry.runId),
+          rpcSourceTesting.get(entry.runId),
           "real native controller",
         );
-        expect(admission.kind).toBe("agent");
-        expect(admission.executionStarted).toBe(false);
+        expect(admission.adapter.kind).toBe("agent");
+        expect(isRpcSourceExecuting(admission)).toBe(false);
         expect(getAgentRunContext(entry.runId)).toBeDefined();
         expect(isSubagentRunQueued(entry)).toBe(true);
-        expect(
-          resolveVisibleActiveSessionRunState({
-            context,
-            requestedKey: entry.childSessionKey,
-            canonicalKey: entry.childSessionKey,
-          }).status,
-        ).toBeUndefined();
+        const target = expectDefined(admission.input.target, "native physical session target");
+        const activeScope = {
+          storePath: target.storeScope,
+          agentId: target.agentId,
+          sessionId: target.incarnation,
+          requestedKey: entry.childSessionKey,
+          canonicalKey: entry.childSessionKey,
+          resolveGatewayContext: context.resolveGatewayContext,
+        };
+        expect(resolveVisibleActiveSessionRunState(activeScope).status).toBeUndefined();
         const releaseCapacityWait = registerAgentRunCapacityWait(
           entry.runId,
           getAgentRunLifecycleGeneration(),
         );
         try {
-          expect(
-            resolveVisibleActiveSessionRunState({
-              context,
-              requestedKey: entry.childSessionKey,
-              canonicalKey: entry.childSessionKey,
-            }).status,
-          ).toBe("queued");
+          expect(resolveVisibleActiveSessionRunState(activeScope).status).toBe("queued");
         } finally {
           releaseCapacityWait?.();
         }
@@ -266,10 +268,13 @@ describe("queued collector native admission", () => {
             .toEqual([true, { ok: true, status: "aborted", abortedRunId: entry.runId }]);
         }
         expect.soft(context.chatRunState.hasAbortMarker(entry.runId)).toBe(true);
-        expect.soft(admission.abortStopReason).toBe("rpc");
-        expect.soft(stopped.execution.startedAt).toBeUndefined();
-        expect.soft(stopped.sessionStartedAt).toBeUndefined();
-        expect(context.chatAbortControllers.has(entry.runId)).toBe(false);
+        expect.soft(admission.adapter.abortStopReason).toBe("rpc");
+        expect.soft(entry.execution.startedAt).toBeUndefined();
+        expect.soft(entry.sessionStartedAt).toBeUndefined();
+        expect(rpcSourceTesting.has(entry.runId)).toBe(false);
+        // This unadopted launch still owns its provisional session; join its real cleanup.
+        await closeSwarmScheduler();
+
         expect(order[0]).toBe(publicationFailure ? "deleting" : "published");
         expect(order).toContain("deleted");
         expect(
@@ -278,7 +283,10 @@ describe("queued collector native admission", () => {
       } finally {
         releasePublication.resolve();
         if (nativeRunId) {
-          context.chatAbortControllers.get(nativeRunId)?.controller.abort();
+          const source = rpcSourceTesting.get(nativeRunId);
+          if (source) {
+            requestRpcSourceCancellation(source);
+          }
           await dispatched.promise;
           clearAgentRunContext(nativeRunId);
         }

@@ -47,6 +47,7 @@ import {
   peekSystemEventEntries,
 } from "../../../infra/system-events.js";
 import { getProcessSupervisor } from "../../../process/supervisor/index.js";
+import { rpcSourceTesting } from "../../../sessions/session-lifecycle-admission.test-support.js";
 import { isPidDefinitelyDead } from "../../../shared/pid-alive.js";
 import { withEnvAsync } from "../../../test-utils/env.js";
 import { normalizeAcceptedSessionSpawnResult } from "../../accepted-session-spawn.js";
@@ -439,11 +440,8 @@ export function registerCompletedRequestCustodySpawnCases(options: RequestCustod
             },
           });
           expect(requestSelection.runs.map((entry) => entry.runId)).toEqual([childRunId]);
-          const active = expectDefined(
-            bound.context.chatAbortControllers.get(childRunId),
-            "active native child",
-          );
-          active.controller.signal.addEventListener(
+          const active = expectDefined(rpcSourceTesting.get(childRunId), "active native child");
+          active.input.abortSignal.addEventListener(
             "abort",
             () => {
               source.abort(new Error("Requester revoked after native acceptance"));

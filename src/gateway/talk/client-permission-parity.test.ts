@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { createMockSubsystemLogger } from "../../../test/helpers/mock-subsystem-logger.js";
 import { wrapToolWithBeforeToolCallHook } from "../../agents/agent-tools.before-tool-call.js";
 import { createExecTool } from "../../agents/bash-tools.js";
 import type { RunEmbeddedAgentParams } from "../../agents/embedded-agent-runner/run/params.js";
@@ -159,7 +160,7 @@ describe("authenticated Talk permission parity", () => {
     });
     const runner = createTalkClientAgentConsultRunner({
       config,
-      context: { chatAbortControllers: new Map(), logGateway: { warn: vi.fn() } } as never,
+      context: { logGateway: createMockSubsystemLogger("gateway/test") },
       sessionTarget,
       authority: resolveTalkAgentConsultAuthority(client.connect.scopes, client),
       getVoiceSessionId: () => voiceSessionId,
@@ -216,7 +217,7 @@ describe("authenticated Talk permission parity", () => {
     });
     const runner = createTalkClientAgentConsultRunner({
       config: cfg,
-      context: { chatAbortControllers: new Map(), logGateway: { warn: vi.fn() } } as never,
+      context: { logGateway: createMockSubsystemLogger("gateway/test") },
       sessionTarget,
       authority: resolveTalkAgentConsultAuthority(ownerClient.connect.scopes, ownerClient),
       getVoiceSessionId: () => voiceSessionId,
@@ -244,7 +245,6 @@ describe("authenticated Talk permission parity", () => {
     );
     const context = {
       getRuntimeConfig: () => config,
-      chatAbortControllers: new Map(),
       logGateway: { warn: vi.fn() },
     } as unknown as GatewayRequestContext;
     const connection = new AbortController();
@@ -334,7 +334,6 @@ describe("authenticated Talk permission parity", () => {
   it("retains but does not accept a pending voice-creation request", async () => {
     const context = {
       getRuntimeConfig: () => config,
-      chatAbortControllers: new Map(),
       logGateway: { warn: vi.fn() },
     } as unknown as GatewayRequestContext;
     const connection = new AbortController();

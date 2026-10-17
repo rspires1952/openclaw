@@ -60,7 +60,6 @@ async function createMediaFixture(scenario: Scenario, managed = false) {
     name: params.modelId,
     input: ["text", "image"],
   };
-  params.toolAuthorityFingerprint = "steering-media-authority";
   await fs.mkdir(params.workspaceDir, { recursive: true });
   let mediaDir = params.workspaceDir;
   if (managed) {

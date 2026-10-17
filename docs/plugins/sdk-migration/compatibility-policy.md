@@ -40,6 +40,29 @@ returning. Retired adapters reject calls as documented in their records below.
 Awaited mutations complete only after committed facts have been installed. SessionManager and its
 extension/provider adapters share the session-persistence warning budget.
 
+### Session-controller cutover exception
+
+The session-controller cutover has three explicitly approved immediate breaks,
+without compatibility aliases or a deprecation window:
+
+- Session-keyed `setActiveEmbeddedRun(...)` requires a host-admitted harness
+  attempt. Unadmitted calls throw `AgentHarnessPreflightError` with code
+  `SESSION_CONTROLLER_ADMISSION_REQUIRED` and migration guidance.
+- Gateway handler context no longer exposes mutable `chatAbortControllers` or
+  `chatQueuedTurns` maps. Compose authorized Gateway methods and read session
+  projections instead of mutating session ownership.
+- `AgentTurnStartOwner.observe()` replaces `expiresAtMs` with
+  `startDeadlineAtMs`, which describes the controller's execution-start budget.
+  It is optional and nullable; it is not an execution-authority expiry.
+
+Reading a removed map or the old observation property fails with code
+`PLUGIN_CAPABILITY_REMOVED` and identifies the removed capability. Follow the
+[session-controller migration](/plugins/sdk-migration#session-keyed-harness-registration)
+before upgrading. This exception does not change other compatibility records,
+including Gateway placement and publication services, opaque model-request
+generation identity, or the `recoveringModelAttempt` result from
+`abortAndDrainAgentHarnessRun`.
+
 ### Harness deletion companions
 
 Unbound `AgentHarnessSessionDeletionMutation` callbacks are deprecated. During

@@ -21,8 +21,12 @@ const childScript = `
   import fs from "node:fs";
   import { createChannelIngressDrain } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.ingressDrain))};
   import { createChannelIngressQueue } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.ingressQueue))};
-  import { clearActiveEmbeddedRun, setActiveEmbeddedRun } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.runs))};
-  import { getActiveEmbeddedRunCount } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.activeRunProjections))};
+  import {
+    clearActiveEmbeddedRun,
+    setActiveEmbeddedRun,
+  } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.runs))};
+  import { withSessionTurn } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.sessionControllerAdmission))};
+  import { getActiveSessionRunCount } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.sessionControllerQueries))};
   import { runGatewayLoop } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.runLoop))};
   import { getActiveGatewayRootWorkCount } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.workAdmission))};
 
@@ -45,15 +49,26 @@ const childScript = `
   };
   const drain = createChannelIngressDrain({
     queue,
-    dispatchClaimedEvent: async (_event, lifecycle) => {
-      setActiveEmbeddedRun(sessionId, handle, sessionKey);
-      await lifecycle.onAdopted();
-      trace("adopted:roots=" + getActiveGatewayRootWorkCount() + ":embedded=" + getActiveEmbeddedRunCount());
-      adopted.resolve();
-      await embedded.promise;
-      clearActiveEmbeddedRun(sessionId, handle, sessionKey);
-      trace("embedded-completed");
-    },
+    // A keyed native run registers only under its controller turn admission.
+    dispatchClaimedEvent: (_event, lifecycle) =>
+      withSessionTurn({ sessionKey, sessionId }, async (operation) => {
+        setActiveEmbeddedRun(sessionId, handle, sessionKey, undefined, undefined, operation);
+        await lifecycle.onAdopted();
+        trace(
+          "adopted:roots=" +
+            getActiveGatewayRootWorkCount() +
+            ":embedded=" +
+            getActiveSessionRunCount(),
+        );
+        adopted.resolve();
+        await embedded.promise;
+        clearActiveEmbeddedRun(sessionId, handle, sessionKey);
+        trace("embedded-completed");
+      }).catch((error) => {
+        // Fail fast: a dispatch failure would otherwise leave startup waiting for adoption.
+        trace("dispatch-failed:" + error.message);
+        process.exit(1);
+      }),
   });
 
   await queue.enqueue("event-direct-stop", { text: "hello" }, { laneKey: sessionKey });

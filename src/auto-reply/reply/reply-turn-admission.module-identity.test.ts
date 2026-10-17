@@ -21,7 +21,7 @@ it("keeps admitted session ownership when transformed plugins import the native 
   const source = (relativePath: string) => JSON.stringify(path.join(repo, relativePath));
   const ownerExports = `
     export { admitReplyTurn } from ${source("src/auto-reply/reply/reply-turn-admission.ts")};
-    export { replyRunRegistry } from ${source("src/auto-reply/reply/reply-run-registry.ts")};
+    export { waitForSessionRunIdle } from ${source("src/sessions/session-controller.wait.ts")};
     export { replaceSessionEntrySync } from ${source("src/config/sessions/session-accessor.sqlite-entry.ts")};
     export { closeOpenClawAgentDatabasesAsync } from ${source("src/state/openclaw-agent-db.ts")};
     export { closeOpenClawStateDatabaseAsync } from ${source("src/state/openclaw-state-db.ts")};
@@ -97,7 +97,9 @@ it("keeps admitted session ownership when transformed plugins import the native 
       String.raw`
         import assert from "node:assert/strict";
         import path from "node:path";
-        import { registerHooks } from "node:module";
+        import {
+  registerHooks,
+} from "node:module";
         const root = ${JSON.stringify(root)};
         const deferredModules = new Set(${JSON.stringify([...deferredModules])});
         const unexpectedImports = [];
@@ -130,12 +132,14 @@ it("keeps admitted session ownership when transformed plugins import the native 
           host = await import(${JSON.stringify(pathToFileURL(path.join(dist, "host.js")).href)});
           const native = await import(${JSON.stringify(pathToFileURL(path.join(dist, "admission-runtime.js")).href)});
           assert.equal(native.admitReplyTurn, host.admitReplyTurn, "native SDK shares the host graph");
+          assert.equal(native.waitForSessionRunIdle, host.waitForSessionRunIdle, "native wait shares the host graph");
           const modulePath = path.join(root, "plugin.ts");
           transformed = host.getCachedPluginModuleLoader({
             modulePath, rootDir: root, importerUrl: import.meta.url, tryNative: false,
             aliasMap: { "openclaw/plugin-sdk/admission-fixture": path.join(root, "dist/admission-runtime.js") },
           })(modulePath);
           assert.equal(transformed.admitReplyTurn, host.admitReplyTurn, "plugin transformation retains the native admission owner");
+          assert.equal(transformed.waitForSessionRunIdle, host.waitForSessionRunIdle, "plugin transformation retains the native wait owner");
           const cases = [
             { name: "transformed-same-store", parent: transformed, foreign: false },
             { name: "transformed-foreign-store", parent: transformed, foreign: true },
@@ -150,52 +154,45 @@ it("keeps admitted session ownership when transformed plugins import the native 
             const parentStore = scenario.foreign
               ? path.join(caseRoot, "foreign", "sessions.json") : targetStore;
             const write = (storePath, id) => host.replaceSessionEntrySync(
-              { storePath, sessionKey }, { sessionId: id, updatedAt: Date.now() },
+              { agentId: "main", storePath, sessionKey }, { sessionId: id, updatedAt: Date.now() },
             );
             write(targetStore, sessionId);
             if (scenario.foreign) write(parentStore, sessionId);
             const admitted = await bounded(scenario.parent.admitReplyTurn({
-              sessionKey, sessionId, storePath: parentStore, kind: "visible", resetTriggered: false,
+              agentId: "main", sessionKey, sessionId, storePath: parentStore, kind: "visible", resetTriggered: false,
             }), scenario.name + " parent");
             assert.equal(admitted.status, "owned", "parent must hold actual admission");
             const parent = admitted.operation;
             operations.add(parent);
             parent.setPhase("preflight_compacting");
-            let enteredWait;
-            const waiting = new Promise(resolve => { enteredWait = resolve; });
-            const waitForIdle = host.replyRunRegistry.waitForIdle;
-            host.replyRunRegistry.waitForIdle = function (...args) {
-              const result = waitForIdle.apply(this, args);
-              enteredWait();
-              return result;
-            };
+            const ownerIdle = scenario.foreign
+              ? undefined
+              : host.waitForSessionRunIdle(sessionKey);
             const controller = new AbortController();
             let child;
             let pending;
             try {
               pending = host.admitReplyTurn({
-                sessionKey, sessionId, expectedSessionId: sessionId, storePath: targetStore,
+                agentId: "main", sessionKey, sessionId, expectedSessionId: sessionId, storePath: targetStore,
                 kind: "queued_followup", resetTriggered: false, waitTimeoutMs: 5_000,
                 upstreamAbortSignal: controller.signal,
               });
               void pending.catch(() => {});
-              await bounded(waiting, scenario.name + " native waitForIdle");
+              if (scenario.foreign) {
+                // Equal logical keys/UUIDs do not serialize independent physical stores.
+                child = await bounded(pending, scenario.name + " independent physical admission");
+              } else {
+                await Promise.resolve();
+              }
               write(parentStore, successorId);
-              // Equal UUIDs in a separately replaced store cannot prove this parent's ownership.
-              if (scenario.foreign) write(targetStore, successorId);
               parent.updateSessionId(successorId);
               parent.complete();
-              child = await bounded(pending, scenario.name + " successor");
+              await ownerIdle;
+              child ??= await bounded(pending, scenario.name + " successor");
               if (child.status === "owned") operations.add(child.operation);
-              if (scenario.foreign) {
-                assert.equal(child.status, "skipped");
-                assert.equal(child.reason, "lifecycle-invalidated");
-              } else {
-                assert.equal(child.status, "owned");
-                assert.equal(child.operation.sessionId, successorId);
-              }
+              assert.equal(child.status, "owned");
+              assert.equal(child.operation.sessionId, scenario.foreign ? sessionId : successorId);
             } finally {
-              host.replyRunRegistry.waitForIdle = waitForIdle;
               parent.complete();
               if (child?.status === "owned") child.operation.complete();
               controller.abort();

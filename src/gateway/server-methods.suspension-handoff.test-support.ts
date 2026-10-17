@@ -16,7 +16,7 @@ import {
   resetGatewayWorkAdmission,
   tryBeginGatewayRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
-import { runExclusiveSessionLifecycleMutation } from "../sessions/session-lifecycle-admission.js";
+import { runSessionMutation } from "../sessions/session-controller.lifecycle.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { getGatewayProcessInstanceId } from "./process-instance.js";
 import type { handleGatewayRequest } from "./server-methods.js";
@@ -118,8 +118,6 @@ export function registerSuspensionHandoffLifecycleTests() {
         cron,
         hostLifecycle: host.capability,
         logGateway: { warn: vi.fn(), info: vi.fn() },
-        chatAbortControllers: new Map(),
-        chatQueuedTurns: new Map(),
       } as unknown as Parameters<typeof handleGatewayRequest>[0]["context"];
       const rpc = async (method: keyof typeof suspendHandlers, requestParams: unknown) => {
         const result = dispatch({
@@ -156,7 +154,7 @@ export function registerSuspensionHandoffLifecycleTests() {
           Array.from({ length: 200 }, () => beginGatewayRootWorkAdmissionWhenOpen()),
         );
         await vi.advanceTimersByTimeAsync(30_000);
-        mutation = runExclusiveSessionLifecycleMutation("patch", {
+        mutation = runSessionMutation({
           scope: "suspension-status",
           identities: ["session"],
           run: async () => {

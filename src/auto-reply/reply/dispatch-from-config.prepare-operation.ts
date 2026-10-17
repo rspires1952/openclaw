@@ -31,7 +31,6 @@ import {
   sendReplyWithTranscriptMirror,
 } from "./dispatch-from-config.transcript.js";
 import { DispatchSessionRefreshRequiredError } from "./dispatch-session-refresh-error.js";
-import { REPLY_ADMISSION_TICKET } from "./reply-admission-ticket.js";
 import { extractShortModelName } from "./response-prefix-template.js";
 import { assertPreparedConversationBindingRouteCurrent } from "./session-conversation-binding.js";
 
@@ -198,16 +197,6 @@ export async function prepareDispatchOperation(state: PrepareDispatchOperationCo
   }
   // Own the session before plugin-bound handlers or message hooks can perform
   // work. Fast abort, fast approval, and inbound dedupe remain ahead of this gate.
-  const admissionTicket = params.replyOptions?.[REPLY_ADMISSION_TICKET];
-  if (
-    !state.activeRunSafeCommandTurn &&
-    admissionTicket &&
-    !(await state.traceReplyPhase("reply.wait_admission_ticket", () =>
-      admissionTicket.wait(params.replyOptions?.abortSignal),
-    ))
-  ) {
-    return { status: "complete" as const, result: finishReplyOperationAbortedDispatch() };
-  }
   const assertCurrentBindingRoute = async () => {
     if (ctx.InternalTurnSource === undefined && readConversationBindingRouteFacts(ctx)) {
       await assertPreparedConversationBindingRouteCurrent(ctx);

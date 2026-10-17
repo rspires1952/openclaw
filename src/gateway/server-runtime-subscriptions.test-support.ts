@@ -1,4 +1,5 @@
-import { expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { expect, it, onTestFinished, vi } from "vitest";
 import {
   bindTestChannelParticipantAdmissionEvidence,
   createChannelParticipantAdmissionEvidence,
@@ -25,9 +26,16 @@ import {
 } from "../infra/agent-events.js";
 import { claimAgentRunContext, releaseAgentRunContext } from "../infra/agent-run-registry.js";
 import type { SubsystemLogger } from "../logging/subsystem.js";
+import { captureSessionTarget } from "../sessions/session-controller.lifecycle.js";
+import {
+  releaseSessionControllerClaim,
+  retireSessionControllerInput,
+} from "../sessions/session-controller.mailbox.js";
+import type { RpcSourceRef } from "../sessions/session-controller.rpc-sources.js";
+import { getRpcSourceProjectSessionActive } from "../sessions/session-controller.rpc-sources.js";
 import { emitSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
-import { registerChatAbortController, type ChatAbortControllerEntry } from "./chat-abort.js";
+import { registerChatAbortController } from "./chat-abort.js";
 import {
   createChatRunState,
   createSessionEventSubscriberRegistry,
@@ -67,7 +75,6 @@ export function createSubscriptionTestFixture() {
         toolEventRecipients: chatRunState.toolEventRecipients,
         sessionEventSubscribers: createSessionEventSubscriberRegistry(),
         sessionMessageSubscribers: createSessionMessageSubscriberRegistry(),
-        chatAbortControllers: new Map(),
         restartRecoveryCandidates: new Map(),
         refreshConnectedUserProfiles: vi.fn(),
       };
@@ -76,31 +83,48 @@ export function createSubscriptionTestFixture() {
 }
 
 export function registerSubscriptionChatRun(
-  params: Parameters<typeof startGatewayEventSubscriptions>[0],
-  input: Omit<
-    Parameters<typeof registerChatAbortController>[0],
-    "chatAbortControllers" | "timeoutMs"
-  >,
+  _params: Parameters<typeof startGatewayEventSubscriptions>[0],
+  input: Omit<Parameters<typeof registerChatAbortController>[0], "timeoutMs">,
 ) {
   const registration = registerChatAbortController({
     ...input,
-    chatAbortControllers: params.chatAbortControllers,
+    target:
+      input.target ??
+      captureSessionTarget({
+        storeScope: `/synthetic/subscription/${randomUUID()}/sessions`,
+        sessionKey: input.sessionKey ?? "agent:main:subscription",
+        agentId: input.agentId,
+        incarnation: input.sessionId,
+      }),
     timeoutMs: 60_000,
   });
   if (!registration.entry) {
     throw new Error("expected registered chat abort controller");
   }
-  return { ...registration, entry: registration.entry };
+  registration.initializeTiming();
+  const entry = registration.entry;
+  onTestFinished(async () => {
+    const claim = entry.input.claim;
+    claim?.operation?.complete();
+    if (claim) {
+      releaseSessionControllerClaim(claim);
+      await claim.settlement.promise;
+    }
+    registration.cleanup();
+    retireSessionControllerInput(entry.input);
+    await Promise.allSettled([entry.input.settlement.promise]);
+  });
+  return { ...registration, entry };
 }
 
-export function readLifecycleState(entry: ChatAbortControllerEntry) {
+export function readLifecycleState(entry: RpcSourceRef) {
   return {
-    projectSessionActive: entry.projectSessionActive,
-    projectSessionTerminalPending: entry.projectSessionTerminalPending,
-    projectSessionTerminalObservedAt: entry.projectSessionTerminalObservedAt,
-    projectSessionTerminalPersistence: entry.projectSessionTerminalPersistence,
-    projectSessionTerminalPersisted: entry.projectSessionTerminalPersisted,
-    registrationCleanupRequested: entry.registrationCleanupRequested,
+    projectSessionActive: getRpcSourceProjectSessionActive(entry),
+    projectSessionTerminalPending: entry.adapter.projectSessionTerminalPending,
+    projectSessionTerminalObservedAt: entry.adapter.projectSessionTerminalObservedAt,
+    projectSessionTerminalPersistence: entry.adapter.projectSessionTerminalPersistence,
+    projectSessionTerminalPersisted: entry.adapter.projectSessionTerminalPersisted,
+    retirementRequested: entry.input.retirementRequested,
   };
 }
 
@@ -110,7 +134,7 @@ export function lifecycleState(
   projectSessionTerminalObservedAt?: number,
   projectSessionTerminalPersistence?: Promise<void>,
   projectSessionTerminalPersisted?: boolean,
-  registrationCleanupRequested?: boolean,
+  retirementRequested?: boolean,
 ): ReturnType<typeof readLifecycleState> {
   return {
     projectSessionActive,
@@ -118,7 +142,7 @@ export function lifecycleState(
     projectSessionTerminalObservedAt,
     projectSessionTerminalPersistence,
     projectSessionTerminalPersisted,
-    registrationCleanupRequested,
+    retirementRequested,
   };
 }
 
@@ -409,8 +433,8 @@ export function registerSubscriptionRegistrationTests(
     try {
       emitAgentEventForOwner({ runId, stream: "lifecycle", data: { phase: "end" } }, originalClaim);
       expect(replacementClaim).toBeTruthy();
-      expect(registration.entry.terminalOutcomeObserved).toBeUndefined();
-      expect(readLifecycleState(registration.entry)).toEqual(lifecycleState(true));
+      expect(registration.entry.adapter.terminalOutcomeObserved).toBeUndefined();
+      expect(readLifecycleState(registration.entry)).toEqual(lifecycleState(undefined));
     } finally {
       removeListener();
       registration.cleanup();
@@ -430,8 +454,8 @@ export function registerSubscriptionRegistrationTests(
     });
     try {
       await unsubs.agentUnsub();
-      expect(readLifecycleState(registration.entry)).toEqual(lifecycleState(true));
-      expect(registration.entry.terminalOutcomeObserved).toBeUndefined();
+      expect(readLifecycleState(registration.entry)).toEqual(lifecycleState(undefined));
+      expect(registration.entry.adapter.terminalOutcomeObserved).toBeUndefined();
     } finally {
       registration.cleanup();
     }

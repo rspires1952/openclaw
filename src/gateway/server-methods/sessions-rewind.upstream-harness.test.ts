@@ -70,7 +70,6 @@ async function invoke(
     respond,
     context: {
       broadcastToConnIds: vi.fn(),
-      chatAbortControllers: new Map(),
       getRuntimeConfig: runtimeConfig ?? (() => cfg),
       getSessionEventSubscriberConnIds: () => new Set(),
     } as unknown as GatewayRequestContext,

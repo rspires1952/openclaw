@@ -13,10 +13,11 @@ import {
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { withPluginRuntimeGenerationScope } from "../plugins/runtime/generation-scope.js";
 import type { ProviderFailoverErrorContext } from "../plugins/types.js";
+import { createReplyOperation } from "../sessions/session-controller.js";
 import { createTestAdmittedRunContext } from "./admitted-run-context.test-support.js";
 import { createAttemptNestedToolActivityState } from "./embedded-agent-runner/run/attempt-nested-tool-activity.js";
 import { prepareEmbeddedAttemptStream } from "./embedded-agent-runner/run/attempt-stream-prepare.js";
-import { clearActiveEmbeddedRun } from "./embedded-agent-runner/runs.js";
+import { clearTestEmbeddedRun as clearActiveEmbeddedRun } from "./embedded-agent-runner/runs.test-support.js";
 import {
   createSubscribedSessionHarness,
   emitAssistantLifecycleErrorAndEnd,
@@ -149,11 +150,18 @@ describe("subscribeEmbeddedAgentSession lifecycle billing errors", () => {
           }),
         );
         const { session, modelRegistry } = await createTestSession({ model });
+        const replyOperation = createReplyOperation({
+          sessionKey,
+          sessionId,
+          agentId: "main",
+          resetTriggered: false,
+        });
         const stream = prepareEmbeddedAttemptStream({
           attempt: {
             runId,
             sessionId,
             sessionKey,
+            replyOperation,
             sessionFile: sessionKey,
             config,
             model,
@@ -224,6 +232,7 @@ describe("subscribeEmbeddedAgentSession lifecycle billing errors", () => {
         } finally {
           stream.subscription.unsubscribe();
           clearActiveEmbeddedRun(sessionId, stream.queueHandle, sessionKey, sessionKey);
+          replyOperation.complete();
         }
       });
     } finally {

@@ -10,17 +10,21 @@ import * as sessions from "../../../config/sessions/session-accessor.js";
 import * as generations from "../../../config/sessions/session-delivery-generation.js";
 import { SqliteWorkerError } from "../../../infra/sqlite-worker-contract.js";
 import {
-  beginSessionWorkAdmission,
-  getActiveSessionLifecycleMutationCount,
-  getActiveSessionWorkAdmissionCount,
-  runExclusiveSessionLifecycleMutation,
-} from "../../../sessions/session-lifecycle-admission.js";
-import { clearActiveEmbeddedRun, setActiveEmbeddedRun } from "../../embedded-agent-runner/runs.js";
+  beginSessionEffect,
+  getSessionMutationCount,
+  getSessionControllerWorkCount,
+  runSessionMutation,
+} from "../../../sessions/session-controller.lifecycle.js";
 import { createEmbeddedRunHandle } from "../../embedded-agent-runner/runs.test-support.js";
 import { enqueueSwarmRun, releaseSwarmRun } from "../swarm/swarm-scheduler.js";
 import * as killScope from "./subagent-control-kill-scope.js";
+import {
+  setActiveEmbeddedRun,
+  clearActiveEmbeddedRun,
+} from "./subagent-control-native.test-support.js";
 import * as killSession from "./subagent-control-session.js";
 import { killAllControlledSubagentRuns } from "./subagent-control.js";
+import type { KillScope } from "./subagent-control.types.js";
 import { SUBAGENT_ENDED_REASON_KILLED } from "./subagent-lifecycle-events.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
 import { subscribeSubagentRunChanges } from "./subagent-registry-publication.js";
@@ -83,7 +87,7 @@ it.for(["complete", "reject undefined"] as const)(
     }
     await register("root");
     const lane = new AsyncLocalStorage<string>();
-    const ready = createDeferred<killScope.KillScope>();
+    const ready = createDeferred<KillScope>();
     const finishRun = createDeferred();
     const runFinishing = createDeferred();
     const entered = Array.from({ length: 3 }, () => createDeferred());
@@ -242,7 +246,7 @@ it("retires queued refreshes after an escaping native failure and an undefined c
     collect: true,
     expectsCompletionMessage: false,
   });
-  const ready = createDeferred<killScope.KillScope>();
+  const ready = createDeferred<KillScope>();
   const entered = createDeferred();
   const finishRun = createDeferred();
   const releaseRead = createDeferred();
@@ -485,21 +489,21 @@ it.each([
     const d = subagentRuns.get("d")!;
     const healthy = subagentRuns.get("healthy")!;
     const entered = createDeferred();
-    const admissionA = await beginSessionWorkAdmission({
+    const admissionA = await beginSessionEffect({
       scope: storePath,
       identities: [aKey, "a-session"],
       assertAllowed: () => {},
       onInterrupt: () => entered.resolve(),
     });
     const interruptD = vi.fn(() => admissionD.release());
-    const admissionD = await beginSessionWorkAdmission({
+    const admissionD = await beginSessionEffect({
       scope: storePath,
       identities: [dKey, "d-session"],
       assertAllowed: () => {},
       onInterrupt: interruptD,
     });
     const healthyEntered = createDeferred();
-    const admissionHealthy = await beginSessionWorkAdmission({
+    const admissionHealthy = await beginSessionEffect({
       scope: storePath,
       identities: [healthyKey, "healthy-session"],
       assertAllowed: () => {},
@@ -613,7 +617,7 @@ it.each([
         await awaitProgress(grandchildCancelled.promise, "grandchild cancellation publication");
         // Publication precedes G's abort-marker write. Join its mutation from
         // outside the observer's reentrant context before arming the next fault.
-        await runExclusiveSessionLifecycleMutation("subagent-kill", {
+        await runSessionMutation({
           scope: storePath,
           identities: [gKey, "g-session"],
           run: async () => {},
@@ -670,11 +674,11 @@ it.each([
         reader.mockRestore();
         releaseSwarmRun("d");
         releaseSwarmRun("g");
-        clearActiveEmbeddedRun("a-session", handleA, aKey);
-        clearActiveEmbeddedRun("d-session", handleD, dKey);
+        await clearActiveEmbeddedRun("a-session", handleA, aKey);
+        await clearActiveEmbeddedRun("d-session", handleD, dKey);
       }
-      expect(getActiveSessionWorkAdmissionCount()).toBe(0);
-      expect(getActiveSessionLifecycleMutationCount()).toBe(0);
+      expect(getSessionControllerWorkCount()).toBe(0);
+      expect(getSessionMutationCount()).toBe(0);
     }
   },
 );

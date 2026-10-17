@@ -7,7 +7,6 @@ import {
   markGatewayDraining,
   publishLaneConfiguration,
   resetAllLanes,
-  resetCommandLane,
 } from "./command-queue.js";
 import { getQueueState } from "./command-queue.state.js";
 import { resetCommandQueueStateForTest } from "./command-queue.test-support.js";
@@ -290,16 +289,16 @@ describe("background work admission", () => {
     },
   );
 
-  it("preserves admission draining and the newest generation across real lane resets", async () => {
+  it("preserves admission draining and the newest generation across Gateway restarts", async () => {
     const lane = "background:reset";
     const sibling = "background:reset-sibling";
     publishLaneConfiguration({
-      lanes: { [lane]: 1, [sibling]: 1 },
+      lanes: { [sibling]: 1 },
       groups: { "background-work": { budget: 3, members: [lane, sibling] } },
     });
-    resetCommandLane(lane);
-    resetCommandLane(sibling);
-    resetCommandLane(sibling);
+    resetAllLanes();
+    publishLaneConfiguration({ lanes: { [lane]: 1 } });
+    resetAllLanes();
     const started = createDeferred();
     const oldGate = createDeferred();
     const freshGate = createDeferred();

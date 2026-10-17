@@ -25,12 +25,14 @@ import {
 } from "./admitted-run-context.js";
 import { createDeferredEmbeddedRunLifecycleManager } from "./embedded-agent-runner/run/deferred-lifecycle-owner.js";
 import {
-  clearActiveEmbeddedRun,
   isEmbeddedAgentRunHandleActive,
   resolveActiveEmbeddedRunOwner,
-  setActiveEmbeddedRun,
 } from "./embedded-agent-runner/runs.js";
-import { createEmbeddedRunHandle } from "./embedded-agent-runner/runs.test-support.js";
+import {
+  clearTestEmbeddedRun as clearActiveEmbeddedRun,
+  registerTestEmbeddedRun as setActiveEmbeddedRun,
+  createEmbeddedRunHandle,
+} from "./embedded-agent-runner/runs.test-support.js";
 import { withPreparedEmbeddedRunToolAuthority } from "./harness/tool-authority.runtime.js";
 import {
   installSessionPlacementAdmissionProvider,
@@ -56,7 +58,7 @@ async function fromParent(
     agentId: "main",
     runId: "parent-run",
     workspaceDir: "/unused-parent-workspace",
-    config: {},
+    config: { session: { store: sessionTarget.storePath } },
     provider: "openai",
     modelId: "gpt-test",
   };
@@ -179,7 +181,7 @@ describe("independent placement caller scope", () => {
 
   it("registers the direct CLI handoff under its own placement lifecycle", async () => {
     const input = turn("child-cli-run");
-    const lifecycle = createDeferredEmbeddedRunLifecycleManager(input);
+    let lifecycle: ReturnType<typeof createDeferredEmbeddedRunLifecycleManager> | undefined;
     uninstall = installSessionPlacementAdmissionProvider(
       createWorkerSessionTurnPlacementProvider({
         placements,
@@ -197,6 +199,7 @@ describe("independent placement caller scope", () => {
           },
           async (assertCurrent) => {
             assertCurrent();
+            lifecycle = createDeferredEmbeddedRunLifecycleManager(input);
             lifecycle.handoffToCli();
             expect(resolveActiveEmbeddedRunOwner(SESSION_ID)?.runId).toBe(input.runId);
             await lifecycle.complete();
@@ -208,7 +211,7 @@ describe("independent placement caller scope", () => {
       expect(isEmbeddedAgentRunHandleActive(SESSION_ID)).toBe(false);
       expect(placements.get(SESSION_ID)?.turnClaim).toBeNull();
     } finally {
-      await lifecycle.complete();
+      await lifecycle?.complete();
       input.preparedRunAdmission.close();
     }
   });

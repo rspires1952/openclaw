@@ -17,6 +17,7 @@ import {
   isSubagentSessionKey,
   normalizeMainKey,
 } from "../../routing/session-key.js";
+import { updateSessionControllerSourcePolicy } from "../../sessions/session-controller.mailbox.js";
 import { hasControlCommand } from "../command-detection.js";
 import {
   isNativeCommandTurn,
@@ -44,7 +45,9 @@ import {
   resolveInboundUserContextPromptJoiner,
 } from "./inbound-meta.js";
 import { buildReplyPromptEnvelope, buildReplyPromptEnvelopeBase } from "./prompt-prelude.js";
+import { resolveQueueSettings } from "./queue/settings-runtime.js";
 import { resolveReplyOperationRunState } from "./reply-operation-run-state.js";
+import { readReplySourceInput } from "./reply-source-binding.js";
 import { resolveRuntimePolicySessionKey } from "./runtime-policy-session-key.js";
 import {
   resolveBareResetBootstrapFileAccess,
@@ -260,6 +263,27 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
   const softResetTriggered = command.softResetTriggered === true;
   const softResetTail = command.softResetTail?.trim() ?? "";
   const effectiveResetTriggered = resetTriggered || softResetTriggered;
+  const sourceInput = readReplySourceInput(opts);
+  if (sourceInput) {
+    const policy = useFastReplyRuntime
+      ? { mode: "collect" as const, debounceMs: 0, cap: 1, dropPolicy: "summarize" as const }
+      : resolveQueueSettings({
+          cfg,
+          channel: sessionCtx.Provider,
+          sessionEntry,
+          inlineMode: effectiveQueueMode,
+          inlineOptions: params.perMessageQueueOptions,
+        });
+    updateSessionControllerSourcePolicy(sourceInput, {
+      ...policy,
+      mode:
+        isHeartbeat || inboundEventKind === "room_event"
+          ? "followup"
+          : effectiveResetTriggered
+            ? "interrupt"
+            : policy.mode,
+    });
+  }
   const hasCurrentReplyTargetContext =
     hasReplyTargetContext(ctx) || hasReplyTargetContext(sessionCtx);
   const isWholeMessageCommand =

@@ -26,9 +26,9 @@ import type { ManagedWorktreeRecord } from "./types.js";
 
 const mocks = vi.hoisted(() => ({
   placementService: vi.fn(),
-  isSessionWorkAdmissionActive: vi.fn(),
-  isSessionLifecycleMutationActive: vi.fn(),
-  runExclusiveSessionLifecycleMutation: vi.fn(),
+  isSessionControllerWorkActive: vi.fn(),
+  isSessionMutationActive: vi.fn(),
+  runSessionMutation: vi.fn(),
 }));
 
 const readOwnersInWorker = sessionReads.readResolvedSessionStoreTargetsInWorker;
@@ -54,11 +54,11 @@ vi.mock("../../gateway/session-worker-placement-context.js", () => ({
     workerSessionPlacementService: mocks.placementService(),
   }),
 }));
-vi.mock("../../sessions/session-lifecycle-admission.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../sessions/session-lifecycle-admission.js")>()),
-  isSessionWorkAdmissionActive: mocks.isSessionWorkAdmissionActive,
-  isSessionLifecycleMutationActive: mocks.isSessionLifecycleMutationActive,
-  runExclusiveSessionLifecycleMutation: mocks.runExclusiveSessionLifecycleMutation,
+// mock-isolation: GC tests select explicit controller activity and mutation facts.
+vi.mock("../../sessions/session-controller.lifecycle.js", () => ({
+  isSessionControllerWorkActive: mocks.isSessionControllerWorkActive,
+  isSessionMutationActive: mocks.isSessionMutationActive,
+  runSessionMutation: mocks.runSessionMutation,
 }));
 
 function target(
@@ -91,11 +91,9 @@ beforeEach(() => {
       release: () => {},
     }),
   });
-  mocks.isSessionWorkAdmissionActive.mockReturnValue(false);
-  mocks.isSessionLifecycleMutationActive.mockReturnValue(false);
-  mocks.runExclusiveSessionLifecycleMutation.mockImplementation(
-    (_operation, { run }: { run: () => Promise<unknown> }) => run(),
-  );
+  mocks.isSessionControllerWorkActive.mockReturnValue(false);
+  mocks.isSessionMutationActive.mockReturnValue(false);
+  mocks.runSessionMutation.mockImplementation(({ run }: { run: () => Promise<unknown> }) => run());
   readOwners.mockImplementation(({ sessionKeys }: { sessionKeys: readonly string[] }) =>
     Promise.resolve(new Map(sessionKeys.map((key) => [key, target(key)]))),
   );
@@ -253,11 +251,9 @@ describe("createManagedWorktreeOwnerPolicy", () => {
     signal,
   }) => {
     const lifecycle = await vi.importActual<
-      typeof import("../../sessions/session-lifecycle-admission.js")
-    >("../../sessions/session-lifecycle-admission.js");
-    mocks.runExclusiveSessionLifecycleMutation.mockImplementation(
-      lifecycle.runExclusiveSessionLifecycleMutation,
-    );
+      typeof import("../../sessions/session-controller.lifecycle.js")
+    >("../../sessions/session-controller.lifecycle.js");
+    mocks.runSessionMutation.mockImplementation(lifecycle.runSessionMutation);
     const key = cleanupRecord.ownerId;
     const sessionId = "queued-cleanup-session";
     readOwners.mockResolvedValue(
@@ -266,7 +262,8 @@ describe("createManagedWorktreeOwnerPolicy", () => {
     const cfg = { session: { store: "/worktree-cleanup-policy/sessions.json" } };
     const entered = createDeferred();
     const release = createDeferred();
-    const blocker = lifecycle.runExclusiveSessionLifecycleMutation("archive", {
+    const blocker = lifecycle.runSessionMutation({
+      policy: "wait",
       scope: resolveSessionStorePathCore(cfg.session.store, { agentId: "main" }),
       identities: [key, sessionId],
       run: async () => {
@@ -323,7 +320,7 @@ describe("createManagedWorktreeOwnerPolicy", () => {
   });
 
   it("exempts its own cleanup fence while preserving new work admission", async () => {
-    mocks.isSessionLifecycleMutationActive.mockReturnValue(true);
+    mocks.isSessionMutationActive.mockReturnValue(true);
     const policy = createManagedWorktreeOwnerPolicy({});
     const key = cleanupRecord.ownerId;
     await policy.withOwnerCleanup(cleanupRecord, async (withOwnerMutation) => {
@@ -331,7 +328,7 @@ describe("createManagedWorktreeOwnerPolicy", () => {
       await withOwnerMutation(async () => {
         expect(policy.readOwnerState("session", key)).toBe("retired");
         expect(policy.readOwnerState("session", `${key}:other`)).toBe("active");
-        mocks.isSessionWorkAdmissionActive.mockReturnValue(true);
+        mocks.isSessionControllerWorkActive.mockReturnValue(true);
         expect(policy.readOwnerState("session", key)).toBe("active");
       });
     });

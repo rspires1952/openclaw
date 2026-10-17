@@ -6,7 +6,6 @@ import { createDeferredCore } from "../../shared/deferred.js";
 export async function waitForRestartRecoveryProgress(params: {
   agentId?: string;
   sessionKey: string;
-  ownerRelease?: Promise<void>;
   signal?: AbortSignal;
 }): Promise<void> {
   const changed = createDeferredCore();
@@ -22,12 +21,10 @@ export async function waitForRestartRecoveryProgress(params: {
   // Retry deferred dispatches without spinning; also cover a commit that won
   // just before subscription. Every wake revalidates the session and owner.
   try {
-    await raceWithTimeout(
-      params.ownerRelease ? Promise.race([changed.promise, params.ownerRelease]) : changed.promise,
-      DEFAULT_RECOVERY_DELAY_MS,
-      () => undefined,
-      { ref: false, signal: params.signal },
-    );
+    await raceWithTimeout(changed.promise, DEFAULT_RECOVERY_DELAY_MS, () => undefined, {
+      ref: false,
+      signal: params.signal,
+    });
   } finally {
     unsubscribe();
   }

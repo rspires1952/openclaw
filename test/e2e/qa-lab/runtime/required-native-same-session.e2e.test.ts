@@ -649,7 +649,7 @@ it.skipIf(process.platform === "win32")(
                 })),
               });
               expect(pendingHistory.items).toContainEqual(
-                // queued is an optional in-memory chatQueuedTurns hint. The
+                // queued reflects optional controller source readiness. The
                 // canonical queued receipt, then actual native HTTP entry, own this proof.
                 expect.objectContaining({ runId: markers.B, state: "queued" }),
               );

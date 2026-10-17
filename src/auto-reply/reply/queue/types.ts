@@ -23,6 +23,10 @@ import type { QueueDropPolicy } from "../../../config/types.queue.js";
 import type { GatewayLocalUserIngress } from "../../../gateway/local-user-ingress.js";
 import type { MediaFact } from "../../../media/media-facts.js";
 import type { PromptImageOrderEntry } from "../../../media/prompt-image-order.js";
+import type {
+  SessionControllerInput,
+  SessionControllerMailboxClaim,
+} from "../../../sessions/session-controller.mailbox.js";
 import type { UserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.types.js";
 import type { ExplicitSkillSelection } from "../../../skills/types.js";
 import type {
@@ -111,6 +115,10 @@ type FollowupRunObservers = Pick<
 };
 
 export type FollowupRun = {
+  /** Controller-owned immutable input identity and mutable source custody. */
+  controllerInput?: SessionControllerInput;
+  /** Execution view of an already selected compatible batch, never another source. */
+  controllerClaim?: SessionControllerMailboxClaim;
   /** External-turn eligibility; queued execution refreshes the session-selected profile. */
   personalBootstrapEligible?: boolean;
   prompt: string;
@@ -165,12 +173,6 @@ export type FollowupRun = {
   forceCodeModeTools?: boolean;
   /** Force individual drain; never merge this run into a collect batch. */
   disableCollectBatching?: boolean;
-  /** Pending same-turn acceptance while this item remains parked in FIFO order. */
-  steerPending?: {
-    phase: "waiting" | "injecting";
-    predecessor: Promise<boolean>;
-    settle: (accepted: boolean) => void;
-  };
   /** Internal Goal nudge; admission must still observe this exact active Goal. */
   goalContinuation?: import("../goal-continuation.js").GoalContinuation;
   /** Internal marker for the one-shot stranded final recovery retry. */
@@ -330,20 +332,30 @@ export type InternalFollowupRun = FollowupRun & {
 };
 
 export function isFollowupRunAborted(
-  run: Pick<FollowupRun, "abortSignal" | "queueAbortSignal" | "operatorAuthority">,
+  run: Pick<
+    FollowupRun,
+    "abortSignal" | "queueAbortSignal" | "operatorAuthority" | "controllerInput"
+  >,
 ): boolean {
   return (
-    run.abortSignal?.aborted === true ||
+    (!run.controllerInput?.custody.cancellationRetired &&
+      (run.abortSignal?.aborted === true || run.controllerInput?.abortSignal.aborted === true)) ||
     run.queueAbortSignal?.aborted === true ||
     run.operatorAuthority?.signal?.aborted === true
   );
 }
 
 export function resolveFollowupAbortSignal(
-  run: Pick<FollowupRun, "abortSignal" | "queueAbortSignal" | "operatorAuthority">,
+  run: Pick<
+    FollowupRun,
+    "abortSignal" | "queueAbortSignal" | "operatorAuthority" | "controllerInput"
+  >,
 ): AbortSignal | undefined {
-  const signals = [run.abortSignal, run.queueAbortSignal, run.operatorAuthority?.signal].filter(
-    (signal): signal is AbortSignal => signal !== undefined,
-  );
+  const signals = [
+    run.controllerInput?.custody.cancellationRetired ? undefined : run.abortSignal,
+    run.controllerInput?.custody.cancellationRetired ? undefined : run.controllerInput?.abortSignal,
+    run.queueAbortSignal,
+    run.operatorAuthority?.signal,
+  ].filter((signal): signal is AbortSignal => signal !== undefined);
   return signals.length > 1 ? AbortSignal.any(signals) : signals[0];
 }

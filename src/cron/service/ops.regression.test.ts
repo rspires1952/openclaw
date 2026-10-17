@@ -20,7 +20,6 @@ import {
 import { resolveCronMutationCommitGuard } from "../../gateway/server-methods/cron-caller-scope.js";
 import type { GatewayRequestContext } from "../../gateway/server-methods/types.js";
 import {
-  clearCommandLane,
   enqueueCommandInLane,
   getTotalQueueSize,
   setCommandLaneConcurrency,
@@ -74,7 +73,6 @@ describe("cron service ops regressions", () => {
     resetGatewayWorkAdmission();
 
     const childLane = "cron-manual-admission-child";
-    clearCommandLane(childLane);
     setCommandLaneConcurrency(childLane, 1);
     const store = opsRegressionFixtures.makeStorePath();
     const now = Date.parse("2026-02-06T10:05:00.000Z");
@@ -127,7 +125,6 @@ describe("cron service ops regressions", () => {
       requestRoot?.release();
       enterRunner.resolve();
       await Promise.allSettled(state.queuedManualRuns.values());
-      clearCommandLane(childLane);
       resetGatewayWorkAdmission();
     }
   });

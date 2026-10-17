@@ -29,6 +29,10 @@ import { formatErrorMessage } from "../../infra/errors.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import type { ProviderRuntimeModel } from "../../plugins/provider-runtime-model.types.js";
 import { enqueueCommandInLane } from "../../process/command-queue.js";
+import type { ReplyOperation } from "../../sessions/session-controller.contracts.js";
+import { getCurrentSessionControllerOwner } from "../../sessions/session-controller.lifecycle.js";
+import { assertSessionControllerOperation } from "../../sessions/session-controller.state.js";
+import type { SessionWatchdogWait } from "../../sessions/session-controller.watchdog.js";
 import { normalizeOptionalAgentRuntimeId } from "../agent-runtime-id.js";
 import { resolveSessionAgentIds } from "../agent-scope.js";
 import { maybeCompactAgentHarnessSession } from "../harness/compaction.js";
@@ -48,7 +52,7 @@ import {
   type AcceptedCompactionSuccessor,
 } from "./compaction-successor.js";
 import { runContextEngineMaintenance } from "./context-engine-maintenance.js";
-import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
+import { resolveGlobalLane } from "./lanes.js";
 import { log } from "./logger.js";
 import { declarePromptHistoryRewrite } from "./prompt-cache-observability.js";
 import {
@@ -71,6 +75,8 @@ type QueuedCompactionHostCommit = {
 
 /** Host-only bookkeeping, deliberately separate from plugin compaction parameters. */
 export type QueuedCompactionHostOptions = CompactionRequestConstraints & {
+  /** Exact in-band turn, never forwarded as plugin authority. */
+  replyOperation?: ReplyOperation;
   sourceAuthority: AgentHarnessCompactionSourceAuthority;
   assertActive?: SessionSourceAssertion;
   transcriptBytePreflightHarness?: "codex";
@@ -125,19 +131,48 @@ function enqueueCompactionInLanes<T>(
   >,
   run: () => Promise<T>,
 ): Promise<T> {
-  const sessionLane = resolveSessionLane(params.sessionKey?.trim() || params.sessionId);
   const globalLane = resolveGlobalLane(params.lane, params);
   const enqueueGlobal =
     params.enqueue ?? ((task, opts) => enqueueCommandInLane(globalLane, task, opts));
-  const options = {
-    abortSignal: params.abortSignal,
-    sessionTarget: {
-      agentId: params.agentId,
-      sessionKey: params.sessionKey,
-      sessionId: params.sessionId,
-    },
+  const operation = getCurrentSessionControllerOwner();
+  let queued = true;
+  let wait: SessionWatchdogWait | undefined;
+  const beginWait = () => {
+    if (wait || !queued) {
+      return;
+    }
+    wait = operation?.watchdog.beginWait({
+      kind: "global_capacity",
+      isCurrent: () => {
+        if (!queued || !operation) {
+          return false;
+        }
+        assertSessionControllerOperation(operation);
+        return true;
+      },
+    });
   };
-  return enqueueCommandInLane(sessionLane, () => enqueueGlobal(run, options), options);
+  const finishWait = () => {
+    queued = false;
+    wait?.close();
+  };
+  try {
+    return enqueueGlobal(
+      async () => {
+        finishWait();
+        params.abortSignal?.throwIfAborted();
+        if (operation) {
+          assertSessionControllerOperation(operation);
+        }
+        operation?.watchdog.progress("semantic", "compaction:capacity_admitted");
+        return await run();
+      },
+      { abortSignal: params.abortSignal, onQueued: beginWait },
+    ).finally(finishWait);
+  } catch (error) {
+    finishWait();
+    throw error;
+  }
 }
 
 export async function runPrimaryNativeCompactionInLanes<T>(

@@ -624,6 +624,9 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
     }),
     onSelectionChange: revisions.onSelectionChange,
     onFactsChange: revisions.onFactsChange,
+    get physicalPaths() {
+      return scope.physicalPaths;
+    },
     readPreparedRowContext: () =>
       disposed ? undefined : inOwnerContext(() => metadata.readPrepared(epoch)),
     readPreparedSpawnedBy,

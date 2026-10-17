@@ -28,7 +28,6 @@ import type { SystemAgentOperation } from "../../system-agent/operation-types.js
 import type { WizardSession } from "../../wizard/session.js";
 import type { AgentRuntimeApprovalAuthorityValidator } from "../agent-runtime-approval-authority.js";
 import type { InternalAgentTurnFacadeFactory } from "../agent-turn/internal-facade.types.js";
-import type { ChatAbortControllerEntry } from "../chat-abort.types.js";
 import type {
   GatewayDeferredChannelReload,
   GatewayHotReloadStatus,
@@ -317,9 +316,6 @@ type GatewayKernelContext = {
   ) => void;
   nodeRegistry: NodeRegistry;
   agentRunSeq: Map<string, number>;
-  chatAbortControllers: Map<string, ChatAbortControllerEntry>;
-  /** Cancel identities for turns waiting in the followup/collect queue. */
-  chatQueuedTurns: Map<string, import("../chat-queued-turns.js").QueuedChatTurnEntry>;
   chatRunState: ChatRunState;
   addChatRun: (sessionId: string, entry: ChatRunRegistration) => void;
   removeChatRun: (

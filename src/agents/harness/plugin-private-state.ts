@@ -3,8 +3,8 @@ import type { EmbeddedRunAttemptInternalParams } from "../embedded-agent-runner/
 export function withoutPluginHarnessPrivateState(
   params: EmbeddedRunAttemptInternalParams & { __openclawSourceReplyDeliveryRuntime?: unknown },
 ): Omit<import("./types.js").AgentHarnessAttemptParamsV2, "hostCapabilities"> {
-  // Keep mutable host-owned state behind one projection for every plugin handoff;
-  // separate projections can drift and expose authority on less common operations.
+  // Keep host admission and preparation state behind one projection for every handoff.
+  // The released replyOperation reference delegates to the same controller owner.
   const {
     admittedRunContext: _admittedRunContext,
     thinkingExplicit: _thinkingExplicit,
@@ -13,6 +13,7 @@ export function withoutPluginHarnessPrivateState(
     compactionCountOwner: _compactionCountOwner,
     completionCheck: _completionCheck,
     preparedSessionTarget: _preparedSessionTarget,
+    bindWatchdogAttempt: _bindWatchdogAttempt,
     onContextAccountingEvent: _onContextAccountingEvent,
     onCompactionRequestBudget: _onCompactionRequestBudget,
     contextEngineLogicalTurnLease: _contextEngineLogicalTurnLease,

@@ -13,10 +13,10 @@ import {
 import type { WorkerSessionPlacementRecord } from "../../gateway/worker-environments/placement-record.js";
 import { resolveSessionWorkerPlacementMutationError } from "../../gateway/worker-environments/session-placement-lifecycle.js";
 import {
-  isSessionLifecycleMutationActive,
-  isSessionWorkAdmissionActive,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
+  isSessionMutationActive,
+  isSessionControllerWorkActive,
+  runSessionMutation,
+} from "../../sessions/session-controller.lifecycle.js";
 import {
   sessionChanges,
   sessionChangeScopeAffectsStoredRows,
@@ -83,9 +83,8 @@ export function createManagedWorktreeOwnerPolicy(
         return "active";
       }
       if (
-        isSessionWorkAdmissionActive(scope, identities) ||
-        (!(ownsCleanup && cleanup.lifecycleHeld) &&
-          isSessionLifecycleMutationActive(scope, identities))
+        isSessionControllerWorkActive(scope, identities) ||
+        (!(ownsCleanup && cleanup.lifecycleHeld) && isSessionMutationActive(scope, identities))
       ) {
         return "active";
       }
@@ -251,7 +250,9 @@ export function createManagedWorktreeOwnerPolicy(
           // The registry claim protects Git work; final guards consume receipt-invalidated facts.
           return await cleanupOwner.run({ ...owner, placements }, () =>
             run((mutation, options) =>
-              runExclusiveSessionLifecycleMutation("worktree-cleanup", {
+              runSessionMutation({
+                diagnosticLabel: "worktree-cleanup",
+                policy: "wait",
                 scope,
                 identities,
                 signal: options?.settle ? undefined : signal,

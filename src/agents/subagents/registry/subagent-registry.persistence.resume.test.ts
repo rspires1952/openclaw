@@ -1,4 +1,5 @@
 import { setImmediate as nextTask } from "node:timers/promises";
+import { expectDefined } from "@openclaw/normalization-core";
 // Subagent registry persistence-resume tests cover restoring SQLite-backed child runs.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import "./subagent-registry.persistence.mocks.test-support.js";
@@ -13,7 +14,6 @@ import {
 } from "./subagent-registry.persistence-fixture.test-support.js";
 import { useAutoCleanupTempDirTracker } from "../../../../test/helpers/temp-dir.js";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../../../config/config.js";
-import type { ChatAbortControllerEntry } from "../../../gateway/chat-abort.types.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import { closeOpenClawStateDatabaseForTest as closeSeedStateDatabase } from "../../../state/openclaw-state-db.js";
 import "./subagent-registry.mocks.shared.js";
@@ -225,7 +225,6 @@ describe("subagent registry persistence resume", () => {
   it.each([
     "inactive drain error",
     "restart admission",
-    "restart before deadline",
     "restart before activation",
     "restart throwing source",
   ] as const)("settles or preserves a delivered wake after %s", async (failure) => {
@@ -234,11 +233,9 @@ describe("subagent registry persistence resume", () => {
     const waitingForActivation = failure === "restart before activation";
     let firstGatewayOpen = true;
     const firstGateway = {
-      chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
       resolveGatewayContext: () => (firstGatewayOpen ? (firstGateway as never) : undefined),
     };
     const replacementGateway = {
-      chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
       resolveGatewayContext: () => replacementGateway as never,
     };
     if (restarting) {
@@ -257,7 +254,10 @@ describe("subagent registry persistence resume", () => {
           rearmGeneration: 1,
         });
         const wakeRequester = vi.fn<WakeRequester>(async (params) => {
-          if (!restarting) {
+          if (!restarting || getGatewayContextResolver(params.settledEntry!)?.() === firstGateway) {
+            if (restarting) {
+              admission.markGatewayRestartDraining();
+            }
             throw new admission.GatewayDrainingError();
           }
           expect(getGatewayContextResolver(params.settledEntry!)?.()).toBe(replacementGateway);
@@ -303,16 +303,12 @@ describe("subagent registry persistence resume", () => {
         }
 
         if (restarting) {
-          // The earlier delivery released its root; the real deadline timer must
-          // cross fresh admission rather than inheriting live requester authority.
+          // A refused evaluation retains its receipt until a current Gateway activates it.
           const previousWork = settleOwnedWork;
           settleOwnedWork = undefined;
           await previousWork?.();
-          admission.markGatewayRestartDraining();
-          if (failure !== "restart before deadline" && !waitingForActivation) {
-            await vi.advanceTimersByTimeAsync(30_000);
-          }
-          expect(wakeRequester).not.toHaveBeenCalled();
+          await vi.advanceTimersByTimeAsync(30_000);
+          expect(wakeRequester).toHaveBeenCalledOnce();
           expect(mod.getSubagentRunByRunId(run.runId)?.requesterSettleWake).toEqual(
             run.requesterSettleWake,
           );
@@ -332,7 +328,7 @@ describe("subagent registry persistence resume", () => {
           settleOwnedWork = observeRootWork();
           if (waitingForActivation) {
             await vi.advanceTimersByTimeAsync(30_000);
-            expect(wakeRequester).not.toHaveBeenCalled();
+            expect(wakeRequester).toHaveBeenCalledOnce();
             expect(readPersistedRun(run.runId)?.requesterSettleWake).toEqual(
               run.requesterSettleWake,
             );
@@ -345,15 +341,16 @@ describe("subagent registry persistence resume", () => {
           expect(mod.getSubagentRunByRunId(run.runId)).toBe(recoveredRun);
           expect(retiredResolver?.()).toBeUndefined();
           await mod.testing.runSweeperTickForTests();
-          await vi.advanceTimersByTimeAsync(failure === "restart before deadline" ? 30_000 : 0);
+          await vi.advanceTimersByTimeAsync(0);
         }
         await settleSubagentRegistryPersistenceWork(() => settleOwnedWork?.(true));
-        expect(wakeRequester).toHaveBeenCalledOnce();
+        const expectedCalls = restarting ? 2 : 1;
+        expect(wakeRequester).toHaveBeenCalledTimes(expectedCalls);
         const restored = readPersistedRun(run.runId);
         expect(restored?.delivery).toMatchObject({ status: "delivered" });
         expect(restored?.requesterSettleWake).toBeUndefined();
         await mod.testing.sweepOnceForTests();
-        expect(wakeRequester).toHaveBeenCalledOnce();
+        expect(wakeRequester).toHaveBeenCalledTimes(expectedCalls);
       });
     } finally {
       admission.resetGatewayWorkAdmission();
@@ -376,11 +373,9 @@ describe("subagent registry persistence resume", () => {
       let oldFinished = 0;
       let firstGatewayOpen = true;
       const firstGateway = {
-        chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
         resolveGatewayContext: () => (firstGatewayOpen ? (firstGateway as never) : undefined),
       };
       const replacementGateway = {
-        chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
         resolveGatewayContext: () => replacementGateway as never,
       };
       vi.useFakeTimers();
@@ -413,8 +408,11 @@ describe("subagent registry persistence resume", () => {
                         status: "dispatching",
                         attemptCount: 3,
                       },
-                      (published) => {
-                        params.settledEntry = published[0]!;
+                      () => {
+                        params.settledEntry = expectDefined(
+                          mod.getSubagentRunByRunId(params.settledEntry.runId),
+                          "published requester wake",
+                        );
                       },
                     ),
                   );
@@ -612,8 +610,12 @@ describe("subagent registry persistence resume", () => {
   it("keeps restored recovery dormant until the Gateway lifecycle activates it", async () => {
     const wakeStarted = createDeferredCore();
     const waitStarted = createDeferredCore();
-    const wakeRequester = vi.fn(async () => {
+    const wakeRequester = vi.fn<WakeRequester>(async (params) => {
       wakeStarted.resolve();
+      await params.completeBatch(
+        [params.settledEntry],
+        params.settledEntry.requesterSettleWake?.rearmGeneration,
+      );
       return false;
     });
     vi.spyOn(requesterSettleModule, "maybeWakeRequesterAfterAllChildrenSettled").mockImplementation(
@@ -708,7 +710,6 @@ describe("subagent registry persistence resume", () => {
         let firstLifecycleOpen = true;
         const gatewayContext = {
           localEmbedded: true,
-          chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
           recoveryRuntime,
           resolveGatewayContext: vi.fn(),
         };
@@ -735,14 +736,10 @@ describe("subagent registry persistence resume", () => {
 
         // Activation's collector publications must settle before the manual sweep captures them.
         await settleSubagentRegistryPersistenceWork(() => settleOwnedWork?.(true));
-        const sweptWake = createDeferredCore<boolean>();
-        wakeRequester.mockImplementationOnce(() => {
-          sweptWake.resolve(false);
-          return sweptWake.promise;
-        });
-        await mod.testing.runSweeperTickForTests();
-        await sweptWake.promise;
         wakeRequester.mockClear();
+        // Cleanup never schedules another evaluation of an unchanged requester obligation.
+        await mod.testing.runSweeperTickForTests();
+        expect(wakeRequester).not.toHaveBeenCalled();
         expect(callGatewayModule.callGateway).toHaveBeenCalledTimes(1);
         expect(callGatewayModule.callGateway).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -765,7 +762,6 @@ describe("subagent registry persistence resume", () => {
         };
         const replacementGateway = {
           localEmbedded: true,
-          chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
           recoveryRuntime: replacementRuntime,
           resolveGatewayContext: () => replacementGateway as never,
         };
@@ -838,6 +834,8 @@ describe("subagent registry persistence resume", () => {
         expect(wakeRequester).toHaveBeenCalledTimes(2);
         expect(activeWakes).toBe(2);
         expect(maxActiveWakes).toBe(2);
+        await activateSubagentPersistenceRegistry(mod, callGatewayModule.callGateway);
+        expect(wakeRequester).toHaveBeenCalledTimes(2);
 
         wakeResolvers.shift()?.();
         await waitForCalls(3);
@@ -872,13 +870,27 @@ describe("subagent registry persistence resume", () => {
   ])(
     "settles a restored steered requester turn (yielded: $requesterYielded, superseded predecessor: $superseded, prepared: $prepared)",
     async ({ requesterYielded, superseded, prepared }) => {
-      const wakeRequester = vi.fn(async () => false);
+      const releaseWake = createDeferredCore();
+      const deliverWake = vi.fn();
+      const wakeRequester = vi.fn<WakeRequester>(async (params) => {
+        await releaseWake.promise;
+        if (!params.isSourceCurrent()) {
+          return false;
+        }
+        deliverWake();
+        await params.completeBatch(
+          [params.settledEntry],
+          params.settledEntry.requesterSettleWake?.rearmGeneration,
+          { delivered: true, path: "direct" },
+        );
+        return true;
+      });
       vi.spyOn(
         requesterSettleModule,
         "maybeWakeRequesterAfterAllChildrenSettled",
       ).mockImplementation(wakeRequester);
 
-      await withRegistryState(async (stateDir) => {
+      const inspectRestoredTurn = async (stateDir: string) => {
         const endedAt = Date.now();
         const run = createDeliveredWake("run-steered", undefined, {
           taskRunId: "run-original",
@@ -975,16 +987,23 @@ describe("subagent registry persistence resume", () => {
             requesterYieldBatch: true,
             afterRequesterYield: true,
           });
-          await vi.waitFor(() => expect(wakeRequester).toHaveBeenCalledOnce(), {
-            timeout: 1_000,
-            interval: 10,
-          });
+          expect(deliverWake).not.toHaveBeenCalled();
+          releaseWake.resolve();
+          await settleSubagentRegistryPersistenceWork(() => settleOwnedWork?.(true));
+          expect(deliverWake).toHaveBeenCalledOnce();
+          expect(readPersistedRun(run.runId)?.requesterSettleWake).toBeUndefined();
+          await mod.testing.runSweeperTickForTests();
+          await settleSubagentRegistryPersistenceWork(() => settleOwnedWork?.(true));
+          expect(deliverWake).toHaveBeenCalledOnce();
         } else {
           expect(restored?.requesterSettleWake).toBeUndefined();
           await nextTask();
           expect(wakeRequester).not.toHaveBeenCalled();
         }
-      });
+      };
+      await withRegistryState((stateDir) =>
+        inspectRestoredTurn(stateDir).finally(() => releaseWake.resolve()),
+      );
     },
   );
 });

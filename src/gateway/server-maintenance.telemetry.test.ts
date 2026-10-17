@@ -65,7 +65,6 @@ vi.mock("../media/store.js", () => ({
 
 vi.mock("./chat-abort.js", () => ({
   abortChatRunById: () => forbiddenDefaultAdapter("chat abort"),
-  removeChatAbortControllerEntry: () => forbiddenDefaultAdapter("chat abort removal"),
 }));
 
 vi.mock("./session-request-agent.js", () => ({

@@ -64,6 +64,10 @@ export async function prepareAgentContentPhase(params: {
   explicitRecipientSession?: ExplicitRecipientSession;
   knownAgents: string[];
   assertAdmissionCurrent?: () => void;
+  onTargetResolved?: (target: {
+    sessionKey?: string;
+    agentId?: string;
+  }) => boolean | void | Promise<boolean | void>;
 }) {
   const transcriptInputText = params.request.message.trim();
   let content: Awaited<ReturnType<typeof parseMessageWithAttachments>> = {
@@ -98,48 +102,6 @@ export async function prepareAgentContentPhase(params: {
       );
       return undefined;
     }
-  }
-
-  if (params.normalizedAttachments.length > 0) {
-    let baseProvider: string | undefined;
-    let baseModel: string | undefined;
-    let catalogAgentId = agentId;
-    let isConfirmedAcpSession = false;
-    if (params.requestedSessionKeyRaw) {
-      const target = resolveSessionStoreIdentity({
-        cfg: params.cfg,
-        sessionKey: params.requestedSessionKeyRaw,
-        agentId,
-      });
-      const session = await readAcpSessionEntryAsync({
-        cfg: params.cfg,
-        agentId: target.agentId,
-        sessionKey: target.canonicalKey,
-        assertCurrent: params.assertAdmissionCurrent,
-      });
-      params.assertAdmissionCurrent?.();
-      catalogAgentId = target.agentId;
-      const modelRef = resolveSessionModelRef(
-        session?.cfg ?? params.cfg,
-        session?.entry,
-        target.agentId,
-      );
-      baseProvider = modelRef.provider;
-      baseModel = modelRef.model;
-      isConfirmedAcpSession =
-        params.request.acpTurnSource === "manual_spawn" &&
-        isAcpSessionKey(params.requestedSessionKeyRaw) &&
-        session?.acp != null;
-    }
-    supportsInlineImages = isConfirmedAcpSession
-      ? true
-      : await resolveGatewayModelSupportsImages({
-          loadGatewayModelCatalog: params.context.loadGatewayModelCatalog,
-          loadGatewayModelCatalogSnapshot: params.context.loadGatewayModelCatalogSnapshot,
-          agentId: catalogAgentId,
-          provider: params.providerOverride || baseProvider,
-          model: params.modelOverride || baseModel,
-        });
   }
 
   const voiceWakeTrigger = normalizeOptionalString(params.request.voiceWakeTrigger) ?? "";
@@ -214,7 +176,50 @@ export async function prepareAgentContentPhase(params: {
     }
   }
 
+  params.assertAdmissionCurrent?.();
+  if ((await params.onTargetResolved?.({ sessionKey: requestedSessionKey, agentId })) === false) {
+    return undefined;
+  }
   if (params.normalizedAttachments.length > 0) {
+    let baseProvider: string | undefined;
+    let baseModel: string | undefined;
+    let catalogAgentId = agentId;
+    let isConfirmedAcpSession = false;
+    if (params.requestedSessionKeyRaw) {
+      const target = resolveSessionStoreIdentity({
+        cfg: params.cfg,
+        sessionKey: params.requestedSessionKeyRaw,
+        agentId,
+      });
+      const session = await readAcpSessionEntryAsync({
+        cfg: params.cfg,
+        agentId: target.agentId,
+        sessionKey: target.canonicalKey,
+        assertCurrent: params.assertAdmissionCurrent,
+      });
+      params.assertAdmissionCurrent?.();
+      catalogAgentId = target.agentId;
+      const modelRef = resolveSessionModelRef(
+        session?.cfg ?? params.cfg,
+        session?.entry,
+        target.agentId,
+      );
+      baseProvider = modelRef.provider;
+      baseModel = modelRef.model;
+      isConfirmedAcpSession =
+        params.request.acpTurnSource === "manual_spawn" &&
+        isAcpSessionKey(params.requestedSessionKeyRaw) &&
+        session?.acp != null;
+    }
+    supportsInlineImages = isConfirmedAcpSession
+      ? true
+      : await resolveGatewayModelSupportsImages({
+          loadGatewayModelCatalog: params.context.loadGatewayModelCatalog,
+          loadGatewayModelCatalogSnapshot: params.context.loadGatewayModelCatalogSnapshot,
+          agentId: catalogAgentId,
+          provider: params.providerOverride || baseProvider,
+          model: params.modelOverride || baseModel,
+        });
     params.assertAdmissionCurrent?.();
     try {
       content = await parseMessageWithAttachments(content.message, params.normalizedAttachments, {
@@ -226,6 +231,9 @@ export async function prepareAgentContentPhase(params: {
       });
       content.message = content.message.trim();
     } catch (err) {
+      // A retired request owns its terminal response even when media parsing
+      // fails while the captured input is being cancelled.
+      params.assertAdmissionCurrent?.();
       if (err instanceof AgentRequestReservationEndedError) {
         throw err;
       }

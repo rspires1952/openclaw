@@ -1,6 +1,6 @@
 // Keep the real scheduler, wake owner, preflight, busy guards, and SQLite stores.
-// Busy polls hold actual command-lane work; a fabricated skipped result misses this bug.
-// Model/channel I/O and late-admission activity are injected at their owned boundaries.
+// Busy polls hold real controller turns; a fabricated skipped result misses this bug.
+// Model/channel I/O is injected at its owned boundary.
 import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
@@ -24,14 +24,15 @@ import {
   setHeartbeatWakeHandler,
   setHeartbeatsEnabled,
 } from "../infra/heartbeat-wake.js";
+import * as heartbeatTargets from "../infra/outbound/targets.js";
 import {
   enqueueSystemEventWithReceipt,
   peekSystemEventEntries,
   resetSystemEventsForTest,
 } from "../infra/system-events.js";
-import { enqueueCommandInLane, getQueueSize, resetAllLanes } from "../process/command-queue.js";
+import { resetAllLanes } from "../process/command-queue.js";
 import { resetGatewayWorkAdmission } from "../process/gateway-work-admission.js";
-import { CommandLane } from "../process/lanes.js";
+import { withSessionTurn } from "../sessions/session-controller.admission.js";
 import { closeOpenClawAgentDatabasesAsync } from "../state/openclaw-agent-db.js";
 import {
   closeOpenClawStateDatabaseAsync,
@@ -67,6 +68,7 @@ async function createPollFixture(options: { scratch?: string; isolated?: boolean
   let cron: CronService | undefined;
   const releases: Array<() => void> = [];
   const scheduledRuns: Promise<void>[] = [];
+  const heldTurns: Promise<void>[] = [];
   async function close() {
     for (const release of releases) {
       release();
@@ -83,6 +85,7 @@ async function createPollFixture(options: { scratch?: string; isolated?: boolean
       if (vi.isFakeTimers()) {
         await vi.advanceTimersByTimeAsync(1_000);
       }
+      await Promise.allSettled(heldTurns);
       await Promise.allSettled(scheduledRuns);
       await cron?.waitForIdle();
       await vi.waitFor(() => expect(getActiveCronJobCount()).toBe(0));
@@ -137,6 +140,7 @@ async function createPollFixture(options: { scratch?: string; isolated?: boolean
       lastChannel: "telegram",
       lastProvider: "telegram",
       lastTo: "12345",
+      sessionId: "busy-session",
     });
     const reply = vi.fn<NonNullable<HeartbeatDeps["getReplyFromConfig"]>>().mockResolvedValue(
       createHeartbeatToolResponsePayload({
@@ -227,16 +231,33 @@ async function createPollFixture(options: { scratch?: string; isolated?: boolean
         (await writeCronJobScratch({ storePath, jobId: monitor.id, content: options.scratch })).ok,
       ).toBe(true);
     }
-    async function holdLane(lane: string) {
+    async function holdSession(key = sessionKey) {
       const started = createDeferred();
       const release = createDeferred();
       releases.push(() => release.resolve());
-      const work = enqueueCommandInLane(lane, async () => {
-        started.resolve();
-        await release.promise;
-      });
+      const work = withSessionTurn(
+        {
+          sessionKey: key,
+          sessionId: key === sessionKey ? "busy-session" : "busy-isolated-session",
+          agentId: "main",
+          storePath: sessionStorePath,
+        },
+        async (operation, signal) => {
+          operation?.setPhase("running");
+          const wait = operation?.watchdog.beginWait({
+            kind: "runtime_owned",
+            isCurrent: () => !signal.aborted,
+          });
+          started.resolve();
+          try {
+            await release.promise;
+          } finally {
+            wait?.close();
+          }
+        },
+      );
+      heldTurns.push(work);
       await started.promise;
-      expect(getQueueSize(lane)).toBe(1);
       return async () => {
         release.resolve();
         await work;
@@ -256,7 +277,7 @@ async function createPollFixture(options: { scratch?: string; isolated?: boolean
       waitForRequest,
       finished,
       waitForFinished,
-      holdLane,
+      holdSession,
       tick: () => {
         if (!ownedState) {
           throw new Error("Expected the constructed cron state");
@@ -298,10 +319,10 @@ describe("native heartbeat busy poll settlement", () => {
         waitForRequest,
         finished,
         waitForFinished,
-        holdLane,
+        holdSession,
         tick,
       }) => {
-        const releaseMain = await holdLane(CommandLane.Main);
+        const releaseSession = await holdSession();
         const firstTick = monitor.state.nextRunAtMs!;
         await vi.advanceTimersByTimeAsync(firstTick - Date.now());
         const firstRun = tick();
@@ -361,7 +382,7 @@ describe("native heartbeat busy poll settlement", () => {
         expect(finished()).toHaveLength(1);
         expect(runOnce).toHaveBeenCalledOnce();
         expect(reply).not.toHaveBeenCalled();
-        await releaseMain();
+        await releaseSession();
         await vi.advanceTimersByTimeAsync(nextTick - Date.now() - 1);
         expect(runOnce).toHaveBeenCalledOnce();
         await vi.advanceTimersByTimeAsync(1);
@@ -384,7 +405,7 @@ describe("native heartbeat busy poll settlement", () => {
     );
   });
 
-  it("keeps cron-in-progress and native force semantics while a direct manual wake still retries", async () => {
+  it("retires a forced native poll on a busy session while a direct manual wake still retries", async () => {
     await withPollFixture(
       async ({
         cron,
@@ -395,9 +416,9 @@ describe("native heartbeat busy poll settlement", () => {
         request,
         waitForRequest,
         finished,
-        holdLane,
+        holdSession,
       }) => {
-        const releaseCron = await holdLane(CommandLane.CronNested);
+        const releaseSession = await holdSession();
         const forced = cron.run(monitor.id, "force");
         await waitForRequest(1);
         await vi.advanceTimersByTimeAsync(250);
@@ -413,7 +434,7 @@ describe("native heartbeat busy poll settlement", () => {
         );
         expect(finished()[0]).toMatchObject({
           status: "skipped",
-          error: "heartbeat skipped: cron-in-progress",
+          error: "heartbeat skipped: requests-in-flight",
         });
         const settled = vi.fn();
         const manual = requestHeartbeatAndWait({
@@ -428,7 +449,7 @@ describe("native heartbeat busy poll settlement", () => {
         expect(settled).not.toHaveBeenCalled();
         expect(reply).not.toHaveBeenCalled();
         expect(runOnce).toHaveBeenCalledTimes(2);
-        await releaseCron();
+        await releaseSession();
         await vi.advanceTimersByTimeAsync(1_000);
         await expect(manual).resolves.toMatchObject({ status: "ran" });
         expect(reply).toHaveBeenCalledOnce();
@@ -448,9 +469,9 @@ describe("native heartbeat busy poll settlement", () => {
         request,
         waitForRequest,
         finished,
-        holdLane,
+        holdSession,
       }) => {
-        const releaseMain = await holdLane(CommandLane.Main);
+        const releaseSession = await holdSession();
         const text = "Reminder: Check the retained reminder";
         enqueueSystemEventWithReceipt(text, {
           sessionKey,
@@ -468,7 +489,7 @@ describe("native heartbeat busy poll settlement", () => {
         expect(finished()).toHaveLength(0);
         expect(peekSystemEventEntries(sessionKey).map((entry) => entry.text)).toContain(text);
         expect(reply).not.toHaveBeenCalled();
-        await releaseMain();
+        await releaseSession();
         await vi.advanceTimersByTimeAsync(60_000);
         await expect(parent).resolves.toMatchObject({ ok: true, ran: true });
         expect(finished()).toHaveLength(1);
@@ -484,7 +505,7 @@ describe("native heartbeat busy poll settlement", () => {
 
   it("coalesces a native monitor with a task, retains the exact payload, and settles both parents on failure", async () => {
     await withPollFixture(
-      async ({ cron, monitor, reply, runOnce, request, waitForRequest, finished, holdLane }) => {
+      async ({ cron, monitor, reply, runOnce, request, waitForRequest, finished, holdSession }) => {
         reply.mockImplementationOnce(async (_ctx, options) => {
           setHeartbeatAgentTurnStatus(options, "failed");
           return undefined;
@@ -503,7 +524,7 @@ describe("native heartbeat busy poll settlement", () => {
           { systemOwned: true },
         );
         const task = "job" in added ? added.job : added;
-        const releaseMain = await holdLane(CommandLane.Main);
+        const releaseSession = await holdSession();
         const parents = [cron.run(monitor.id, "force"), cron.run(task.id, "force")];
         // Polling with vi.waitFor advances the coalescer while SQLite admission is still pending.
         await waitForRequest(2);
@@ -517,7 +538,7 @@ describe("native heartbeat busy poll settlement", () => {
         });
         expect(finished()).toHaveLength(0);
         expect(reply).not.toHaveBeenCalled();
-        await releaseMain();
+        await releaseSession();
         await vi.advanceTimersByTimeAsync(60_000);
         await expect(Promise.all(parents)).resolves.toEqual([
           expect.objectContaining({ ok: true, ran: true }),
@@ -541,35 +562,39 @@ describe("native heartbeat busy poll settlement", () => {
       async ({
         cron,
         monitor,
-        deps,
+        sessionKey,
         reply,
         runOnce,
         request,
         waitForRequest,
         finished,
-        holdLane,
+        holdSession,
       }) => {
-        // The wake-stage check is clear; the second check is in preparation after
-        // delivery resolution. This is the actual late admission boundary.
-        deps.isReplyRunActive = vi
-          .fn()
-          .mockReturnValueOnce(false)
-          .mockReturnValueOnce(true)
-          .mockReturnValue(false);
+        // The wake-stage check is clear; a real controller turn starts while
+        // delivery resolution yields, before isolated admission checks again.
+        const resolveTarget = heartbeatTargets.resolveHeartbeatDeliveryTargetWithSessionRoute;
+        let releaseSession: (() => Promise<void>) | undefined;
+        vi.spyOn(
+          heartbeatTargets,
+          "resolveHeartbeatDeliveryTargetWithSessionRoute",
+        ).mockImplementationOnce(async (...args) => {
+          const target = await resolveTarget(...args);
+          releaseSession = await holdSession(`${sessionKey}:heartbeat`);
+          return target;
+        });
         const parent = cron.run(monitor.id, "force");
         await waitForRequest(1);
         expect(request).toHaveBeenCalledOnce();
         await vi.advanceTimersByTimeAsync(250);
         await runOnce.mock.results[0]?.value;
-        expect(deps.isReplyRunActive).toHaveBeenCalledTimes(2);
+        expect(releaseSession).toBeTypeOf("function");
         expect(finished()).toHaveLength(0);
         expect(reply).not.toHaveBeenCalled();
-        const releaseMain = await holdLane(CommandLane.Main);
         await vi.advanceTimersByTimeAsync(60_000);
         expect(runOnce).toHaveBeenCalledTimes(2);
         await runOnce.mock.results[1]?.value;
         expect(finished()).toHaveLength(0);
-        await releaseMain();
+        await releaseSession?.();
         await vi.advanceTimersByTimeAsync(60_000);
         await expect(parent).resolves.toMatchObject({ ok: true, ran: true });
         expect(finished()[0]?.error).toBeUndefined();

@@ -5,6 +5,8 @@ import { SESSION_ROUTING_CHANGED_ERROR_REASON } from "../../config/sessions/main
 import { hasRestartRecoveryTerminalRun } from "../../config/sessions/restart-recovery-state.js";
 import { isSessionTranscriptProjectionUnavailableError } from "../../config/sessions/session-transcript-projection-error.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
+import { captureSessionTarget } from "../../sessions/session-controller.lifecycle.js";
+import { hasRpcSource } from "../../sessions/session-controller.rpc-sources.js";
 import { sessionDeliveryChannel } from "../../utils/delivery-context.read.js";
 import { setGatewayDedupeEntry } from "../agent-turn/agent-job.js";
 import { createChatAbortOps } from "../chat-abort-ops.js";
@@ -66,10 +68,7 @@ type ChatSendRetryParams = Pick<
     | "sessionKey"
     | "storePath"
   >;
-  context: Pick<
-    GatewayRequestHandlerOptions["context"],
-    "dedupe" | "chatRunState" | "chatAbortControllers" | "chatQueuedTurns"
-  >;
+  context: Pick<GatewayRequestHandlerOptions["context"], "dedupe" | "chatRunState">;
   respond: GatewayRequestHandlerOptions["respond"];
 };
 
@@ -116,14 +115,14 @@ export function resolveChatSendRequestConflict(
   ) {
     return conflict(true);
   }
-  const ownsPendingReservation =
+  const ownPendingAttempt =
     ownPendingAttemptId !== undefined &&
     readPreRegisteredRun({
       key: session.pendingChatSendKey,
       entry: entries[1],
       keyPrefix: PENDING_CHAT_SEND_DEDUPE_PREFIX,
     })?.payload.attemptId === ownPendingAttemptId;
-  const retryEntries = ownsPendingReservation ? entries.slice(0, 1) : entries;
+  const retryEntries = ownPendingAttempt ? entries.slice(0, 1) : entries;
   if (
     !comparison &&
     request.requestIdentity !== undefined &&
@@ -136,8 +135,7 @@ export function resolveChatSendRequestConflict(
     sameDurableSource ||
     hasRestartRecoveryTerminalRun(session.entry, session.clientRunId) ||
     context.chatRunState.hasAbortMarker(session.clientRunId) ||
-    (!ownsPendingReservation && context.chatAbortControllers.has(session.clientRunId)) ||
-    context.chatQueuedTurns?.has(session.clientRunId);
+    (!ownPendingAttempt && hasRpcSource(session.clientRunId));
   if (!knownRetry) {
     return undefined;
   }
@@ -222,16 +220,27 @@ export function respondChatSendRetry(
     respond(true, payload, undefined, { cached: true, runId: clientRunId });
     return true;
   }
+  const accepted = context.dedupe.get(`chat:${clientRunId}`);
+  if (
+    accepted?.ok === true &&
+    accepted.effectAccepted === true &&
+    !hasRestartRecoveryTerminalRun(session.entry, clientRunId) &&
+    accepted.requestIdentity === params.request.requestIdentity &&
+    accepted.payload === undefined &&
+    accepted.error === undefined
+  ) {
+    respond(true, { runId: clientRunId, status: "in_flight" as const }, undefined, {
+      cached: true,
+      runId: clientRunId,
+    });
+    return true;
+  }
   const pending = readPreRegisteredRun({
     key: pendingChatSendKey,
     entry: context.dedupe.get(pendingChatSendKey),
     keyPrefix: PENDING_CHAT_SEND_DEDUPE_PREFIX,
   });
-  if (
-    pending ||
-    context.chatAbortControllers.has(clientRunId) ||
-    context.chatQueuedTurns?.has(clientRunId)
-  ) {
+  if (pending || hasRpcSource(clientRunId)) {
     respond(true, { runId: clientRunId, status: "in_flight" as const }, undefined, {
       cached: true,
       runId: clientRunId,
@@ -272,6 +281,8 @@ export async function runChatSendPreAdmission(
     ).entry;
   const resolveClaim = (currentEntry: typeof entry, warn: (message: string) => void) =>
     resolveDurableChatClaim({
+      agentId: session.agentId,
+      resolveGatewayContext: context.resolveGatewayContext,
       canonicalSessionKey: sessionKey,
       cfg,
       clientRunId,
@@ -404,6 +415,8 @@ export async function runChatSendPreAdmission(
       respondChatSessionRoutingChanged(respond);
       return false;
     }
+    const stopRequester = resolveChatAbortRequester(client);
+
     const stopStorePath = session.readSource?.path ?? storePath;
     const guard: { failure?: { error: unknown } } = {};
     const assertCurrent = () => {
@@ -460,7 +473,25 @@ export async function runChatSendPreAdmission(
         defaultAgentId: tryResolveSessionCompatibilityOwnerAgentId(cfg, sessionKey),
         abortOrigin: "stop-command",
         stopReason: "stop",
-        requester: resolveChatAbortRequester(client),
+        requester: stopRequester,
+        stopSource: "channel-user",
+        // The controller keeps the selected store locator; persistence uses its physical DB.
+        controllerTargets: [
+          captureSessionTarget({
+            storeScope: storePath,
+            sessionKey,
+            aliases: [rawSessionKey],
+            agentId: selectedAgent.agentId,
+            incarnation: entry?.sessionId,
+          }),
+        ],
+        hookContext: {
+          sessionKey,
+          sessionEntry: entry,
+          sessionId: entry?.sessionId,
+          commandSource: "gateway:chat.send",
+          senderId: stopRequester.deviceId ?? stopRequester.connId,
+        },
         assertCurrent,
         beforeAbort,
         cascadeDescendants: true,
@@ -473,6 +504,7 @@ export async function runChatSendPreAdmission(
           throw abortedPartialPersistenceError(error, res.warning);
         }
       }
+      assertCurrent();
       // Descendant cancellation aggregates errors; preserve the admission reason.
       if (guard.failure) {
         throw abortedPartialPersistenceError(guard.failure.error, res.warning);

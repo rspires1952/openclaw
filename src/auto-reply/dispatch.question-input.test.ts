@@ -15,13 +15,13 @@ import {
   setEmbeddedQuestionBroker,
 } from "../infra/embedded-question-broker.js";
 import { resetGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import { createReplyOperation } from "../sessions/session-controller.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { dispatchInboundMessageWithRoutedChannelDispatcher } from "./dispatch.js";
 import { runReplyQuestionInput } from "./reply/agent-runner-question-input.js";
 import type { DispatchReplyFromConfig } from "./reply/dispatch-from-config.types.js";
 import { createQueueTestRun } from "./reply/queue.test-helpers.js";
 import { REPLY_OPERATION_RUN_STATE } from "./reply/reply-operation-run-state.js";
-import { createReplyOperation } from "./reply/reply-run-registry.js";
 import { prepareReplyToolAuthority } from "./reply/reply-tool-authority.js";
 import { buildTestCtx } from "./reply/test-ctx.js";
 import type { ReplyPayload } from "./types.js";
@@ -286,6 +286,11 @@ describe("routed channel question input delivery order", () => {
             });
             if (outcome === "terminal") {
               expect(result).toEqual({ handled: false });
+            } else if (outcome === "forbidden") {
+              expect(result).toMatchObject({
+                handled: false,
+                refusedNotice: { text: expect.any(String) },
+              });
             } else {
               expect(result).toMatchObject({ handled: true, payload: { isError: true } });
             }

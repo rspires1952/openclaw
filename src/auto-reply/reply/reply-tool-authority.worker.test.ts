@@ -14,24 +14,25 @@ import {
 } from "../../config/sessions/session-transcript-worker-resources.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import * as sessionReaders from "../../gateway/session-utils-store-worker.js";
+import {
+  acknowledgeReplySessionTransition,
+  captureReplyOperationSessionReader,
+  getReplyOperationSessionReader,
+} from "../../sessions/session-controller.session-reader.js";
+import { getSessionControllerEntryForOperation } from "../../sessions/session-controller.state.js";
+import { testing } from "../../sessions/session-controller.test-support.js";
+import { waitForReplyRunSuccessorAdmission } from "../../sessions/session-controller.wait.js";
 import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import { observeMainThreadSql } from "../../test-utils/main-thread-sql-spies.test-support.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
 import { createQueueTestRun } from "./queue.test-helpers.js";
-import { waitForReplyRunSuccessorAdmission } from "./reply-run-registry.js";
-import {
-  acknowledgeReplySessionTransition,
-  captureReplyOperationSessionReader,
-  getReplyOperationSessionReader,
-} from "./reply-run-registry.state.js";
 import { createTestReplyOperation } from "./reply-run-registry.test-helpers.js";
-import { testing } from "./reply-run-registry.test-support.js";
 import { prepareReplyToolAuthority } from "./reply-tool-authority.js";
 import { admitReplyTurn } from "./reply-turn-admission.js";
 
 afterEach(() => {
-  testing.resetReplyRunRegistry();
+  testing.resetSessionControllerForTest();
   vi.restoreAllMocks();
 });
 
@@ -243,6 +244,7 @@ it.each(["execution", "separate"] as const)(
       if (admitted.status !== "owned") {
         throw new Error("Fixture requires retained reply admission");
       }
+      const controller = getSessionControllerEntryForOperation(admitted.operation);
       const run = createQueueTestRun({ prompt: "authority after compaction" });
       Object.assign(run.run, {
         agentId: "main",
@@ -300,7 +302,7 @@ it.each(["execution", "separate"] as const)(
           );
         }
         admitted.operation.complete();
-        await waitForReplyRunSuccessorAdmission(executionKey, null);
+        await waitForReplyRunSuccessorAdmission(executionKey, null, { target: controller.target });
         discovery.mockClear();
         await expect(snapshot.fingerprintAsync(run.run)).rejects.toThrow();
         expect(discovery).not.toHaveBeenCalled();
@@ -308,7 +310,7 @@ it.each(["execution", "separate"] as const)(
         independent.close();
         discovery.mockRestore();
         admitted.operation.complete();
-        await waitForReplyRunSuccessorAdmission(executionKey, null);
+        await waitForReplyRunSuccessorAdmission(executionKey, null, { target: controller.target });
       }
     });
   },

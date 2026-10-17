@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
 import { loadTranscriptEvents } from "../../config/sessions/session-accessor.js";
 import { drainSessionStoreWriterQueuesForTest } from "../../config/sessions/store-writer-state.test-support.js";
 import * as transcript from "../../config/sessions/transcript.js";
+import type { ReplyOperation } from "../../sessions/session-controller.js";
 import { readModelFallbackNotice } from "../../shared/model-fallback-notice.js";
 import { disposeOpenClawAgentDatabaseByPath } from "../../state/openclaw-agent-db-disposal.js";
 import { closeOpenClawAgentDatabasesAsync } from "../../state/openclaw-agent-db.js";
@@ -13,7 +14,6 @@ import {
   agentAccountingPersistenceDiagnostic as primary,
   createAgentAccountingPersistenceFixture,
 } from "./agent-runner-result-accounting.persistence.test-support.js";
-import type { ReplyOperation } from "./reply-run-registry.js";
 
 // Runtime outcomes are fixed fixtures; completion, source fencing and canonical transcript writes are real.
 let root: string;

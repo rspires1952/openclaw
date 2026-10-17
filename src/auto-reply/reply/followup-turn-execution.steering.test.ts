@@ -14,12 +14,18 @@ import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/ses
 import { loadSessionTranscriptEvents } from "../../config/sessions/session-transcript-events.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import { createChatSendMessageInjectionStarter } from "../../gateway/server-methods/chat-send-message-injection.js";
+import { createRpcSourceForTest } from "../../gateway/test-helpers.rpc-source.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { getSessionControllerEntryForOperation } from "../../sessions/session-controller.identity.js";
+import {
+  beginReplyMessageInjectionTarget,
+  createReplyOperation,
+  captureCurrentReplyMessageInjectionTarget,
+} from "../../sessions/session-controller.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import type { ReplyPayload } from "../types.js";
 import type { AgentTurnParams } from "./agent-runner-execution.types.js";
-import type { AdmittedFollowupTurn } from "./followup-turn-admission.js";
 import {
   createFollowupTurnTestTypingController as createTypingController,
   createFollowupTurnTestTurn as createTurn,
@@ -27,18 +33,16 @@ import {
   getFollowupTurnTestState,
   resetFollowupTurnTestState,
 } from "./followup-turn-execution.test-support.js";
-import { enqueueFollowupRun, isFollowupRunAborted, scheduleFollowupDrain } from "./queue.js";
-import { clearFollowupQueueForTest, createQueueTestRun } from "./queue.test-helpers.js";
+import { enqueueFollowupRun, scheduleFollowupDrain, type FollowupRun } from "./queue.js";
+import { createQueueTestRun, rejectQueuePreparation } from "./queue.test-helpers.js";
 import {
   collectRuntimeMetadata,
   createOverflowSummaryRetrySource,
 } from "./queue/delivery-context.js";
-import {
-  beginReplyMessageInjectionTarget,
-  createReplyOperation,
-  replyRunRegistry,
-} from "./reply-run-registry.js";
-import { retainReplyOperationUntilComplete } from "./reply-run-registry.state.js";
+import { completeFollowupRunLifecycle } from "./queue/lifecycle.js";
+import { clearFollowupQueue } from "./queue/state.js";
+import { isFollowupRunAborted } from "./queue/types.js";
+import type { AdmittedFollowupTurn } from "./reply-agent-turn-preparation.js";
 import { createReplyRecoveryActorFixture } from "./restart-recovery-claim.test-support.js";
 import { readChannelSourceTurnId } from "./source-turn-id.js";
 
@@ -84,9 +88,6 @@ describe("queued turn steering", () => {
             if (next) {
               entry = next;
             }
-          },
-          adopt: (next) => {
-            entry = next;
           },
         },
       });
@@ -144,6 +145,7 @@ describe("queued turn steering", () => {
         operation.bindToolAuthorityRoute({ provider: "anthropic", model: "claude" });
         operation.attachBackend({
           kind: "embedded",
+          supportsTranscriptCommitWait: true,
           runId: "followup-execution",
           cancel: vi.fn(),
           messageInjectionV2: {
@@ -158,7 +160,17 @@ describe("queued turn steering", () => {
         for (const [index, message] of steeringMessages.entries()) {
           const clientRunId = `new-human-input-${index}`;
           const attempt = await createChatSendMessageInjectionStarter({
-            target: replyRunRegistry.resolveCurrentMessageInjectionTarget(sessionKey),
+            sourceRef: createRpcSourceForTest(
+              {},
+              {
+                runId: clientRunId,
+                storeScope: storePath,
+                sessionKey,
+                sessionId: entry.sessionId,
+                agentId: "main",
+              },
+            ),
+            target: captureCurrentReplyMessageInjectionTarget(sessionKey),
             abortSignal: new AbortController().signal,
             request: {
               p: {
@@ -222,8 +234,12 @@ describe("queued turn steering", () => {
           onCompactionNoticePayload: vi.fn(async () => {}),
         });
         expect(queueMessage.mock.calls.map(([text]) => text)).toEqual(steeringMessages);
-        expect(replyRunRegistry.getSourceTurnId(sessionKey)).toBe(sourceTurnId);
+        expect(getSessionControllerEntryForOperation(operation).sourceTurnId).toBe(sourceTurnId);
       } finally {
+        if (turn.queued.controllerInput) {
+          completeFollowupRunLifecycle(turn.queued);
+          await Promise.allSettled([turn.queued.controllerInput.settlement.promise]);
+        }
         await turn.restartRecovery?.clear();
       }
     },
@@ -249,9 +265,14 @@ describe("queued turn steering", () => {
     const queueMessage = vi.fn(async () => {});
     state.execute.mockImplementation(async () => {
       operation.bindToolAuthorityRoute({ provider: "anthropic", model: "claude" });
-      operation.attachBackend({ kind: "embedded", cancel: vi.fn(), queueMessage });
+      operation.attachBackend({
+        kind: "embedded",
+        supportsTranscriptCommitWait: true,
+        cancel: vi.fn(),
+        queueMessage,
+      });
       expect(operation.phase).toBe("running");
-      const target = replyRunRegistry.resolveCurrentMessageInjectionTarget("main");
+      const target = captureCurrentReplyMessageInjectionTarget("main");
       expect(target).toBeDefined();
       const overlay = {
         operatorAuthority: createAdmittedRunOperatorAuthority({
@@ -325,6 +346,10 @@ describe("queued turn steering", () => {
         onCompactionNoticePayload: vi.fn(async () => {}),
       });
     } finally {
+      if (turn.queued.controllerInput) {
+        completeFollowupRunLifecycle(turn.queued);
+        await Promise.allSettled([turn.queued.controllerInput.settlement.promise]);
+      }
       operation.complete();
     }
   });
@@ -341,7 +366,7 @@ describe("queued ingress acceptance", () => {
     vi.unstubAllEnvs();
   });
 
-  it("lets ingress bound delivery-group preparation failures before queued execution", async () => {
+  it("keeps exclusive ingress inputs separate and bounds their preparation retries", async () => {
     await withOpenClawTestState({ label: "queued-ingress-group-retry" }, async (testState) => {
       const preparation = vi
         .spyOn(sandboxRuntime, "withSandboxRuntimeStatusesInWorker")
@@ -350,7 +375,15 @@ describe("queued ingress acceptance", () => {
       const failed = observeChannelIngressQueueWrite(queue, "fail", "second-input");
       const key = "agent:main:ingress-group-retry";
       const ingressSignals: AbortSignal[] = [];
-      const runFollowup = vi.fn(async () => {});
+      const selectedGroups: string[][] = [];
+      const runFollowup = vi.fn(async (run: FollowupRun) => {
+        if (isFollowupRunAborted(run)) {
+          return;
+        }
+        const claim = run.controllerClaim ?? run.controllerInput?.claim;
+        selectedGroups.push(claim?.sources.map((source) => source.prompt) ?? []);
+        rejectQueuePreparation(run, new Error("ENOSPC: queued preparation failed"));
+      });
       const drain = createChannelIngressDrain({
         queue,
         adoptionStallTimeoutMs: 90,
@@ -386,11 +419,18 @@ describe("queued ingress acceptance", () => {
         await drain.waitForIdle();
         scheduleFollowupDrain(key, runFollowup);
         await vi.advanceTimersByTimeAsync(50);
-        expect(preparation).toHaveBeenCalled();
-        expect(preparation.mock.calls[0]?.[0]).toHaveLength(2);
-        expect(runFollowup).not.toHaveBeenCalled();
+        expect(preparation).not.toHaveBeenCalled();
+        expect(selectedGroups.length).toBeGreaterThan(0);
+        for (const sources of selectedGroups) {
+          expect(sources).toEqual(["First request"]);
+        }
+        expect(await queue.listClaims()).toHaveLength(2);
         expect(ingressSignals.map((signal) => signal.aborted)).toEqual([false, false]);
         await vi.advanceTimersByTimeAsync(60);
+        expect(ingressSignals.map((signal) => signal.aborted)).toEqual([true, false]);
+        expect(selectedGroups).toContainEqual(["Second request"]);
+        // The waiting input keeps its heartbeat until its own preparation fails.
+        await vi.advanceTimersByTimeAsync(90);
         expect(ingressSignals.map((signal) => signal.aborted)).toEqual([true, true]);
         await expect(failed).resolves.toBe(true);
         expect(await queue.listFailed?.()).toEqual(
@@ -401,7 +441,7 @@ describe("queued ingress acceptance", () => {
         );
       } finally {
         drain.dispose();
-        clearFollowupQueueForTest(key);
+        clearFollowupQueue(key);
         preparation.mockRestore();
       }
     });
@@ -454,7 +494,7 @@ describe("queued ingress acceptance", () => {
           ]);
         } finally {
           drain.dispose();
-          clearFollowupQueueForTest(key);
+          clearFollowupQueue(key);
         }
       });
     },
@@ -486,7 +526,6 @@ describe("queued ingress acceptance", () => {
           resetTriggered: false,
           upstreamAbortSignal: upstreamAbort.signal,
         });
-        retainReplyOperationUntilComplete(operation);
         await using actor = createReplyRecoveryActorFixture({
           ...target,
           operation,
@@ -509,9 +548,6 @@ describe("queued ingress acceptance", () => {
               if (next) {
                 entry = next;
               }
-            },
-            adopt: (next) => {
-              entry = next;
             },
           },
         });
@@ -621,6 +657,10 @@ describe("queued ingress acceptance", () => {
           expect(replies).toHaveLength(failure === "user-abort" ? 0 : 1);
         } finally {
           drain.dispose();
+          if (turn.queued.controllerInput) {
+            completeFollowupRunLifecycle(turn.queued);
+            await Promise.allSettled([turn.queued.controllerInput.settlement.promise]);
+          }
           await turn.restartRecovery?.clear();
         }
       });

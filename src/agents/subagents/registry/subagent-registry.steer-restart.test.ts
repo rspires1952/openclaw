@@ -111,6 +111,21 @@ vi.mock("../../../config/sessions/session-accessor.js", async (importOriginal) =
   patchSessionEntryCore: async () => null,
 }));
 
+// Controller reservation reads use the same synthetic requester as lifecycle reads.
+vi.mock("../../../config/sessions/session-entry-read-runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("../../../config/sessions/session-entry-read-runtime.js")
+  >()),
+  readSessionEntryReadOnlyInWorker: vi.fn<
+    typeof import("../../../config/sessions/session-entry-read-runtime.js").readSessionEntryReadOnlyInWorker
+  >(async (scope, assertCurrent) => {
+    assertCurrent?.();
+    const entry = await Promise.resolve(sessionStore[scope.sessionKey]);
+    assertCurrent?.();
+    return entry;
+  }),
+}));
+
 const announceSpy = vi.fn(
   async (_params: unknown): Promise<"delivered" | "retryable"> => "delivered",
 );
@@ -499,8 +514,6 @@ describe("subagent registry steer restarts", () => {
       draft.archiveAtMs = endedAt;
       draft.delivery = {
         status: "suspended",
-        attemptCount: 2,
-        lastAttemptAt: endedAt,
         enqueuedAt: endedAt,
         deliveredAt: endedAt,
         announcedAt: endedAt,

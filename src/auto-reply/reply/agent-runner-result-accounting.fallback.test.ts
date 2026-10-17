@@ -16,12 +16,13 @@ import type { InternalSessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { buildGatewaySessionRow } from "../../gateway/session-utils-row.js";
 import { clearAgentRunContext, registerAgentRunContext } from "../../infra/agent-run-registry.js";
+import { createReplyOperation, type ReplyOperation } from "../../sessions/session-controller.js";
+import { captureSessionTarget } from "../../sessions/session-controller.lifecycle.js";
 import { disposeOpenClawAgentDatabaseByPath } from "../../state/openclaw-agent-db-disposal.js";
 import { closeOpenClawAgentDatabasesAsync } from "../../state/openclaw-agent-db.js";
 import { readSessionFallbackModelAsync } from "../../status/session-fallback-model.js";
 import { withAgentTurnCompletion } from "./agent-runner-completion.js";
 import { accountAgentTurn } from "./agent-runner-result-accounting.js";
-import { createReplyOperation, type ReplyOperation } from "./reply-run-registry.js";
 import { createMockFollowupRun } from "./test-helpers.js";
 
 const diagnostic = { provider: "primary-fixture", model: "thinking" };
@@ -66,6 +67,12 @@ async function createFixture(selected = diagnostic) {
     sessionId: entry.sessionId,
     sessionKey,
     resetTriggered: false,
+    target: captureSessionTarget({
+      storeScope: storePath,
+      sessionKey,
+      agentId: "main",
+      incarnation: entry.sessionId,
+    }),
   });
   operations.push(replyOperation);
   replyOperation.setPhase("running");

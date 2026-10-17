@@ -21,12 +21,7 @@ import {
   resolveSessionAgentId,
 } from "../agents/agent-scope.js";
 import { ensureContextWindowCacheLoaded } from "../agents/context.js";
-import { resolveActiveEmbeddedRunSessionId } from "../agents/embedded-agent-runner/active-run-projections.js";
-import {
-  claimPendingEmbeddedAgentQuestionAnswer,
-  queueEmbeddedAgentMessageWithOutcomeAsync,
-} from "../agents/embedded-agent-runner/runs.js";
-import { QuestionAnswerUnconfirmedError } from "../agents/harness/gateway-question-dispatch.js";
+import { claimPendingEmbeddedAgentQuestionAnswer } from "../agents/embedded-agent-runner/runs.js";
 import { resolveThinkingDefault } from "../agents/model-selection.js";
 import { resolvePublishedModelCatalogOwner } from "../agents/prepared-model-catalog-owner.js";
 import {
@@ -114,6 +109,10 @@ import {
   normalizeAgentId,
 } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
+import {
+  resolveActiveReplyOperationForSessionId,
+  resolveActiveSessionRunId,
+} from "../sessions/session-controller.queries.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../utils/message-channel.js";
 import { applyQueueDropPolicy, waitForQueueDebounce } from "../utils/queue-helpers.js";
@@ -141,6 +140,7 @@ import {
   readEmbeddedHistorySessionInfo,
   readEmbeddedPrivateHistorySessionInfo,
 } from "./embedded-session-reader.js";
+import { steerEmbeddedSessionInput } from "./embedded-session-steering.js";
 import type {
   ChatSendOptions,
   TuiAgentsList,
@@ -330,7 +330,7 @@ export class EmbeddedTuiBackend implements TuiBackend {
         ...loadOptions,
       });
       this.scheduler.signal.throwIfAborted();
-      const activeSessionId = resolveActiveEmbeddedRunSessionId(canonicalKey);
+      const activeSessionId = resolveActiveSessionRunId(canonicalKey);
       if (activeSessionId) {
         const claimed = await claimPendingEmbeddedAgentQuestionAnswer(
           activeSessionId,
@@ -348,21 +348,21 @@ export class EmbeddedTuiBackend implements TuiBackend {
       });
       if (queueSettings.mode === "steer") {
         if (activeSessionId) {
-          const outcome = await queueEmbeddedAgentMessageWithOutcomeAsync(
-            activeSessionId,
-            opts.message,
-            {
-              steeringMode: "all",
-              debounceMs: queueSettings.debounceMs ?? DEFAULT_QUEUE_DEBOUNCE_MS,
-              isInboundUserMessage: true,
-            },
-          ).catch((error: unknown) => {
-            if (error instanceof QuestionAnswerUnconfirmedError) {
-              throw error;
-            }
-            return undefined;
+          const steer = await steerEmbeddedSessionInput({
+            operation: resolveActiveReplyOperationForSessionId(activeSessionId),
+            text: opts.message,
+            sessionEntry: entry,
+            debounceMs: queueSettings.debounceMs ?? DEFAULT_QUEUE_DEBOUNCE_MS,
+            abortSignal: this.scheduler.signal,
           });
-          if (outcome?.queued) {
+          if (steer.status === "indeterminate") {
+            // Consumed without a confirmed commit: queuing it again could duplicate it.
+            throw new Error(steer.errorMessage);
+          }
+          if (steer.status === "accepted") {
+            if (steer.result?.transcriptCommit === "unconfirmed") {
+              throw new Error(steer.result.errorMessage);
+            }
             return { runId: queuedAfter.runId };
           }
         }

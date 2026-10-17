@@ -17,7 +17,6 @@ import {
   restoreSubagentRunsFromDisk,
 } from "../registry/subagent-registry-persistence.js";
 import { subscribeSubagentRunChanges } from "../registry/subagent-registry-publication.js";
-import { getPendingWakeCommit } from "../registry/subagent-registry-requester-wake-commit.js";
 import { loadSubagentRegistryFromSqlite } from "../registry/subagent-registry-state.fixture.test-support.js";
 import { bindSubagentRunRecord } from "../registry/subagent-registry.store.codec.js";
 import { writeSubagentRunValuesInDatabase } from "../registry/subagent-registry.store.kernel.js";
@@ -221,7 +220,7 @@ describe("persisted subagent requester wakes", () => {
       expect(subagentRuns.get(input.subagent.runId)?.requesterSettleWake).toBeUndefined();
       expect(driver.wake).toHaveBeenCalledOnce();
     } finally {
-      driver.controller.clearScheduledResumeTimers();
+      driver.controller.clearRuntimeState();
     }
   });
 
@@ -262,7 +261,7 @@ describe("persisted subagent requester wakes", () => {
       ).toEqual(advancedWake);
       expect(driver.wake).toHaveBeenCalledOnce();
     } finally {
-      driver.controller.clearScheduledResumeTimers();
+      driver.controller.clearRuntimeState();
       vi.useRealTimers();
     }
   });
@@ -348,11 +347,11 @@ describe("persisted subagent requester wakes", () => {
             expect(subagentRuns.has(input.subagent.runId)).toBe(cut !== "retirement");
           }
         } finally {
-          retry.controller.clearScheduledResumeTimers();
+          retry.controller.clearRuntimeState();
         }
       } finally {
         unsubscribe();
-        driver.controller.clearScheduledResumeTimers();
+        driver.controller.clearRuntimeState();
       }
     },
   );
@@ -395,7 +394,9 @@ describe("persisted subagent requester wakes", () => {
       const acknowledgedBatches: string[][] = [];
       driver.wake.mockImplementation(async (params) => {
         const state = currentCompletionRun(input).requesterSettleWake!;
-        let observedBatch = batch.map((entry) => subagentRuns.get(entry.runId)!);
+        let observedBatch = batch
+          .map((entry) => subagentRuns.get(entry.runId)!)
+          .filter((entry) => entry.requesterSettleWake?.rearmGeneration === state.rearmGeneration);
         const adoptPublished = (published: readonly SubagentRunRecord[]) => {
           observedBatch = [...published];
           acknowledgedBatches.push(published.map((entry) => entry.runId));
@@ -450,22 +451,19 @@ describe("persisted subagent requester wakes", () => {
             return { value: undefined, postimages: new Map([[next.runId, next]]) };
           });
         }
-        for (let sweep = 0; sweep < 6; sweep++) {
-          await advanceRequesterWakeTime(5_000, () =>
-            driver.controller.resumeRequesterSettleWake(input.subagent.runId, input.subagent),
-          );
-        }
+        await advanceRequesterWakeTime(30_000, () =>
+          driver.controller.resumeRequesterSettleWake(input.subagent.runId, input.subagent),
+        );
         expect(transport).toHaveBeenCalledOnce();
         expect(replayAttempts).toBe(2);
-        for (let sweep = 0; sweep < 6; sweep++) {
-          await advanceRequesterWakeTime(5_000, () =>
-            driver.controller.resumeRequesterSettleWake(input.subagent.runId, input.subagent),
-          );
-        }
-        expect(transport).toHaveBeenCalledOnce();
-        expect(replayAttempts).toBe(2);
+        expect(
+          loadSubagentRegistryFromSqlite().get(input.subagent.runId)?.requesterSettleWake
+            ?.replayCount,
+        ).toBeUndefined();
         database.db.exec("DROP TRIGGER reject_replay");
-        await advanceRequesterWakeTime(30_000);
+        await advanceRequesterWakeTime(30_000, () =>
+          driver.controller.resumeRequesterSettleWake(input.subagent.runId, input.subagent),
+        );
         expect(replayAttempts).toBe(3);
         expect(transport).toHaveBeenCalledTimes(2);
         expect(acknowledgedBatches).toEqual([batchRunIds, [input.subagent.runId]]);
@@ -486,7 +484,7 @@ describe("persisted subagent requester wakes", () => {
       } finally {
         observed.mockRestore();
         database.db.exec("DROP TRIGGER IF EXISTS reject_replay");
-        driver.controller.clearScheduledResumeTimers();
+        driver.controller.clearRuntimeState();
         vi.useRealTimers();
       }
     },
@@ -525,7 +523,7 @@ describe("persisted subagent requester wakes", () => {
         });
         expect(subagentRuns.get(input.subagent.runId)?.delivery?.payload).toBeUndefined();
       } finally {
-        driver.controller.clearScheduledResumeTimers();
+        driver.controller.clearRuntimeState();
       }
     },
   );
@@ -667,12 +665,6 @@ describe("persisted subagent requester wakes", () => {
           expect(subagentRuns.has(second.subagent.runId)).toBe(false);
         }
         if (cut === "committed") {
-          expect(
-            getPendingWakeCommit(
-              driver.controller,
-              subagentRuns.get(second.subagent.runId) ?? second.subagent,
-            ),
-          ).toBeUndefined();
           expect(publication.reconciledBatches).toEqual([
             [first.subagent.runId, third.subagent.runId],
           ]);
@@ -696,7 +688,7 @@ describe("persisted subagent requester wakes", () => {
         process.env.OPENCLAW_STATE_DIR = originalStateDir;
         publication.restore();
         database.db.exec("DROP TRIGGER IF EXISTS reject_outcome");
-        driver.controller.clearScheduledResumeTimers();
+        driver.controller.clearRuntimeState();
         vi.useRealTimers();
       }
     },
@@ -727,7 +719,7 @@ describe("persisted subagent requester wakes", () => {
         expect(readCompletionSystemEvents(database)).toEqual([]);
         expect(driver.wake).toHaveBeenCalledOnce();
       } finally {
-        driver.controller.clearScheduledResumeTimers();
+        driver.controller.clearRuntimeState();
       }
     },
   );
@@ -851,7 +843,7 @@ describe("persisted subagent requester wakes", () => {
         });
         expect(readCompletionSystemEvents(database)).toEqual([]);
       } finally {
-        driver.controller.clearScheduledResumeTimers();
+        driver.controller.clearRuntimeState();
       }
     },
   );
@@ -920,7 +912,7 @@ describe("persisted subagent requester wakes", () => {
         expect(database.db.prepare("SELECT COUNT(*) AS count FROM task_runs").get()?.count).toBe(0);
         expect(readCompletionSystemEvents(database)).toEqual([]);
       } finally {
-        driver.controller.clearScheduledResumeTimers();
+        driver.controller.clearRuntimeState();
       }
     },
   );

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import "../agents/subagents/spawn/subagent-spawn-model.mocks.shared.js";
 import fs from "node:fs/promises";
+import "../agents/subagents/spawn/subagent-spawn-model.mocks.shared.js";
 import path from "node:path";
 import { promisify } from "node:util";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
@@ -23,15 +23,15 @@ import { withTimeout } from "../infra/fs-safe.js";
 import { withPluginRuntimeGatewayContextResolver } from "../plugins/runtime/gateway-request-scope.js";
 import { registerProjectRegistry, removeProjectRegistry } from "../projects/project-registry.js";
 import {
-  getSessionWorkAdmissionRelease,
-  SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS,
-} from "../sessions/session-lifecycle-admission.js";
+  captureSessionControllerSettlement,
+  SESSION_CONTROLLER_DRAIN_TIMEOUT_MS,
+} from "../sessions/session-controller.lifecycle.js";
+import { rpcSourceTesting } from "../sessions/session-lifecycle-admission.test-support.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { closeStateDatabaseForTest } from "../test-utils/database-cleanup.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import { waitForChatAbortControllerRemoval } from "./chat-abort-lifecycle-internal.js";
-import type { ChatAbortControllerEntry } from "./chat-abort.js";
 import { createDirectChatContext } from "./server-chat.agent-events.test-helpers.js";
 import { disposeSessionReadContexts } from "./server-methods/sessions-read-cache.test-support.js";
 import { createWorktreeSpawnRepositoryFixture } from "./server.sessions.create-worktree-spawn.test-support.js";
@@ -233,7 +233,9 @@ test.each(["registered", "github", "inherited"] as const)(
         throw new Error("Missing child session key");
       }
       childKey = result.details.childSessionKey;
-      await settleWorkspaceRuns(context, storePath, childKey);
+      if (childKey) {
+        await settleWorkspaceRuns(context, storePath, childKey);
+      }
       const child = loadSessionEntry({ agentId: "main", sessionKey: childKey, storePath });
       expect(child).toMatchObject({ parentSessionId: parent.sessionId, sandbox: "required" });
       if (source !== "inherited") {
@@ -254,7 +256,9 @@ test.each(["registered", "github", "inherited"] as const)(
       await expect(fs.stat(path.join(child!.spawnedCwd!, "setup-marker.txt"))).rejects.toThrow();
       expect(registerRun).toHaveBeenCalledOnce();
     } finally {
-      await settleWorkspaceRuns(context, storePath, childKey, true);
+      if (childKey) {
+        await settleWorkspaceRuns(context, storePath, childKey, true);
+      }
       dispatchInboundMessageMock.mockReset();
     }
   },
@@ -288,7 +292,9 @@ test.each(["registered", "github"] as const)(
       if (isRecord(result?.details) && typeof result.details.childSessionKey === "string") {
         childKey = result.details.childSessionKey;
       }
-      await settleWorkspaceRuns(context, storePath, childKey);
+      if (childKey) {
+        await settleWorkspaceRuns(context, storePath, childKey);
+      }
       const child = childKey
         ? loadSessionEntry({ agentId: "main", sessionKey: childKey, storePath })
         : undefined;
@@ -312,7 +318,9 @@ test.each(["registered", "github"] as const)(
       expect(child?.projectId).toBeUndefined();
       expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
     } finally {
-      await settleWorkspaceRuns(context, storePath, childKey, true);
+      if (childKey) {
+        await settleWorkspaceRuns(context, storePath, childKey, true);
+      }
       dispatchInboundMessageMock.mockReset();
     }
   },
@@ -625,6 +633,7 @@ test("publishes a failed worktree spawn only after its durable session failure",
   const key = "agent:main:dashboard:failed-worktree-child";
   const target = { agentId: "main", sessionKey: key, storePath };
   const preparation = createDeferredCore<never>();
+  void preparation.promise.catch(() => {});
   const preparationStarted = createDeferredCore();
   const createWorktree = vi
     .spyOn(ManagedWorktreeService.prototype, "createWithOutcome")
@@ -639,7 +648,6 @@ test("publishes a failed worktree spawn only after its durable session failure",
   let publishedEntry: SessionEntry | undefined;
   let registryProjection: Promise<void> | undefined;
   const context = {
-    chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
     dedupe: new Map(),
     broadcast: vi.fn((event: string, payload: unknown) => {
       if (
@@ -675,80 +683,87 @@ test("publishes a failed worktree spawn only after its durable session failure",
     }),
   };
   const client = spawnClient();
-  const created = await directSessionReq<{
-    key: string;
-    sessionId: string;
-    runId: string;
-    runStarted: boolean;
-  }>(
-    "sessions.create",
-    {
-      key,
-      agentId: "main",
-      label: "Failed worktree child",
-      parentSessionKey: parentKey,
-      spawnDepth: 1,
-      worktree: true,
-      worktreeName: "failed-child",
-      task: "Read README.md",
-    },
-    {
-      client: {
-        ...client,
-        connect: {
-          ...client.connect,
-          minProtocol: 1,
-          maxProtocol: 1,
-          client: {
-            id: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-            version: "test",
-            platform: "node",
-            mode: GATEWAY_CLIENT_MODES.BACKEND,
+  try {
+    const created = await directSessionReq<{
+      key: string;
+      sessionId: string;
+      runId: string;
+      runStarted: boolean;
+    }>(
+      "sessions.create",
+      {
+        key,
+        agentId: "main",
+        label: "Failed worktree child",
+        parentSessionKey: parentKey,
+        spawnDepth: 1,
+        worktree: true,
+        worktreeName: "failed-child",
+        task: "Read README.md",
+      },
+      {
+        client: {
+          ...client,
+          connect: {
+            ...client.connect,
+            minProtocol: 1,
+            maxProtocol: 1,
+            client: {
+              id: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
+              version: "test",
+              platform: "node",
+              mode: GATEWAY_CLIENT_MODES.BACKEND,
+            },
           },
         },
+        context,
       },
-      context,
-    },
-  );
-  expect(created.ok, JSON.stringify(created.error)).toBe(true);
-  expect(created.payload?.runStarted).toBe(true);
-  const { runId, sessionId } = created.payload!;
-  const admittedRun = context.chatAbortControllers.get(runId)!;
-  registryStartedAt = Math.max(Date.now(), admittedRun.startedAtMs + 1);
-  const released = getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
-  expect(released).toBeDefined();
-  expect(loadSessionEntry(target)?.pendingWorktree?.workspace).toBe(repository);
-  await preparationStarted.promise;
-  expect(createWorktree).toHaveBeenCalledOnce();
-  preparation.reject(failure);
-  await withTimeout(released!, SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS, "failed workspace proof");
-  await registryProjection;
+    );
+    expect(created.ok, JSON.stringify(created.error)).toBe(true);
+    expect(created.payload?.runStarted).toBe(true);
+    const { runId, sessionId } = created.payload!;
+    const admittedRun = rpcSourceTesting.get(runId)!;
+    expect(admittedRun.input.claim).toBeUndefined();
+    registryStartedAt = Date.now() + 1;
+    const released = captureSessionControllerSettlement({ scope: storePath, identities: [key] });
+    expect(released).toBeDefined();
+    expect(loadSessionEntry(target)?.pendingWorktree?.workspace).toBe(repository);
+    await preparationStarted.promise;
+    expect(createWorktree).toHaveBeenCalledOnce();
+    preparation.reject(failure);
+    await withTimeout(released!, SESSION_CONTROLLER_DRAIN_TIMEOUT_MS, "failed workspace proof");
+    await registryProjection;
 
-  expect.soft(publishedEntry).toMatchObject({
-    sessionId,
-    status: "failed",
-    lastRunId: runId,
-    lastRunError: expect.stringContaining("git ls-tree"),
-  });
-  expect.soft(loadSessionEntry(target)).toMatchObject({
-    status: "failed",
-    lastRunId: runId,
-    lastRunError: expect.stringContaining("timed out after 120 seconds"),
-  });
-  expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
-  const notices = (await loadTranscriptEvents({ ...target, sessionId })).filter(
-    (event) => isRecord(event) && event.customType === "run-failed-before-reply",
-  );
-  expect(notices).toMatchObject([
-    { details: { runId, error: expect.stringContaining("git ls-tree") }, display: true },
-  ]);
-  const listed = await directSessionReq<{
-    sessions: Array<{ key: string; lastRunError?: string }>;
-  }>("sessions.list", { agentId: "main" }, adminRequest);
-  expect(listed.ok, JSON.stringify(listed.error)).toBe(true);
-  expect(listed.payload?.sessions.find((row) => row.key === key)).toMatchObject({
-    lastRunError: expect.stringContaining("git ls-tree"),
-  });
+    expect.soft(publishedEntry).toMatchObject({
+      sessionId,
+      status: "failed",
+      lastRunId: runId,
+      lastRunError: expect.stringContaining("git ls-tree"),
+    });
+    expect.soft(loadSessionEntry(target)).toMatchObject({
+      status: "failed",
+      lastRunId: runId,
+      lastRunError: expect.stringContaining("timed out after 120 seconds"),
+    });
+    expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
+    const notices = (await loadTranscriptEvents({ ...target, sessionId })).filter(
+      (event) => isRecord(event) && event.customType === "run-failed-before-reply",
+    );
+    expect(notices).toMatchObject([
+      { details: { runId, error: expect.stringContaining("git ls-tree") }, display: true },
+    ]);
+    const listed = await directSessionReq<{
+      sessions: Array<{ key: string; lastRunError?: string }>;
+    }>("sessions.list", { agentId: "main" }, adminRequest);
+    expect(listed.ok, JSON.stringify(listed.error)).toBe(true);
+    expect(listed.payload?.sessions.find((row) => row.key === key)).toMatchObject({
+      lastRunError: expect.stringContaining("git ls-tree"),
+    });
+  } finally {
+    preparation.reject(failure);
+    await settleWorkspaceRuns(context, storePath, key, true);
+    await registryProjection;
+  }
 });
 
 test.each(["archive", "stale-child"] as const)(
@@ -771,7 +786,6 @@ test.each(["archive", "stale-child"] as const)(
     initialSend.mockRestore();
     const context = {
       broadcast: vi.fn(),
-      chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
       dedupe: new Map(),
     };
     const operator = {
@@ -839,19 +853,18 @@ test.each(["archive", "stale-child"] as const)(
         operator,
       );
       expect(retried.ok, JSON.stringify(retried.error)).toBe(true);
-      const targets = [...context.chatAbortControllers].map(([runId, entry]) => ({ runId, entry }));
-      const released = getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
+      const targets = [...rpcSourceTesting].map(([runId, entry]) => ({ runId, entry }));
+      const released = captureSessionControllerSettlement({ scope: storePath, identities: [key] });
       expect(
         await waitForChatAbortControllerRemoval({
-          entries: context.chatAbortControllers,
           targets,
-          timeoutMs: SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS,
+          timeoutMs: SESSION_CONTROLLER_DRAIN_TIMEOUT_MS,
         }),
       ).toBe(true);
       if (released) {
         await withTimeout(
           released,
-          SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS,
+          SESSION_CONTROLLER_DRAIN_TIMEOUT_MS,
           "deferred workspace proof",
         );
       }

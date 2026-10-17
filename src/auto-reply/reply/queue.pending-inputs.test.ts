@@ -15,6 +15,7 @@ import {
 import { useTempSessionsFixture } from "../../config/sessions/test-helpers.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { captureGatewayRootWorkReleaseObserver } from "../../process/gateway-work-admission.js";
+import { createReplyOperation } from "../../sessions/session-controller.js";
 import {
   createUserTurnTranscriptRecorder,
   type PersistedUserTurnMessage,
@@ -26,13 +27,11 @@ import { executeFollowupTurn } from "./followup-turn-execution.js";
 import {
   admitFollowupRunLifecycle,
   enqueueFollowupRun,
-  FollowupRunDeferredError,
   scheduleFollowupDrain,
   type FollowupRun,
 } from "./queue.js";
 import { createQueueTestRun } from "./queue.test-helpers.js";
 import { clearFollowupQueue, getExistingFollowupQueue } from "./queue/state.js";
-import { createReplyOperation } from "./reply-run-registry.js";
 import { createTypingController } from "./typing.js";
 
 vi.mock("./agent-runner-execution.js", () => ({ executeAgentTurn: vi.fn() }));
@@ -182,10 +181,7 @@ describe("followup queue durable input consumption", () => {
     });
     await vi.waitFor(() => expect(getExistingFollowupQueue(sessionKey)).toBeUndefined());
 
-    expect(calls.map((run) => run.prompt)).toEqual([
-      "[Queued messages while agent was busy]\n\n---\nQueued #1\nstaged approved",
-      "[Queued messages while agent was busy]\n\n---\nQueued #1\nunstaged runtime body",
-    ]);
+    expect(calls.map((run) => run.prompt)).toEqual(["staged approved", "unstaged runtime body"]);
     expect(calls[1]?.transcriptPrompt).toContain("unstaged transcript body");
   });
 
@@ -217,7 +213,12 @@ describe("followup queue durable input consumption", () => {
         assert(observeRelease, "followup execution must own root admission");
         observeRelease(drainReleased.resolve);
         calls.push(run);
-        const operation = createReplyOperation({ sessionKey, sessionId, resetTriggered: false });
+        const operation = createReplyOperation({
+          sessionKey,
+          sessionId,
+          resetTriggered: false,
+          mailboxClaim: run.controllerClaim ?? run.controllerInput!.claim,
+        });
         const typing = createTypingController({});
         try {
           pendingTotals.push((await listSessionPendingInputs(scope())).total);
@@ -241,7 +242,6 @@ describe("followup queue durable input consumption", () => {
                 kind: "detached",
                 current: () => undefined,
                 publish: () => {},
-                adopt: () => {},
               },
               sendPolicy: "allow",
               preflightCompactionApplied: false,
@@ -285,7 +285,7 @@ describe("followup queue durable input consumption", () => {
     },
   );
 
-  it("retains elided and retried overflow sources until their summary commits", async () => {
+  it("retains elided overflow sources until their summary commits", async () => {
     const sources = await Promise.all(["first", "second", "third"].map(createStagedRun));
     const settings = {
       mode: "followup" as const,
@@ -302,9 +302,6 @@ describe("followup queue durable input consumption", () => {
     const pendingRunIds: string[][] = [];
     scheduleFollowupDrain(sessionKey, async (run) => {
       calls.push(run);
-      if (calls.length === 1) {
-        throw new FollowupRunDeferredError();
-      }
       try {
         await admitFollowupRunLifecycle(run);
         await persistQueuedRun(run);
@@ -315,11 +312,19 @@ describe("followup queue durable input consumption", () => {
         failures.push(error);
       }
     });
-    await vi.waitFor(() => expect(getExistingFollowupQueue(sessionKey)).toBeUndefined());
+    // Durable append owns real worker I/O; a polling deadline is not its receipt.
+    await Promise.all(sources.map(({ run }) => run.controllerInput!.settlement.promise));
+    await Promise.all(
+      sources.flatMap(({ run }) => {
+        const claim = run.controllerInput!.claim;
+        return claim ? [claim.settlement.promise] : [];
+      }),
+    );
+    expect(getExistingFollowupQueue(sessionKey)).toBeUndefined();
 
     expect(failures).toEqual([]);
-    expect(calls).toHaveLength(3);
-    expect(calls[1]?.prompt).toBe(
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.prompt).toBe(
       "[Queue overflow] Dropped 2 messages due to cap.\nSummary:\n- second approved",
     );
     expect(pendingRunIds).toEqual([["third"], []]);
@@ -327,7 +332,7 @@ describe("followup queue durable input consumption", () => {
       .filter(isRecord)
       .filter((event) => event.type === "message");
     expect(messages).toHaveLength(2);
-    expect(messages[0]?.message).toMatchObject({ content: calls[1]?.prompt });
+    expect(messages[0]?.message).toMatchObject({ content: calls[0]?.prompt });
     expect(messages[1]?.message).toMatchObject({ content: "third approved" });
     expect(sources.map((source) => source.beforeMessageWrite.mock.calls.length)).toEqual([1, 1, 1]);
   });

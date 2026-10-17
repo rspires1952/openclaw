@@ -1,6 +1,7 @@
 import { importFreshModule } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
+import { captureSessionControllerSourceSettlement } from "../../sessions/session-controller.mailbox.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
 import {
   admitFollowupRunLifecycle,
@@ -14,14 +15,38 @@ import {
   createDrainRecorder,
   installQueueRuntimeErrorSilencer,
 } from "./queue.test-helpers.js";
-import { clearFollowupDrainCallback } from "./queue/drain.js";
 import { resetRecentQueuedMessageIdDedupe } from "./queue/recent-message-ids.test-support.js";
 import { clearFollowupQueue, getExistingFollowupQueue } from "./queue/state.js";
 
 installQueueRuntimeErrorSilencer();
+const collectSettings: QueueSettings = {
+  mode: "collect",
+  debounceMs: 0,
+  cap: 50,
+  dropPolicy: "summarize",
+};
 const settings = createQueueSettings();
 let sequence = 0;
 let key: string;
+
+function createFollowupCollector(expectedCalls = 1): {
+  calls: FollowupRun[];
+  done: ReturnType<typeof createDeferred<void>>;
+  runFollowup: (run: FollowupRun) => Promise<void>;
+} {
+  const calls: FollowupRun[] = [];
+  const done = createDeferred();
+  return {
+    calls,
+    done,
+    runFollowup: async (run: FollowupRun) => {
+      calls.push(run);
+      if (calls.length >= expectedCalls) {
+        done.resolve();
+      }
+    },
+  };
+}
 
 function source(prompt: string, overrides: Partial<Parameters<typeof createRun>[0]> = {}) {
   return createRun({
@@ -39,11 +64,186 @@ beforeEach(() => {
 });
 afterEach(() => {
   clearFollowupQueue(key);
-  clearFollowupDrainCallback(key);
   vi.useRealTimers();
 });
 
 describe("followup queue deduplication", () => {
+  beforeEach(() => {
+    resetRecentQueuedMessageIdDedupe();
+  });
+
+  it("deduplicates settled redeliveries within their physical store, not across stores", async () => {
+    const queueKey = "agent:main:physical-dedupe";
+    const makeRun = (store: string) => {
+      const run = createRun({
+        prompt: store,
+        messageId: "same-id",
+        originatingChannel: "discord",
+        originatingTo: "channel:physical",
+      });
+      run.run.sessionKey = queueKey;
+      run.run.config = { session: { store } };
+      return run;
+    };
+    const originals = [
+      makeRun("/synthetic/store-a/sessions.json"),
+      makeRun("/synthetic/store-b/sessions.json"),
+    ];
+    const { calls, done, runFollowup } = createFollowupCollector(2);
+    try {
+      for (const run of originals) {
+        expect(enqueueFollowupRun(queueKey, run, collectSettings, "message-id", runFollowup)).toBe(
+          true,
+        );
+      }
+      await done.promise;
+      await Promise.all(
+        originals.map((run) => {
+          if (!run.controllerInput) {
+            throw new Error("Expected the canonical source input");
+          }
+          return captureSessionControllerSourceSettlement(run.controllerInput);
+        }),
+      );
+      for (const run of originals) {
+        expect(
+          enqueueFollowupRun(
+            queueKey,
+            makeRun(run.prompt),
+            collectSettings,
+            "message-id",
+            runFollowup,
+          ),
+        ).toBe(false);
+      }
+      expect(calls).toHaveLength(2);
+    } finally {
+      await Promise.all(
+        originals.flatMap((run) =>
+          run.controllerInput
+            ? [captureSessionControllerSourceSettlement(run.controllerInput)]
+            : [],
+        ),
+      );
+    }
+  });
+
+  it("deduplicates messages with same Discord message_id", async () => {
+    const queueKey = `test-dedup-message-id-${Date.now()}`;
+    const { calls, done, runFollowup } = createFollowupCollector();
+
+    const first = enqueueFollowupRun(
+      queueKey,
+      createRun({
+        prompt: "[Discord Guild #test channel id:123] Hello",
+        messageId: "m1",
+        originatingChannel: "discord",
+        originatingTo: "channel:123",
+      }),
+      collectSettings,
+    );
+    expect(first).toBe(true);
+
+    const second = enqueueFollowupRun(
+      queueKey,
+      createRun({
+        prompt: "[Discord Guild #test channel id:123] Hello (dupe)",
+        messageId: "m1",
+        originatingChannel: "discord",
+        originatingTo: "channel:123",
+      }),
+      collectSettings,
+    );
+    expect(second).toBe(false);
+
+    const third = enqueueFollowupRun(
+      queueKey,
+      createRun({
+        prompt: "[Discord Guild #test channel id:123] World",
+        messageId: "m2",
+        originatingChannel: "discord",
+        originatingTo: "channel:123",
+      }),
+      collectSettings,
+    );
+    expect(third).toBe(true);
+
+    scheduleFollowupDrain(queueKey, runFollowup);
+    await done.promise;
+    expect(calls[0]?.prompt).toContain("[Queued messages while agent was busy]");
+  });
+
+  it("deduplicates message ids when numeric and string thread ids share a route", () => {
+    const queueKey = `test-dedup-thread-normalized-${Date.now()}`;
+
+    const first = enqueueFollowupRun(
+      queueKey,
+      createRun({
+        prompt: "first",
+        messageId: "same-id",
+        originatingChannel: "telegram",
+        originatingTo: "-100123",
+        originatingThreadId: 42.9,
+      }),
+      collectSettings,
+    );
+    expect(first).toBe(true);
+
+    const second = enqueueFollowupRun(
+      queueKey,
+      createRun({
+        prompt: "second",
+        messageId: "same-id",
+        originatingChannel: "telegram",
+        originatingTo: "-100123",
+        originatingThreadId: "42",
+      }),
+      collectSettings,
+    );
+    expect(second).toBe(false);
+  });
+
+  it("deduplicates redelivery after reply policy changes", async () => {
+    const queueKey = `test-dedup-policy-change-${Date.now()}`;
+    const { calls, done, runFollowup } = createFollowupCollector();
+
+    expect(
+      enqueueFollowupRun(
+        queueKey,
+        createRun({
+          prompt: "first",
+          messageId: "same-id",
+          originatingChannel: "slack",
+          originatingTo: "U123",
+          originatingReplyToId: "101.001",
+          originatingReplyToMode: "off",
+          originatingChatType: "direct",
+        }),
+        collectSettings,
+      ),
+    ).toBe(true);
+
+    scheduleFollowupDrain(queueKey, runFollowup);
+    await done.promise;
+
+    expect(
+      enqueueFollowupRun(
+        queueKey,
+        createRun({
+          prompt: "redelivery",
+          messageId: "same-id",
+          originatingChannel: "slack",
+          originatingTo: "U123",
+          originatingReplyToId: "101.001",
+          originatingReplyToMode: "first",
+          originatingChatType: "direct",
+        }),
+        collectSettings,
+      ),
+    ).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
   it("deduplicates same message_id across distinct enqueue module instances", async () => {
     const enqueueA = await importFreshModule<typeof import("./queue/enqueue.js")>(
       import.meta.url,
@@ -142,6 +342,7 @@ describe("followup queue deduplication", () => {
       // Retrying ingress must not need a drain or an owner-clear event.
       expect(enqueueFollowupRun(key, retry, settings, "message-id", runFollowup, false)).toBe(true);
       expect(onAbandoned).toHaveBeenCalledOnce();
+      await first.controllerInput!.settlement.promise;
       expect(onSettled).toHaveBeenCalledOnce();
       await Promise.resolve();
       expect(runFollowup).toHaveBeenCalledExactlyOnceWith(
@@ -150,6 +351,22 @@ describe("followup queue deduplication", () => {
       expect(getExistingFollowupQueue(key)?.draining).toBe(false);
     },
   );
+
+  it("releases a compacted source's message identity through its cloned lifecycle", () => {
+    const capped: QueueSettings = { ...settings, cap: 1 };
+    const onAbandoned = vi.fn();
+    const first = source("first");
+    first.turnAdoptionLifecycle = { onAdopted: () => {}, onAbandoned };
+    expect(enqueueFollowupRun(key, first, capped)).toBe(true);
+    for (const messageId of ["m2", "m3"]) {
+      expect(enqueueFollowupRun(key, source(messageId, { messageId }), capped)).toBe(true);
+    }
+    clearFollowupQueue(key);
+    expect(onAbandoned).toHaveBeenCalledOnce();
+    const retry = source("first");
+    retry.turnAdoptionLifecycle = { onAdopted: () => {} };
+    expect(enqueueFollowupRun(key, retry, capped)).toBe(true);
+  });
 
   it("does not let a stale abandoned lifecycle release a newer same-id owner", async () => {
     vi.useFakeTimers();
@@ -164,7 +381,6 @@ describe("followup queue deduplication", () => {
     const admission = admitFollowupRunLifecycle(first);
     await vi.advanceTimersByTimeAsync(0);
     clearFollowupQueue(key);
-    clearFollowupDrainCallback(key);
     await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
     const replacement = source("replacement");
     replacement.turnAdoptionLifecycle = { onAdopted: () => {} };
@@ -184,7 +400,6 @@ describe("followup queue deduplication", () => {
     completeFollowupRunLifecycle(run);
     expect(onAbandoned).not.toHaveBeenCalled();
     clearFollowupQueue(key);
-    clearFollowupDrainCallback(key);
     expect(enqueueFollowupRun(key, source("redelivery"), settings)).toBe(false);
   });
 });

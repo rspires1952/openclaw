@@ -11,8 +11,9 @@ import {
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import { replaceTranscriptEvents } from "../../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
-import { replyRunRegistry, waitForReplyRunSuccessorAdmission } from "./reply-run-registry.js";
-import { getReplyOperationSessionReader } from "./reply-run-registry.state.js";
+import { getReplyOperationSessionReader } from "../../sessions/session-controller.session-reader.js";
+import { getSessionControllerEntryForOperation } from "../../sessions/session-controller.state.js";
+import { waitForReplyRunSuccessorAdmission } from "../../sessions/session-controller.wait.js";
 import { admitReplyTurn, runWithReplyOperationLifecycleAdmission } from "./reply-turn-admission.js";
 import {
   initSessionState,
@@ -62,6 +63,7 @@ export function registerSessionInitializationAdmissionTests({
       if (admitted.status !== "owned" || !admitted.databaseClaim) {
         throw new Error("Fixture requires a retained reply admission");
       }
+      const controller = getSessionControllerEntryForOperation(admitted.operation);
       const previousReader = getReplyOperationSessionReader(admitted.operation);
       try {
         const initialized = await runWithReplyOperationLifecycleAdmission(admitted.operation, () =>
@@ -109,7 +111,7 @@ export function registerSessionInitializationAdmissionTests({
         }
       } finally {
         admitted.operation.complete();
-        await waitForReplyRunSuccessorAdmission(sessionKey, null);
+        await waitForReplyRunSuccessorAdmission(sessionKey, null, { target: controller.target });
       }
     },
   );
@@ -135,10 +137,11 @@ export function registerSessionInitializationAdmissionTests({
       if (admitted.status !== "owned" || !admitted.databaseClaim) {
         throw new Error("Fixture requires a retained reply admission");
       }
+      const controller = getSessionControllerEntryForOperation(admitted.operation);
       const previous = admitted.databaseClaim;
       if (!("kind" in previous) || !previous.afterTransition) {
         admitted.operation.complete();
-        await waitForReplyRunSuccessorAdmission(sessionKey, null);
+        await waitForReplyRunSuccessorAdmission(sessionKey, null, { target: controller.target });
         throw new Error("Fixture requires the worker initialization handoff");
       }
       const prepare = previous.afterTransition.bind(previous);
@@ -199,7 +202,9 @@ export function registerSessionInitializationAdmissionTests({
           expect(next.isCurrent()).toBe(false);
         }
         let closed = false;
-        closing = waitForReplyRunSuccessorAdmission(sessionKey, null).then((result) => {
+        closing = waitForReplyRunSuccessorAdmission(sessionKey, null, {
+          target: controller.target,
+        }).then((result) => {
           closed = true;
           return result;
         });
@@ -212,14 +217,14 @@ export function registerSessionInitializationAdmissionTests({
         );
         expect(await withinTest(closing, signal)).toMatchObject({ settled: true });
         expect(next.isCurrent()).toBe(false);
-        expect(replyRunRegistry.get(sessionKey)).toBeUndefined();
+        expect(controller.active).toBeUndefined();
       } finally {
         continueHandoff.resolve();
         prepareSpy.mockRestore();
         releaseSpy?.mockRestore();
         admitted.operation.complete();
         await Promise.allSettled([initialization, closing]);
-        await waitForReplyRunSuccessorAdmission(sessionKey, null);
+        await waitForReplyRunSuccessorAdmission(sessionKey, null, { target: controller.target });
       }
     },
   );
@@ -250,6 +255,7 @@ export function registerSessionInitializationAdmissionTests({
     if (admitted.status !== "owned" || !admitted.databaseClaim) {
       throw new Error("Fixture requires a retained reply admission");
     }
+    const controller = getSessionControllerEntryForOperation(admitted.operation);
     const separateHeaderPhase = vi.spyOn(lifecycleReads, "resolveSessionLifecycleTimestampsAsync");
     try {
       const initialized = await runWithReplyOperationLifecycleAdmission(admitted.operation, () =>
@@ -270,7 +276,7 @@ export function registerSessionInitializationAdmissionTests({
     } finally {
       separateHeaderPhase.mockRestore();
       admitted.operation.complete();
-      await waitForReplyRunSuccessorAdmission(sessionKey, null);
+      await waitForReplyRunSuccessorAdmission(sessionKey, null, { target: controller.target });
     }
   });
 }

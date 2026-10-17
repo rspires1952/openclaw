@@ -124,7 +124,6 @@ function makeDispatchInput(
     getLifecycleGeneration: () => lifecycleGeneration,
     getParams: () => params,
     globalLane: "retry-dispatch-global",
-    sessionLane: "retry-dispatch-session",
     initialQueuedLifecycleGeneration: lifecycleGeneration,
     setLifecycleGeneration: (value) => {
       lifecycleGeneration = value;

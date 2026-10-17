@@ -1,5 +1,5 @@
 import { subagentRuns } from "../../agents/subagents/registry/subagent-registry-memory.js";
-/** Channel Stop initiates native and ACP cancellation independently of either drain. */
+/** Channel Stop cancels native and bound ACP controller turns independently of either drain. */
 // Preserve module setup before modules that consume it.
 // oxfmt-ignore
 import { useChatAbortRegistryFixture } from "../../gateway/server-methods/chat.abort-registry.test-support.js";
@@ -8,6 +8,7 @@ import { expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { testing as acpTesting, getAcpSessionManager } from "../../acp/control-plane/manager.js";
 import { disposeAcpSessionManagerInstance } from "../../acp/control-plane/manager.lifecycle.js";
+import { AcpRuntimeError } from "../../acp/runtime/errors.js";
 import {
   registerAcpRuntimeBackend,
   unregisterAcpRuntimeBackend,
@@ -18,10 +19,10 @@ import {
   prepareAgentRunAdmission,
 } from "../../agents/admitted-run-context.js";
 import {
-  clearActiveEmbeddedRun,
-  setActiveEmbeddedRun,
-} from "../../agents/embedded-agent-runner/runs.js";
-import { createEmbeddedRunHandle } from "../../agents/embedded-agent-runner/runs.test-support.js";
+  clearTestEmbeddedRun as clearActiveEmbeddedRun,
+  registerTestEmbeddedRun as setActiveEmbeddedRun,
+  createEmbeddedRunHandle,
+} from "../../agents/embedded-agent-runner/runs.test-support.js";
 import { subscribeSubagentRunChanges } from "../../agents/subagents/registry/subagent-registry-publication.js";
 import { registerSubagentRun } from "../../agents/subagents/registry/subagent-registry.js";
 import { writeSubagentSessionEntry } from "../../agents/subagents/registry/subagent-registry.persistence.test-support.js";
@@ -37,16 +38,17 @@ import {
   setActivePluginRegistry,
 } from "../../plugins/runtime.js";
 import {
-  beginSessionWorkAdmission,
-  isSessionWorkAdmissionActive,
-  type SessionWorkAdmissionLease,
-} from "../../sessions/session-lifecycle-admission.js";
+  beginSessionEffect,
+  captureSessionTarget,
+  isSessionControllerWorkActive,
+  type SessionEffectRef,
+} from "../../sessions/session-controller.lifecycle.js";
+import { createReplyOperation } from "../../sessions/session-controller.operation.js";
 import {
   createChannelTestPluginBase,
   createTestRegistry,
 } from "../../test-utils/channel-plugins.js";
 import { tryFastAbortFromMessage } from "./abort.js";
-import { createReplyOperation } from "./reply-run-registry.js";
 import { buildTestCtx } from "./test-ctx.js";
 
 const fixture = useChatAbortRegistryFixture();
@@ -61,6 +63,22 @@ it.each([
     const active = scenario !== "idle";
     const nativeFailure = scenario === "native failure";
     const nativeError = new Error("native cancellation failed");
+    const backendError = new Error("backend cancellation failed");
+    const expectBackendCleanupFailure = (error: unknown): AcpRuntimeError => {
+      if (!(error instanceof AggregateError)) {
+        throw new Error("Expected a session source cleanup failure", { cause: error });
+      }
+      expect(error.message).toBe("Session source cleanup failed");
+      expect(error.errors).toHaveLength(1);
+      const runtimeError: unknown = error.errors[0];
+      if (!(runtimeError instanceof AcpRuntimeError)) {
+        throw new Error("Expected the ACP runtime cancellation failure", { cause: runtimeError });
+      }
+      expect(runtimeError.code).toBe("ACP_TURN_FAILED");
+      expect(runtimeError.message).toBe(backendError.message);
+      expect(runtimeError.cause).toBe(backendError);
+      return runtimeError;
+    };
     const sourceKey = "agent:main:stop-test:direct:room";
     const acpKey = "agent:main:acp:bound-stop";
     const runningKey = "agent:main:subagent:running";
@@ -110,7 +128,7 @@ it.each([
       await proceed.promise;
       cancelFinished.resolve();
       if (completion === "reject") {
-        throw new Error("backend cancellation failed");
+        throw backendError;
       }
     });
     const settleCancelRpc = async () => {
@@ -149,25 +167,34 @@ it.each([
     const native = createReplyOperation({
       sessionKey: sourceKey,
       sessionId: "source-session",
+      target: captureSessionTarget({
+        storeScope: storePath,
+        sessionKey: sourceKey,
+        incarnation: "source-session",
+        agentId: "main",
+      }),
       resetTriggered: false,
     });
     native.attachBackend({
       kind: "embedded",
       isStreaming: () => true,
       cancel: () => {
+        queueMicrotask(() => native.complete());
         releaseSwarmRun("capacity");
         if (nativeFailure) {
           throw nativeError;
         }
       },
     });
-    const runningAbort = vi.fn();
+    const runningAbort = vi.fn(() => {
+      queueMicrotask(() => clearActiveEmbeddedRun("running-session", handle, runningKey));
+    });
     const handle = createEmbeddedRunHandle({ runId: "running", abort: runningAbort });
     setActiveEmbeddedRun("running-session", handle, runningKey);
     const selectedDispatch = vi.fn(async () => {});
     const survivorDispatch = vi.fn(async () => {});
     let pending: ReturnType<typeof tryFastAbortFromMessage> | undefined;
-    let childAdmission: SessionWorkAdmissionLease | undefined;
+    let childAdmission: SessionEffectRef | undefined;
     const preparedAdmission = prepareAgentRunAdmission({
       cfg,
       operationalRunInstance: createOperationalRunInstanceRef("acp-steer"),
@@ -226,7 +253,7 @@ it.each([
         ]);
         expect(acpSignal.aborted).toBe(false);
         expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
-        childAdmission = await beginSessionWorkAdmission({
+        childAdmission = await beginSessionEffect({
           scope: storePath,
           identities: [runningKey, "running-session"],
           run: {
@@ -306,16 +333,33 @@ it.each([
         proceed.resolve();
         await settleCancelRpc();
         expect(stopSettled).toBe(false);
+        childAdmission?.release();
         finishTurn.resolve();
-        expect(await outcome).toEqual({ error: nativeError });
+        const stopped = await outcome;
+        if (!("error" in stopped) || !(stopped.error instanceof AggregateError)) {
+          throw new Error("Expected both native and ACP cancellation failures", { cause: stopped });
+        }
+        expect(stopped.error.message).toBe("Cancellation cleanup failed");
+        expect(stopped.error.errors).toHaveLength(2);
+        expect(stopped.error.errors[0]).toBe(nativeError);
+        const runtimeError = expectBackendCleanupFailure(stopped.error.errors[1]);
+        await expect(turn).rejects.toBe(runtimeError);
         expect(cancel).toHaveBeenCalledOnce();
         return;
       }
       if (active) {
         await nativeInterrupted.promise;
         expect(native.abortSignal.aborted).toBe(true);
-        expect(isSessionWorkAdmissionActive(storePath, [runningKey, "running-session"])).toBe(true);
-        await vi.waitFor(() => expect(acpSignal?.aborted).toBe(true));
+        expect(isSessionControllerWorkActive(storePath, [runningKey, "running-session"])).toBe(
+          true,
+        );
+        await Promise.race([
+          entered.promise,
+          pending.then(() => {
+            throw new Error("Stop missed the bound ACP turn");
+          }),
+        ]);
+        expect(acpSignal?.aborted).toBe(true);
         expect(cancel).toHaveBeenCalledOnce();
         expect(stopSettled).toBe(false);
         expect(selectedDispatch).not.toHaveBeenCalled();
@@ -330,13 +374,7 @@ it.each([
         }
         childAdmission?.release();
       }
-      await Promise.race([
-        entered.promise,
-        pending.then(() => {
-          throw new Error("Stop missed the bound ACP backend");
-        }),
-      ]);
-      expect(native.abortSignal.aborted).toBe(true);
+      await vi.waitFor(() => expect(native.abortSignal.aborted).toBe(true));
       // Native terminal publication is independent of the still-held ACP completion.
       await vi.waitFor(() => expect(runningAbort).toHaveBeenCalledOnce());
       await vi.waitFor(() => expect(survivorDispatch).toHaveBeenCalledOnce());
@@ -352,7 +390,7 @@ it.each([
           abortCutoffTimestamp: 1234567890000,
         }),
       );
-      if (!active || completion !== "reject") {
+      if (active && completion !== "reject") {
         expect(stopSettled).toBe(false);
       }
       proceed.resolve();
@@ -361,20 +399,30 @@ it.each([
         expect(stopSettled).toBe(false);
       }
       finishTurn.resolve();
-      expect(await pending).toEqual({
-        handled: true,
-        aborted: true,
-        stoppedSubagents: 2,
-        failedSubagents: 0,
-      });
-      expect(cancel).toHaveBeenCalledExactlyOnceWith({
-        handle: expect.objectContaining({ sessionKey: acpKey }),
-        reason: "fast-abort",
-      });
-      await turn;
-      expect(readAcpSessionEntry({ cfg, sessionKey: acpKey })?.acp?.state).toBe(
-        !active && completion === "reject" ? "error" : "idle",
-      );
+      if (completion === "reject") {
+        const stopped = await outcome;
+        if (!("error" in stopped)) {
+          throw new Error("Expected the ACP cancellation failure", { cause: stopped });
+        }
+        const runtimeError = expectBackendCleanupFailure(stopped.error);
+        await expect(turn).rejects.toBe(runtimeError);
+      } else {
+        expect(await pending).toEqual({
+          handled: true,
+          aborted: true,
+          stoppedSubagents: 2,
+          failedSubagents: 0,
+        });
+        await turn;
+      }
+      // An idle backend keeps its process; only /acp cancel and reset send it ACP cancel.
+      expect(cancel).toHaveBeenCalledTimes(active ? 1 : 0);
+      if (active) {
+        expect(cancel).toHaveBeenCalledWith(
+          expect.objectContaining({ handle: expect.objectContaining({ sessionKey: acpKey }) }),
+        );
+      }
+      expect(readAcpSessionEntry({ cfg, sessionKey: acpKey })?.acp?.state).toBe("idle");
     } finally {
       stopObservingNative();
       childAdmission?.release();
@@ -384,6 +432,7 @@ it.each([
       await turn?.catch(() => undefined);
       preparedAdmission.close();
       native.complete();
+      await native.ownerSettlement;
       clearActiveEmbeddedRun("running-session", handle, runningKey);
       releaseSwarmRun("capacity");
       releaseSwarmRun("queued");

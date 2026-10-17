@@ -40,6 +40,11 @@ import {
   withPluginRuntimeGatewayRequestScope,
 } from "../../plugins/runtime/gateway-request-scope.js";
 import { GatewayDrainingError } from "../../process/command-queue.js";
+import {
+  createReplyOperation,
+  getSessionControllerOperation,
+  type ReplyOperation,
+} from "../../sessions/session-controller.js";
 import type { VisibleWorkSession } from "../get-reply-options.types.js";
 import {
   getReplyPayloadMetadata,
@@ -63,11 +68,6 @@ import { type BaseRunOptions, createBaseRun } from "./agent-runner.runreplyagent
 import { clearPendingFinalDeliveryAfterSuccess } from "./dispatch-from-config.pending-final.js";
 import { scheduleFollowupDrain } from "./queue.js";
 import { REPLY_OPERATION_RUN_STATE } from "./reply-operation-run-state.js";
-import {
-  createReplyOperation,
-  replyRunRegistry,
-  type ReplyOperation,
-} from "./reply-run-registry.js";
 import { buildTestCtx } from "./test-ctx.js";
 
 function createCliBackendTestConfig() {
@@ -589,7 +589,7 @@ describe("runReplyAgent auto-compaction token update", () => {
 
     vi.mocked(scheduleFollowupDrain).mockImplementation((key) => {
       expect(key).toBe(sessionKey);
-      expect(replyRunRegistry.get(sessionKey)).toBeUndefined();
+      expect(getSessionControllerOperation(sessionKey)).toBeUndefined();
       deliveryOrder.push("followup");
     });
 
@@ -605,7 +605,7 @@ describe("runReplyAgent auto-compaction token update", () => {
     }).run();
 
     expectReplyText(result, "ok");
-    expect(replyRunRegistry.get(sessionKey)).toBe(replyOperation);
+    expect(getSessionControllerOperation(sessionKey)).toBe(replyOperation);
     expect(replyOperation.result).toBeNull();
     expect(scheduleFollowupDrain).not.toHaveBeenCalled();
 
@@ -2116,6 +2116,7 @@ describe("runReplyAgent visible work delivery", () => {
               reply: {
                 opts,
                 replyOperation: opts?.replyOperation,
+                queueKey: ctx.SessionKey,
                 sessionKey: ctx.SessionKey,
                 storePath,
                 sessionEntry,

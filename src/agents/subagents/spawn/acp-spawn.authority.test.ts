@@ -23,6 +23,7 @@ import { flushLogger, resetLogger } from "../../../logging/logger.js";
 import { loadActivatedBundledPluginPublicSurfaceModule } from "../../../plugin-sdk/facade-runtime.js";
 import { getActivePluginRegistry } from "../../../plugins/runtime.js";
 import * as gatewayScope from "../../../plugins/runtime/gateway-request-scope.js";
+import { captureSessionTarget } from "../../../sessions/session-controller.lifecycle.js";
 import { listSessionStateEventsSince } from "../../../sessions/session-state-events.js";
 import { AsyncWorkScope } from "../../../shared/async-work-scope.js";
 import { openOpenClawStateDatabase } from "../../../state/openclaw-state-db.js";
@@ -134,7 +135,11 @@ it.each([
   "pending ACP spawn transfers work only from its live parent: %s / %s",
   async (stage, closure) => {
     const cfg = configRuntime.getRuntimeConfig();
-    await registryPersistence.writeChildSession(stateDir, parentSessionKey, "parent-session");
+    const storePath = await registryPersistence.writeSubagentSessionEntry({
+      stateDir,
+      ...parentScope,
+      defaultSessionId: "parent-session",
+    });
     const live = closure === "live";
     const thread = stage === "thread";
     const readChild = (sessionKey: string) =>
@@ -159,7 +164,12 @@ it.each([
       "acp-authority-test",
     );
     const parent = registerChatAbortController({
-      chatAbortControllers: context.chatAbortControllers,
+      target: captureSessionTarget({
+        storeScope: storePath,
+        sessionKey: parentSessionKey,
+        incarnation: "parent-session",
+        agentId: "main",
+      }),
       runId: parentRunId,
       ...parentScope,
       sessionId: "parent-session",

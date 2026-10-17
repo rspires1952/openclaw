@@ -1,6 +1,10 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { resolveActiveEmbeddedRunSessionId } from "../../agents/embedded-agent-runner/active-run-projections.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import {
+  getSessionControllerOperation,
+  captureCurrentReplyMessageInjectionTarget,
+} from "../../sessions/session-controller.js";
+import { resolveActiveSessionRunId } from "../../sessions/session-controller.queries.js";
 import {
   isAuthorizedTextSlashCommandTurn,
   isNativeCommandTurn,
@@ -8,7 +12,6 @@ import {
 } from "../command-turn-context.js";
 import type { MsgContext } from "../templating.js";
 import { resolveCommandSourceSessionKey } from "./command-source-session-key.js";
-import { replyRunRegistry } from "./reply-run-registry.js";
 
 export function parseSteerMessage(raw: string): string | null {
   const match = raw.trim().match(/^\/(?:steer|tell)(?:\s+([\s\S]*))?$/i);
@@ -27,6 +30,32 @@ function listSteerCandidateSessionKeys(targetSessionKey: string): string[] {
     : [targetSessionKey];
 }
 
+// Reads the steer payload of a native or authorized text command turn; null when
+// that turn is not the /steer command. Uses the handler's own matcher.
+function readExplicitSteerMessage(ctx: MsgContext, commandBody?: string): string | null {
+  const commandTurn = resolveCommandTurnContext(ctx);
+  if (!isNativeCommandTurn(commandTurn) && !isAuthorizedTextSlashCommandTurn(commandTurn)) {
+    return null;
+  }
+  return parseSteerMessage(
+    commandBody ??
+      commandTurn.body ??
+      normalizeOptionalString(ctx.CommandBody) ??
+      normalizeOptionalString(ctx.BodyForCommands) ??
+      normalizeOptionalString(ctx.Body) ??
+      "",
+  );
+}
+
+/**
+ * True when this turn is an explicit /steer command. Its handler only replies with
+ * usage or hands the message to queue policy, so admission must let it reach that
+ * policy beside the active turn it steers instead of waiting for that turn to end.
+ */
+export function isExplicitSteerCommandTurn(ctx: MsgContext): boolean {
+  return readExplicitSteerMessage(ctx) !== null;
+}
+
 /**
  * Resolve an authorized explicit steer command to the exact session that owns
  * an injectable active reply. This is intentionally read-only: callers decide
@@ -38,18 +67,7 @@ export function resolveActiveExplicitSteerSessionKey(params: {
   sessionKey?: string;
   commandBody?: string;
 }): string | undefined {
-  const commandTurn = resolveCommandTurnContext(params.ctx);
-  if (!isNativeCommandTurn(commandTurn) && !isAuthorizedTextSlashCommandTurn(commandTurn)) {
-    return undefined;
-  }
-  const commandBody =
-    params.commandBody ??
-    commandTurn.body ??
-    normalizeOptionalString(params.ctx.CommandBody) ??
-    normalizeOptionalString(params.ctx.BodyForCommands) ??
-    normalizeOptionalString(params.ctx.Body) ??
-    "";
-  const message = parseSteerMessage(commandBody);
+  const message = readExplicitSteerMessage(params.ctx, params.commandBody);
   if (!message) {
     return undefined;
   }
@@ -62,10 +80,10 @@ export function resolveActiveExplicitSteerSessionKey(params: {
     return undefined;
   }
   for (const candidateKey of listSteerCandidateSessionKeys(sourceSessionKey)) {
-    const operation = replyRunRegistry.get(candidateKey);
+    const operation = getSessionControllerOperation(candidateKey);
     const hasActiveOwner = operation
-      ? replyRunRegistry.resolveCurrentMessageInjectionTarget(candidateKey) !== undefined
-      : resolveActiveEmbeddedRunSessionId(candidateKey) !== undefined;
+      ? captureCurrentReplyMessageInjectionTarget(candidateKey) !== undefined
+      : resolveActiveSessionRunId(candidateKey) !== undefined;
     if (hasActiveOwner) {
       return candidateKey;
     }

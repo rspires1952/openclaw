@@ -1,12 +1,8 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import {
-  abortEmbeddedAgentRun,
-  isEmbeddedAgentRunHandleActive,
-  waitForEmbeddedAgentRunEnd,
-} from "../../agents/embedded-agent-runner/runs.js";
+import { abortEmbeddedAgentRun } from "../../agents/embedded-agent-runner/runs.js";
+import type { SessionPlacementTurnParams } from "../../agents/session-placement-admission.js";
 import { makeAgentAssistantMessage } from "../../agents/test-helpers/agent-message-fixtures.js";
-import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.js";
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
 import {
   getDiagnosticSessionActivitySnapshot,
@@ -17,6 +13,9 @@ import {
   markGatewayRestartDraining,
   resetGatewayWorkAdmission,
 } from "../../process/gateway-work-admission.js";
+import { withSessionTurn } from "../../sessions/session-controller.admission.js";
+import type { ReplyOperation } from "../../sessions/session-controller.contracts.js";
+import { waitForSessionRunEnd } from "../../sessions/session-controller.native-runtime.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.js";
 import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
@@ -101,7 +100,7 @@ async function createBuildRecoveryHarness(
     refreshInPlace?: boolean;
     afterReconcile?: () => void | Promise<void>;
     waitForAdmissionNode?: WorkerTurnLauncherOptions["waitForAdmissionNode"];
-    replyOperation?: ReturnType<typeof createReplyOperation>;
+    replyOperation?: ReplyOperation;
     duringRetryPreparation?: () => void;
   } = {},
 ) {
@@ -442,6 +441,7 @@ describe("worker turn launcher build recovery", () => {
     const claimTurn = vi.spyOn(placements, "claimTurn");
     const provider = createWorkerSessionTurnPlacementProvider({ placements, environments });
     const input = turn();
+    let executionTurn: SessionPlacementTurnParams | undefined;
     const onAdmitted = vi.fn();
     return {
       acquireTurnCredential,
@@ -450,6 +450,13 @@ describe("worker turn launcher build recovery", () => {
       listeners,
       onAdmitted,
       reachedAdmission: reachedAdmission.promise,
+      watchdog() {
+        const watchdog = executionTurn?.replyOperation?.watchdog;
+        if (!watchdog) {
+          throw new Error("runtime refresh did not capture its admitted operation watchdog");
+        }
+        return watchdog;
+      },
       progress() {
         expect(placements.get(SESSION_ID)?.turnClaim).toBeNull();
         for (const listener of listeners) {
@@ -472,13 +479,30 @@ describe("worker turn launcher build recovery", () => {
         settled.resolve();
         input.preparedRunAdmission.close();
       },
-      execute: (signal: AbortSignal) =>
-        provider.executeTurn(
-          { sessionId: SESSION_ID, sessionKey: SESSION_KEY, agentId: "main", runId: input.runId },
-          { ...input, abortSignal: signal },
-          vi.fn(async () => ({ meta: { durationMs: 1 } })),
-          onAdmitted,
-        ),
+      execute: (signal: AbortSignal) => {
+        return withSessionTurn(
+          {
+            sessionId: SESSION_ID,
+            sessionKey: SESSION_KEY,
+            storePath: sessionTarget.storePath,
+            abortSignal: signal,
+          },
+          async (operation, turnSignal) => {
+            executionTurn = { ...input, replyOperation: operation, abortSignal: turnSignal };
+            return provider.executeTurn(
+              {
+                sessionId: SESSION_ID,
+                sessionKey: SESSION_KEY,
+                agentId: "main",
+                runId: input.runId,
+              },
+              executionTurn,
+              vi.fn(async () => ({ meta: { durationMs: 1 } })),
+              onAdmitted,
+            );
+          },
+        );
+      },
     };
   }
 
@@ -487,7 +511,15 @@ describe("worker turn launcher build recovery", () => {
     async (fence) => {
       const harness = await createRefreshWaitHarness(fence);
       const controller = new AbortController();
-      const execution = harness.execute(controller.signal);
+      // Admission captures this function synchronously; every awaited frame keeps real time.
+      const clock = vi.spyOn(Date, "now");
+      const execution = (() => {
+        try {
+          return harness.execute(controller.signal);
+        } finally {
+          clock.mockRestore();
+        }
+      })();
       const result = execution.catch((error: unknown) => error);
       try {
         await Promise.race([harness.reachedAdmission, execution]);
@@ -496,7 +528,16 @@ describe("worker turn launcher build recovery", () => {
         expect(harness.onAdmitted).not.toHaveBeenCalled();
         expect(harness.launchTurn).not.toHaveBeenCalled();
         expect(harness.claimTurn).toHaveBeenCalledTimes(fence ? 1 : 0);
-        harness.progress();
+        const watchdog = harness.watchdog();
+        const beforeProgress = watchdog.snapshot().transportProgressAtMs;
+        const progressAt = beforeProgress + 1;
+        clock.mockReturnValue(progressAt);
+        try {
+          harness.progress();
+          expect(watchdog.snapshot().transportProgressAtMs).toBe(progressAt);
+        } finally {
+          clock.mockRestore();
+        }
         expect(
           getDiagnosticSessionActivitySnapshot({ sessionId: SESSION_ID, sessionKey: SESSION_KEY })
             .lastProgressReason,
@@ -505,7 +546,7 @@ describe("worker turn launcher build recovery", () => {
         await expect(execution).resolves.toMatchObject({
           payloads: [{ text: "Ran on the refreshed worker" }],
         });
-        await waitForEmbeddedAgentRunEnd(SESSION_ID, null);
+        await waitForSessionRunEnd(SESSION_ID, null);
         expect(harness.claimTurn).toHaveBeenCalledTimes(fence ? 2 : 1);
         expect(harness.acquireTurnCredential).toHaveBeenCalledOnce();
         expect(harness.onAdmitted).toHaveBeenCalledOnce();
@@ -616,35 +657,32 @@ describe("worker turn launcher build recovery", () => {
   it.each(["backend", "reply"] as const)(
     "accepts Stop through the %s owner between refresh and retry preparation",
     async (cancellation) => {
-      const operation = createReplyOperation({
-        sessionId: SESSION_ID,
-        sessionKey: SESSION_KEY,
-        resetTriggered: false,
-      });
-      operation.setPhase("running");
-      const duringRetryPreparation = vi.fn(() => {
-        // The retry now owns cancellation before resolving its workspace.
-        expect(isEmbeddedAgentRunHandleActive(SESSION_ID)).toBe(true);
-        expect(
-          cancellation === "reply" ? operation.abortByUser() : abortEmbeddedAgentRun(SESSION_ID),
-        ).toBe(true);
-      });
-      const harness = await createBuildRecoveryHarness({
-        rejection: "pending refresh",
-        refreshInPlace: true,
-        replyOperation: operation,
-        duringRetryPreparation,
-      });
-      try {
-        await expect(harness.execute(operation.abortSignal)).rejects.toThrow();
-        expect(duringRetryPreparation).toHaveBeenCalledOnce();
-        // Backend cancellation closes its effective turn signal, not the upstream reply signal.
-        expect(operation.abortSignal.aborted).toBe(cancellation === "reply");
-        expect(harness.launchTurn).not.toHaveBeenCalled();
-        expect(placements.get(SESSION_ID)?.turnClaim).toBeNull();
-      } finally {
-        operation.complete();
-      }
+      await withSessionTurn(
+        { sessionKey: SESSION_KEY, sessionId: SESSION_ID, storePath: sessionTarget.storePath },
+        async (operation) => {
+          if (!operation) {
+            throw new Error("Expected an admitted controller operation");
+          }
+          const duringRetryPreparation = vi.fn(() => {
+            expect(
+              cancellation === "reply"
+                ? operation.abortByUser()
+                : abortEmbeddedAgentRun(SESSION_ID),
+            ).toBe(true);
+          });
+          const harness = await createBuildRecoveryHarness({
+            rejection: "pending refresh",
+            refreshInPlace: true,
+            replyOperation: operation,
+            duringRetryPreparation,
+          });
+          await expect(harness.execute(operation.abortSignal)).rejects.toThrow();
+          expect(duringRetryPreparation).toHaveBeenCalledOnce();
+          expect(operation.abortSignal.aborted).toBe(true);
+          expect(harness.launchTurn).not.toHaveBeenCalled();
+          expect(placements.get(SESSION_ID)?.turnClaim).toBeNull();
+        },
+      );
     },
   );
 
@@ -704,7 +742,7 @@ describe("worker turn launcher build recovery", () => {
         const settled = await result;
         if (outcome === "reconnected") {
           expect(settled).toHaveProperty("value");
-          await waitForEmbeddedAgentRunEnd(SESSION_ID, null);
+          await waitForSessionRunEnd(SESSION_ID, null);
           expect(harness.launchTurn).toHaveBeenCalledOnce();
           await expectSinglePersistedInput();
         } else {
@@ -756,7 +794,7 @@ describe("worker turn launcher build recovery", () => {
       const before = placements.get(SESSION_ID);
       const result = await harness.execute();
       expect(result.payloads).toEqual([{ text: "Continued on the replacement worker" }]);
-      await waitForEmbeddedAgentRunEnd(SESSION_ID, null);
+      await waitForSessionRunEnd(SESSION_ID, null);
       expect(harness.redispatchPlacement).not.toHaveBeenCalled();
       expect(harness.launchTurn).toHaveBeenCalledOnce();
       expect(harness.onAdmitted).toHaveBeenCalledOnce();
@@ -783,7 +821,7 @@ describe("worker turn launcher build recovery", () => {
       const harness = await createBuildRecoveryHarness({ rejection });
       const result = await harness.execute(new AbortController().signal);
       expect(result.payloads).toEqual([{ text: "Continued on the replacement worker" }]);
-      await waitForEmbeddedAgentRunEnd(SESSION_ID, null);
+      await waitForSessionRunEnd(SESSION_ID, null);
       expect(harness.redispatchPlacement).toHaveBeenCalledOnce();
       expect(harness.onAdmitted).toHaveBeenCalledOnce();
       expect(harness.launchTurn).toHaveBeenCalledOnce();

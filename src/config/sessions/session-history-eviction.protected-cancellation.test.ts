@@ -3,7 +3,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetAgentRunRegistryForTest } from "../../infra/agent-run-registry.js";
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
-import * as lifecycle from "../../sessions/session-lifecycle-admission.js";
+import * as lifecycle from "../../sessions/session-controller.lifecycle.js";
 import {
   closeOpenClawAgentDatabaseByPathAsync,
   closeOpenClawAgentDatabasesAsync,
@@ -87,9 +87,9 @@ describe("protected historical session cancellation", () => {
       vi.spyOn(diskBudget, "measureSessionPhysicalDiskUsage").mockImplementation(
         async (pathname) => {
           if (protectionChanged) {
-            expect(
-              lifecycle.isSessionLifecycleMutationActive(storePath, [protectedHistory.sessionId]),
-            ).toBe(false);
+            expect(lifecycle.isSessionMutationActive(storePath, [protectedHistory.sessionId])).toBe(
+              false,
+            );
           }
           return await measure(pathname);
         },
@@ -111,23 +111,22 @@ describe("protected historical session cancellation", () => {
         protectionChanged = true;
       };
       if (stage === "planning") {
-        const mutate = lifecycle.runExclusiveSessionLifecycleMutation;
-        vi.spyOn(lifecycle, "runExclusiveSessionLifecycleMutation").mockImplementation(
-          (operation, params) =>
-            mutate(operation, {
-              ...params,
-              run: async () => {
-                if (
-                  !protectionChanged &&
-                  "scope" in params &&
-                  params.scope === storePath &&
-                  Array.from(params.identities).includes(protectedHistory.sessionId)
-                ) {
-                  releasePressure();
-                }
-                return await params.run();
-              },
-            }),
+        const mutate = lifecycle.runSessionMutation;
+        vi.spyOn(lifecycle, "runSessionMutation").mockImplementation((params) =>
+          mutate({
+            ...params,
+            run: async () => {
+              if (
+                !protectionChanged &&
+                "scope" in params &&
+                params.scope === storePath &&
+                Array.from(params.identities).includes(protectedHistory.sessionId)
+              ) {
+                releasePressure();
+              }
+              return await params.run();
+            },
+          }),
         );
       }
       if (stage === "materialization") {

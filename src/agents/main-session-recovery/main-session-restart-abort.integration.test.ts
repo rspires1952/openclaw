@@ -22,6 +22,7 @@ import {
   getAgentEventLifecycleGeneration,
   rotateAgentEventLifecycleGeneration,
 } from "../../infra/agent-events.js";
+import { beginSessionEffect } from "../../sessions/session-controller.lifecycle.js";
 import {
   closeOpenClawAgentDatabasesAsync,
   openOpenClawAgentDatabase,
@@ -135,7 +136,7 @@ it.each([
       markRestartAbortedMainSessions({
         resolveGatewayContext: () => undefined,
         stateDir: state.stateDir,
-        activeRuns: [{ sessionKey, sessionId, runId, lifecycleGeneration }],
+        activeRuns: [{ ...target, sessionId, runId, lifecycleGeneration }],
         isActiveRun: () => isActive,
       });
     if (order === "before settlement" || order === "after settlement" || automationDrain) {
@@ -218,26 +219,24 @@ it.each([
       getDispatchSettlement: () => dispatchSettlement.promise,
       sendRecoveryNotice: vi.fn(async () => ({ suppressed: false })),
     });
-    const recover = (activeSessionIds?: string[]) =>
+    const recover = () =>
       recoverRestartAbortedMainSessions({
         stateDir: state.stateDir,
         gatewayRuntime: runtime,
-        ...(activeSessionIds ? { activeSessionIds } : {}),
       });
     try {
       if (order === "persisted interruption") {
         const info = vi.spyOn(mainSessionRecoveryLog, "info");
+        const liveWork = await beginSessionEffect({
+          scope: target.storePath,
+          identities: [sessionKey, sessionId],
+          assertAllowed() {},
+        });
         try {
           await markStartupOrphanedMainSessionsForRecovery({
             stateDir: state.stateDir,
-            activeSessionIds: [sessionId],
           });
-          expect(await recover([sessionId])).toEqual({
-            started: 0,
-            settled: 0,
-            failed: 0,
-            skipped: 1,
-          });
+          expect(await recover()).toEqual({ started: 0, settled: 0, failed: 0, skipped: 1 });
           expect(dispatch).not.toHaveBeenCalled();
           expect(loadSessionEntry(target)?.restartRecoveryTerminalRunIds).toEqual([
             "previous-completed-run",
@@ -248,6 +247,7 @@ it.each([
             ),
           );
         } finally {
+          liveWork.release();
           info.mockRestore();
         }
       }

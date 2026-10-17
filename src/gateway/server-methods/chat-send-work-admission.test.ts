@@ -1,3 +1,4 @@
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import {
@@ -6,12 +7,14 @@ import {
   retainGatewayRootWorkAdmissionContinuation,
   tryBeginGatewayRootWorkAdmission,
 } from "../../process/gateway-work-admission.js";
+import { getRpcSource } from "../../sessions/session-controller.rpc-sources.js";
 import {
   captureGatewayDeviceRevocation,
   retainGatewayDeviceRevocation,
 } from "../device-revocation.js";
 import * as restartRecovery from "./chat-restart-recovery.js";
 import { createChatSendWorkAdmission } from "./chat-send-work-admission.js";
+import { registerRpcSourceForTest } from "./rpc-source-fixtures.test-support.js";
 
 describe("retained chat work admission", () => {
   afterEach(resetGatewayWorkAdmission);
@@ -20,8 +23,17 @@ describe("retained chat work admission", () => {
     async (change) => {
       const release = vi.fn();
       const resume = createDeferred();
-      const sessionBinding = { sessionId: "terminal-session" };
-      let registered = sessionBinding;
+      const key = "agent:main:terminal";
+      const storePath = "/isolated/terminal.sqlite";
+      const identity = {
+        runId: "terminal-run",
+        sessionId: "terminal-session",
+        sessionKey: key,
+        agentId: "main",
+        storeScope: storePath,
+      };
+      const registration = registerRpcSourceForTest(identity);
+      const sourceRef = expectDefined(registration.entry, "terminal source registration");
       let active = true;
       let guard: (() => void) | undefined;
       const terminal = vi
@@ -32,8 +44,6 @@ describe("retained chat work admission", () => {
           params.assertCurrent();
           return true;
         });
-      const key = "agent:main:terminal";
-      const storePath = "/isolated/terminal.sqlite";
       const work = createChatSendWorkAdmission({
         admission: { release },
         logGateway: { warn: vi.fn() },
@@ -49,12 +59,12 @@ describe("retained chat work admission", () => {
             readSource: { agentId: "main", path: storePath, databaseIdentity: "original-source" },
           },
           storePath,
-          sessionBinding,
-          admittedSessionId: sessionBinding.sessionId,
-          runId: "terminal-run",
+          sourceRef,
+          admittedSessionId: identity.sessionId,
+          runId: identity.runId,
           lifecycleRevision: "original-lifecycle",
           isActive: () => active,
-          currentRegistration: () => registered,
+          currentRegistration: () => getRpcSource(identity.runId),
         },
       });
       const settling = work.settleTerminal({ startedAt: 1, status: "killed", retryable: false });
@@ -65,10 +75,13 @@ describe("retained chat work admission", () => {
       try {
         expect(guard).toBeTypeOf("function");
         work.release();
+        registration.cleanup();
+        expect(getRpcSource(identity.runId)).toBeUndefined();
         guard?.();
         expect(release).not.toHaveBeenCalled();
         if (change === "replaced") {
-          registered = { sessionId: sessionBinding.sessionId };
+          const replacement = registerRpcSourceForTest(identity);
+          expect(replacement.entry).not.toBe(sourceRef);
         } else if (change === "released") {
           active = false;
         }

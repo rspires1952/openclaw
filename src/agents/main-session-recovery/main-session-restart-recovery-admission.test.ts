@@ -11,6 +11,7 @@ import {
 import { callGateway } from "../../gateway/call.js";
 import { createChannelAutostartRecovery } from "../../gateway/server-channel-autostart-recovery.js";
 import { createGatewayInstanceRuntime } from "../../gateway/server-instance-runtime.js";
+import type { GatewayRecoveryRuntime } from "../../gateway/server-instance-runtime.types.js";
 import { markGatewayStartupMainSessionOrphans } from "../../gateway/server-startup-observers.js";
 import * as transcriptReaders from "../../gateway/session-transcript-readers.js";
 import {
@@ -28,14 +29,10 @@ import {
   resetGatewayWorkAdmission,
   tryBeginGatewaySuspendAdmission,
 } from "../../process/gateway-work-admission.js";
-import {
-  getSessionWorkAdmissionOwnerRelease,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
+import { captureSessionTarget } from "../../sessions/session-controller.lifecycle.js";
+import { getExistingSessionControllerMailbox } from "../../sessions/session-controller.mailbox.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
-import { waitForFast } from "../subagent-test-fixtures.test-helpers.js";
-import { MAIN_SESSION_RECOVERY_WORK_ADMISSION_OWNER } from "./main-session-recovery-admission.js";
 import { createRecoveryRuntimeFixture } from "./main-session-recovery-runtime.test-support.js";
 import * as recoveryTargets from "./main-session-restart-recovery-exact-target.js";
 import {
@@ -59,6 +56,22 @@ const gatewayRuntime = createRecoveryRuntimeFixture({
   getDispatchSettlement: () => dispatchSettlement.promise,
   sendRecoveryNotice: async () => ({ suppressed: false }),
 });
+
+/** Reads the durable reservation at the moment the resend's mailbox input settles. */
+function observeReservationAtResendSettlement(params: {
+  storePath: string;
+  sessionKey: string;
+  runId: unknown;
+}) {
+  const input = getExistingSessionControllerMailbox(
+    params.sessionKey,
+    captureSessionTarget({ storeScope: params.storePath, sessionKey: params.sessionKey }),
+  )?.entries.find((entry) => entry.protocolRunId === params.runId);
+  expect(input, "the resend must be a mailbox input").toBeDefined();
+  return input!.settlement.promise.then(
+    () => loadSessionEntry(params)?.mainRestartRecovery?.reservation,
+  );
+}
 
 describe("startup recovery admission", () => {
   let tmpDir: string;
@@ -304,50 +317,39 @@ describe("startup recovery admission", () => {
     },
   );
 
-  it("skips a recovery target replaced while its admission waits", async () => {
+  it("skips a recovery target replaced while runtime preparation waits", async () => {
     const { storePath, sessionKey } = await makeMainSessionFixture();
-    const mutationEntered = createDeferred();
-    const releaseMutation = createDeferred();
-    const mutation = runExclusiveSessionLifecycleMutation("recover", {
-      scope: storePath,
-      identities: [sessionKey, "main-session"],
-      run: async () => {
-        mutationEntered.resolve();
-        await releaseMutation.promise;
-        await replaceSessionEntry(
-          { storePath, sessionKey },
-          { sessionId: "replacement-session", updatedAt: Date.now(), status: "done" },
-        );
-      },
-    });
-    await mutationEntered.promise;
+    const preparationEntered = createDeferred();
+    const releasePreparation = createDeferred();
     const recovery = retryRestartAbortedMainSessionRecovery({
       expectedSessionId: "main-session",
       storePath,
       sessionKey,
-      gatewayRuntime,
+      gatewayRuntime: {
+        ...gatewayRuntime,
+        prepareRestartRecovery: async () => {
+          preparationEntered.resolve();
+          await releasePreparation.promise;
+          return undefined;
+        },
+      },
     });
     try {
-      await waitForFast(() =>
-        expect(
-          getSessionWorkAdmissionOwnerRelease({
-            scope: storePath,
-            identities: [sessionKey, "main-session"],
-            owner: MAIN_SESSION_RECOVERY_WORK_ADMISSION_OWNER,
-          }),
-        ).toBeDefined(),
+      await preparationEntered.promise;
+      await replaceSessionEntry(
+        { storePath, sessionKey },
+        { sessionId: "replacement-session", updatedAt: Date.now(), status: "done" },
       );
-      releaseMutation.resolve();
-      await mutation;
-      await expect(recovery).resolves.toEqual({ started: 0, settled: 0, failed: 0, skipped: 1 });
+      releasePreparation.resolve();
+      await expect(recovery).resolves.toEqual({ started: 0, settled: 0, failed: 0, skipped: 0 });
       expect(callGateway).not.toHaveBeenCalled();
       expect(loadSessionEntry({ storePath, sessionKey })).toMatchObject({
         sessionId: "replacement-session",
         status: "done",
       });
     } finally {
-      releaseMutation.resolve();
-      await Promise.allSettled([mutation, recovery]);
+      releasePreparation.resolve();
+      await recovery;
     }
   });
 
@@ -730,6 +732,57 @@ describe("startup recovery admission", () => {
     }
   });
 
+  it("keeps a queued resend waiting past the start observation without another attempt", async () => {
+    const { storePath, sessionKey } = await makeMainSessionFixture({
+      pendingFinalDelivery: makePendingFinalDelivery(),
+    });
+    const accepted = createDeferred();
+    let executionStarted = false;
+    let markStarted: (() => void) | undefined;
+    // The Gateway reports a queued input's start budget as null (no deadline).
+    const queuedRuntime: GatewayRecoveryRuntime = {
+      ...gatewayRuntime,
+      dispatchAgent: async <T>(
+        request: Parameters<GatewayRecoveryRuntime["dispatchAgent"]>[0],
+        _timeoutMs?: number,
+        options?: Parameters<GatewayRecoveryRuntime["dispatchAgent"]>[2],
+      ) => {
+        await callGateway({ method: "agent", params: request });
+        options?.onStartOwner?.({
+          observe: () =>
+            executionStarted ? { executionStarted } : { executionStarted, startDeadlineAtMs: null },
+          abort: () => false,
+        });
+        options?.onAccepted?.({ runId: request.idempotencyKey, status: "accepted" });
+        markStarted = options?.onExecutionStarted;
+        accepted.resolve();
+        await dispatchSettlement.promise;
+        return { runId: request.idempotencyKey, status: "ok" } as T;
+      },
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const recovery = retryRestartAbortedMainSessionRecovery({
+        expectedSessionId: "main-session",
+        gatewayRuntime: queuedRuntime,
+        sessionKey,
+        storePath,
+      });
+      await accepted.promise;
+      await vi.advanceTimersByTimeAsync(60_000);
+      executionStarted = true;
+      markStarted?.();
+      await expect(recovery).resolves.toEqual({ started: 1, settled: 0, failed: 0, skipped: 0 });
+      expect(callGateway).toHaveBeenCalledOnce();
+      expect(loadSessionEntry({ storePath, sessionKey })?.mainRestartRecovery).toMatchObject({
+        chargedAttempts: 1,
+      });
+    } finally {
+      dispatchSettlement.resolve();
+      vi.useRealTimers();
+    }
+  });
+
   it.for([
     { name: "the final startup retry consumes the last charge", agentId: "main", dirs: ["main"] },
     {
@@ -757,6 +810,7 @@ describe("startup recovery admission", () => {
         targets.push({ agentId, sessionKey, storePath: fixture.storePath });
       }
       const { storePath } = targets[0]!;
+      let reservationAtSettlement: Promise<unknown> | undefined;
       if (multipleStores) {
         vi.mocked(callGateway).mockImplementation(async ({ method }) => {
           if (method === "agent") {
@@ -766,7 +820,12 @@ describe("startup recovery admission", () => {
         });
       } else {
         vi.mocked(callGateway)
-          .mockImplementationOnce(async () => {
+          .mockImplementationOnce(async (request) => {
+            reservationAtSettlement = observeReservationAtResendSettlement({
+              storePath,
+              sessionKey,
+              runId: (request.params as { idempotencyKey?: unknown }).idempotencyKey,
+            });
             await replaceSessionEntry(
               { sessionKey: "agent:main:fresh", storePath },
               {
@@ -810,6 +869,8 @@ describe("startup recovery admission", () => {
           vi.mocked(callGateway).mock.calls.filter(([call]) => call.method === "agent"),
         ).toHaveLength(2);
       } else {
+        // The failed attempt's rollback commits before its mailbox input settles.
+        await expect(reservationAtSettlement).resolves.toBeUndefined();
         const freshEntry = loadSessionEntry({ sessionKey: "agent:main:fresh", storePath });
         expect(freshEntry).toMatchObject({
           sessionId: "fresh-session",

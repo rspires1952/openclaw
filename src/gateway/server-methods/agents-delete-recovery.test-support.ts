@@ -5,14 +5,13 @@ import {
   withinTest,
 } from "../../../test/helpers/promise.js";
 import { AgentDeletionAuthorityRollbackError } from "../../agents/agent-lifecycle-registry.js";
-import { EMBEDDED_RUN_WAITERS } from "../../agents/embedded-agent-runner/run-state.js";
 import {
-  clearActiveEmbeddedRun,
-  resolveEmbeddedAgentRunProgressState,
-  setActiveEmbeddedRun,
-} from "../../agents/embedded-agent-runner/runs.js";
-import { createEmbeddedRunHandle } from "../../agents/embedded-agent-runner/runs.test-support.js";
-import { SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS } from "../../sessions/session-lifecycle-admission.js";
+  clearTestEmbeddedRun as clearActiveEmbeddedRun,
+  registerTestEmbeddedRun as setActiveEmbeddedRun,
+  createEmbeddedRunHandle,
+} from "../../agents/embedded-agent-runner/runs.test-support.js";
+import { SESSION_CONTROLLER_DRAIN_TIMEOUT_MS } from "../../sessions/session-controller.lifecycle.js";
+import { resolveSessionRunProgressState } from "../../sessions/session-controller.queries.js";
 import * as sessionPlacement from "../worker-environments/session-placement-lifecycle.js";
 import {
   deletionJournal,
@@ -95,8 +94,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
     try {
       const deletion = remove();
       await expect(deletion.promise).rejects.toBe(placementError);
-      expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeDefined();
-      expect(EMBEDDED_RUN_WAITERS.has(sessionId)).toBe(false);
+      expect(resolveSessionRunProgressState(sessionId)).toBeDefined();
       expectStorageUntouched(handle.abort);
     } finally {
       prepareStop.mockRestore();
@@ -133,7 +131,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
       const failed = vi.fn();
       const completed = Promise.resolve(deletion.promise).catch(failed);
       try {
-        await vi.advanceTimersByTimeAsync(SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS);
+        await vi.advanceTimersByTimeAsync(SESSION_CONTROLLER_DRAIN_TIMEOUT_MS);
         expect(failed).toHaveBeenCalledOnce();
         expect(failed).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -152,8 +150,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
         } else {
           expectUncalled(mocks.closeOpenClawAgentDatabaseByPath, mocks.beginAgentDeletionRollback);
         }
-        expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeDefined();
-        expect(EMBEDDED_RUN_WAITERS.has(sessionId)).toBe(false);
+        expect(resolveSessionRunProgressState(sessionId)).toBeDefined();
         expectStorageUntouched();
       } finally {
         if (slowPlacement) {
@@ -214,9 +211,8 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
           ]),
         );
         expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledOnce();
-        expect(EMBEDDED_RUN_WAITERS.has(sessionId)).toBe(false);
-        expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeUndefined();
-        expect(resolveEmbeddedAgentRunProgressState("other-session")).toBeDefined();
+        expect(resolveSessionRunProgressState(sessionId)).toBeUndefined();
+        expect(resolveSessionRunProgressState("other-session")).toBeDefined();
         mocks.loadConfigReturn = agentConfig({ main: {} });
         mocks.findAgentEntryIndex.mockReturnValue(-1);
         mocks.readAgentDeletionJournal.mockReturnValue(deletionJournal({ cleanupCompleted: true }));

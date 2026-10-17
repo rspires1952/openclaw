@@ -6,7 +6,6 @@ import {
   getCommandLaneSnapshot,
   publishLaneConfiguration,
   resetAllLanes,
-  resetCommandLane,
   setCommandLaneConcurrency,
 } from "./command-queue.js";
 import { CommandLane } from "./lanes.js";
@@ -223,7 +222,7 @@ describe("command lane capacity groups", () => {
     await newerHook;
   });
 
-  test("multi-slot reset re-arbitrates before stale completions arrive", async () => {
+  test("multi-slot restart re-arbitrates before stale completions arrive", async () => {
     setCommandLaneGroup(GROUP, { budget: 2, members: [CRON, HOOK] });
 
     const staleGates = [createDeferred(), createDeferred()];
@@ -240,7 +239,7 @@ describe("command lane capacity groups", () => {
       enqueueCommandInLane(HOOK, async () => await g.promise, { priority: "background" }),
     );
 
-    expect(resetCommandLane(HOOK)).toBe(2);
+    resetAllLanes();
     expect(getCommandLaneSnapshot(CRON)).toMatchObject({ activeCount: 1, queuedCount: 0 });
     expect(getCommandLaneSnapshot(HOOK)).toMatchObject({ activeCount: 1, queuedCount: 1 });
     expect(getCommandLaneSnapshot(HOOK).groupActive).toBe(2);
@@ -373,7 +372,7 @@ describe("command lane capacity groups", () => {
     expect(() => setCommandLaneGroup(GROUP, { budget: 2, members: ["cron", HOOK] })).toThrow(
       /cannot join a capacity group/,
     );
-    for (const lane of ["session:abc", "subagent:agent:main:parent"]) {
+    for (const lane of ["session:probe-setup-inference:openai", "subagent:agent:main:parent"]) {
       expect(() => setCommandLaneGroup(GROUP, { budget: 2, members: [lane, HOOK] })).toThrow(
         /cannot join a capacity group/,
       );

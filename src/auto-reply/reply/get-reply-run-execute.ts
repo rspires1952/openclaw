@@ -27,6 +27,7 @@ import { resolveGroupSessionKey } from "../../config/sessions/group.js";
 import { sessionPersonalProfileId } from "../../config/sessions/session-entry-provenance.js";
 import { getGatewayLocalUserIngress } from "../../gateway/local-user-ingress.js";
 import { normalizeAccountId } from "../../routing/account-id.js";
+import { isSessionRunActive } from "../../sessions/session-controller.queries.js";
 import { isSessionPersonalBootstrapTurn } from "../../sessions/session-participant-input.js";
 import { MEDIA_ONLY_USER_TEXT } from "../../sessions/user-turn-media.js";
 import {
@@ -655,7 +656,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
         const latestActiveSessionId =
           resolveActiveEmbeddedSessionId(latestSessionState.sessionFile) ??
           latestSessionState.sessionId;
-        return embeddedAgentRuntime?.isEmbeddedAgentRunActive(latestActiveSessionId) ?? false;
+        return embeddedAgentRuntime ? isSessionRunActive(latestActiveSessionId) : false;
       },
       opts:
         authorityRunId || cronCreatorAuthorityCapability

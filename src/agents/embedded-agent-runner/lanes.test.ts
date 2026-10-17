@@ -1,3 +1,5 @@
+// Coverage for global command lane normalization.
+
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { getCommandLaneDiagnostics } from "../../process/command-lane-diagnostics.js";
@@ -9,7 +11,7 @@ import {
 } from "../../process/command-queue.js";
 import { resetCommandQueueStateForTest } from "../../process/command-queue.test-support.js";
 import { CommandLane } from "../../process/lanes.js";
-import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
+import { resolveGlobalLane } from "./lanes.js";
 
 describe("resolveGlobalLane", () => {
   it("normalizes global lanes and isolates nested cron admission (#44805)", () => {
@@ -58,7 +60,6 @@ describe("resolveGlobalLane", () => {
     }
   });
 });
-
 describe("subagent session concurrency", () => {
   beforeEach(() => {
     resetCommandQueueStateForTest();
@@ -213,20 +214,5 @@ describe("subagent session concurrency", () => {
       await Promise.allSettled([child]);
     }
     await expect(child).resolves.toBeUndefined();
-  });
-});
-
-describe("resolveSessionLane", () => {
-  it("normalizes session identities without duplicating the prefix", () => {
-    for (const [lane, expected] of [
-      ["", "session:main"],
-      ["  ", "session:main"],
-      ["abc123", "session:abc123"],
-      [" xyz ", "session:xyz"],
-      ["session:abc", "session:abc"],
-      ["session:main", "session:main"],
-    ] as const) {
-      expect(resolveSessionLane(lane)).toBe(expected);
-    }
   });
 });

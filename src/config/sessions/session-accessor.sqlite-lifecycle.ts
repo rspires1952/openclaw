@@ -8,7 +8,7 @@ import {
   MODEL_SELECTION_LOCK_REMOVAL_MESSAGE,
   resolveAgentHarnessSessionStoreEntryError,
 } from "../../sessions/agent-harness-session-key.js";
-import { collectActiveSessionWorkAdmissions } from "../../sessions/session-lifecycle-admission.js";
+import { collectSessionControllerTargets } from "../../sessions/session-controller.lifecycle.js";
 import { emitSessionIdentityMutation } from "../../sessions/session-lifecycle-events.js";
 import {
   createOpenClawAgentDatabaseClaim,
@@ -80,6 +80,10 @@ import { applySessionResetInDatabase } from "./session-reset.kernel.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 // Single-target lifecycle owner: reset, guarded delete, and trusted rollback.
+
+function collectControllerIdentities(storePath: string): string[] {
+  return [...(collectSessionControllerTargets(undefined, storePath).get(storePath) ?? [])];
+}
 
 async function withCommittedHistoryMaintenance<T>(
   { agentId, env, storePath }: { agentId?: string; env?: NodeJS.ProcessEnv; storePath: string },
@@ -359,9 +363,7 @@ async function deleteSqliteSessionEntryLifecycleLocked(
               input: {
                 deleteParams,
                 archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
-                admissionIdentities: [
-                  ...(collectActiveSessionWorkAdmissions().get(params.storePath) ?? []),
-                ],
+                admissionIdentities: collectControllerIdentities(params.storePath),
                 allowLockedEntryRemoval,
                 expectedPluginOwnerId,
               },
@@ -422,9 +424,7 @@ async function deleteSqliteSessionEntryLifecycleLocked(
                   sessionId,
                   archiveDirectory: prepared.archiveDirectory,
                   archiveTranscript: params.archiveTranscript,
-                  admissionIdentities: [
-                    ...(collectActiveSessionWorkAdmissions().get(params.storePath) ?? []),
-                  ],
+                  admissionIdentities: collectControllerIdentities(params.storePath),
                 },
               },
               assertDeletionCurrent,
@@ -452,9 +452,7 @@ async function deleteSqliteSessionEntryLifecycleLocked(
                   input: {
                     validation: generationValidation,
                     sessionId,
-                    admissionIdentities: [
-                      ...(collectActiveSessionWorkAdmissions().get(params.storePath) ?? []),
-                    ],
+                    admissionIdentities: collectControllerIdentities(params.storePath),
                   },
                 },
                 assertDeletionCurrent,

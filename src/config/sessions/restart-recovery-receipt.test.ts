@@ -245,6 +245,18 @@ describe("restart recovery steering block reasons", () => {
       reason: "stale-claim",
     },
     {
+      name: "claim's own recovery delivery run",
+      fields: claim,
+      sourceTurnId: "recovery-1",
+      reason: undefined,
+    },
+    {
+      name: "another delivery run",
+      fields: claim,
+      sourceTurnId: "other-run",
+      reason: "stale-claim",
+    },
+    {
       name: "replaced session",
       fields: {
         status: undefined,

@@ -552,8 +552,6 @@ beforeEach(() => {
 function createContext() {
   return {
     getRuntimeConfig: () => mocks.loadConfigReturn,
-    chatAbortControllers: new Map(),
-    chatQueuedTurns: new Map(),
     dedupe: new Map(),
     cron: { removeAgentJobsTransactional: mocks.cronRemoveAgentJobsTransactional },
     logGateway: { warn: mocks.logGatewayWarn },

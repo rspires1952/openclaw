@@ -8,7 +8,7 @@ import {
 import { withOwnedSessionTranscriptWrites } from "../../config/sessions/transcript-write-context.js";
 import { createSyntheticPluginRuntimeClient } from "../../gateway/server-plugin-runtime-client.js";
 import { withPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
-import { beginSessionWorkAdmission } from "../../sessions/session-lifecycle-admission.js";
+import { beginSessionEffect } from "../../sessions/session-controller.lifecycle.js";
 import { useSessionStoreTempDirs } from "../../test-utils/session-state-cleanup.js";
 import { createAdmittedRunOperatorAuthority } from "../admitted-run-context.js";
 import * as inProcessGateway from "./in-process-gateway.js";
@@ -37,7 +37,7 @@ async function createArchiveSession(dir: string, name: string, sessionId = `sess
         callGateway,
       }),
     beginAdmission: (id = sessionId) =>
-      beginSessionWorkAdmission({
+      beginSessionEffect({
         scope: storePath,
         identities: [sessionKey, id],
         assertAllowed: () => {},
@@ -272,7 +272,7 @@ describe("sessions tool self-archive", () => {
     const callGateway = vi.fn(async () => ({ ok: true }));
     const tool = createTool(callGateway as never);
     const admission = await beginAdmission();
-    let replacementAdmission: Awaited<ReturnType<typeof beginSessionWorkAdmission>> | undefined;
+    let replacementAdmission: Awaited<ReturnType<typeof beginSessionEffect>> | undefined;
 
     try {
       await admission.run(async () => {
@@ -344,7 +344,7 @@ describe("sessions tool self-archive", () => {
       dir,
       "archive-retry",
     );
-    let competingAdmission: Awaited<ReturnType<typeof beginSessionWorkAdmission>> | undefined;
+    let competingAdmission: Awaited<ReturnType<typeof beginSessionEffect>> | undefined;
     const callGateway = vi.fn(async () => {
       if (!competingAdmission) {
         competingAdmission = await beginAdmission();

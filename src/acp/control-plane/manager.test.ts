@@ -20,6 +20,7 @@ import {
   flushMicrotasks,
   hoisted,
   installAcpSessionManagerTestLifecycle,
+  installMutableAcpSessionMetaUpsert,
   mockCallArg,
   mockParentedAcpSessionEntries,
   readySessionMeta,
@@ -254,16 +255,12 @@ describe("AcpSessionManager", () => {
           events.push(event);
         },
       });
-      expect(f.manager.getObservabilitySnapshot().turns.queueDepth).toBe(2);
       abortController.abort();
       await second;
-      expect(f.manager.getObservabilitySnapshot().turns.queueDepth).toBe(2);
       expect(events).toEqual([{ type: "done", status: "cancelled", stopReason: "cancel" }]);
       expect(f.runtimeState.runTurn).toHaveBeenCalledOnce();
       releaseFirstTurn.resolve();
       await first;
-      await f.manager.getSessionStatus(target);
-      expect(f.manager.getObservabilitySnapshot().turns.queueDepth).toBe(0);
     } finally {
       abortController.abort();
       releaseFirstTurn.resolve();
@@ -276,9 +273,12 @@ describe("AcpSessionManager", () => {
     try {
       await withStateDirEnv("openclaw-acp-manager-", async () => {
         const f = fixture();
+        const state = { currentMeta: readySessionMeta() };
+        installMutableAcpSessionMetaUpsert(state);
         mockParentedAcpSessionEntries({
           childSessionKey: target.sessionKey,
           parentSessionKey: "agent:main:main",
+          state,
         });
         let firstTurnStarted = false;
         f.runtimeState.runTurn.mockImplementation(async function* ({ requestId }) {
@@ -304,7 +304,6 @@ describe("AcpSessionManager", () => {
         const second = f.run("second", "r2", { cfg });
         await flushMicrotasks();
         expect(f.runtimeState.runTurn).toHaveBeenCalledOnce();
-        expect(f.manager.getObservabilitySnapshot().turns.queueDepth).toBe(2);
         await vi.advanceTimersByTimeAsync(3_500);
         await expectRejectedRecord(first, {
           code: "ACP_TURN_FAILED",
@@ -318,7 +317,7 @@ describe("AcpSessionManager", () => {
         const snapshot = f.manager.getObservabilitySnapshot();
         expect(snapshot.runtimeCache.activeSessions).toBe(1);
         expect(snapshot.errorsByCode.ACP_TURN_FAILED).toBe(1);
-        expectRecordFields(snapshot.turns, { active: 0, queueDepth: 0, completed: 1, failed: 1 });
+        expectRecordFields(snapshot.turns, { active: 0, completed: 1, failed: 1 });
         const states = extractStatesFromUpserts();
         expect(states).toContain("error");
         expect(states.at(-1)).toBe("idle");
@@ -606,13 +605,13 @@ describe("AcpSessionManager", () => {
         const reached = createDeferred();
         const release = createDeferred();
         const failure = new Error(`ACP preflight ${reason}`);
-        const read = manager.resolveSessionAsync.bind(manager);
-        const readSpy = vi.spyOn(manager, "resolveSessionAsync");
+        const read = hoisted.readAcpSessionEntryAsyncMock.getMockImplementation();
+        const readSpy = hoisted.readAcpSessionEntryAsyncMock;
         if (reason !== "signal failure") {
           readSpy.mockImplementationOnce(async (params) => {
             reached.resolve();
             await release.promise;
-            return await read(params);
+            return await read?.(params);
           });
         }
         const signalSpy =
@@ -641,6 +640,8 @@ describe("AcpSessionManager", () => {
         );
         const successorStarted = createDeferred();
         const releaseSuccessor = createDeferred();
+        const successorReadReached = createDeferred();
+        const releaseSuccessorRead = createDeferred();
         let successor: Promise<void> | undefined;
         try {
           expect(
@@ -668,8 +669,26 @@ describe("AcpSessionManager", () => {
               await releaseSuccessor.promise;
               yield { type: "done" as const };
             });
+            readSpy.mockImplementationOnce(async (params) => {
+              successorReadReached.resolve();
+              await releaseSuccessorRead.promise;
+              return await read?.(params);
+            });
             successor = manager.runTurn(input);
             void successor.catch(() => {});
+            await flushMicrotasks();
+            expect(runtime.ensureSession).not.toHaveBeenCalled();
+          }
+          const metadataWrites = hoisted.upsertAcpSessionMetaMock.mock.calls.length;
+          release.resolve();
+          const settled = await outcome;
+          expect(settled.ok).toBe(false);
+          if (successor) {
+            await successorReadReached.promise;
+          }
+          expect(hoisted.upsertAcpSessionMetaMock).toHaveBeenCalledTimes(metadataWrites);
+          releaseSuccessorRead.resolve();
+          if (successor) {
             await Promise.race([
               successorStarted.promise,
               successor.then(() => {
@@ -677,11 +696,6 @@ describe("AcpSessionManager", () => {
               }),
             ]);
           }
-          const metadataWrites = hoisted.upsertAcpSessionMetaMock.mock.calls.length;
-          release.resolve();
-          const settled = await outcome;
-          expect(settled.ok).toBe(false);
-          expect(hoisted.upsertAcpSessionMetaMock).toHaveBeenCalledTimes(metadataWrites);
           expect(getActiveAcpTurnCount()).toBe(successor ? 1 : 0);
           expect(listActiveAcpSessionsForOwner(parentSessionKey)).toEqual(
             successor ? [sessionKey] : [],
@@ -705,9 +719,12 @@ describe("AcpSessionManager", () => {
           }
         } finally {
           release.resolve();
+          releaseSuccessorRead.resolve();
           releaseSuccessor.resolve();
           await Promise.allSettled([pending, ...(successor ? [successor] : [])]);
-          readSpy.mockRestore();
+          if (read) {
+            readSpy.mockImplementation(read);
+          }
           signalSpy?.mockRestore();
         }
       });

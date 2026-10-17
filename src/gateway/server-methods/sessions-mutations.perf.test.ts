@@ -153,8 +153,6 @@ test.each([{ pinned: true }, { label: "Renamed" }, { label: " Taken " }])(
             })),
             broadcastToConnIds: vi.fn(),
             getSessionEventSubscriberConnIds: () => new Set(),
-            chatAbortControllers: new Map(),
-            chatQueuedTurns: new Map(),
             dedupe: new Map(),
           } as unknown as GatewayRequestContext,
           client: humanClient(),
@@ -333,8 +331,6 @@ test("sessions.patchMany archives 30 human sessions without transcript hydration
         loadGatewayModelCatalogSnapshot: vi.fn(async () => ({ entries: [], routeVariants: [] })),
         broadcastToConnIds: vi.fn(),
         getSessionEventSubscriberConnIds: () => new Set(),
-        chatAbortControllers: new Map(),
-        chatQueuedTurns: new Map(),
         dedupe: new Map(),
         cron: {
           list: cronList,

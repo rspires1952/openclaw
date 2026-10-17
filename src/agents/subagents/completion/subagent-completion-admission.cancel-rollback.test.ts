@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../../test/helpers/temp-dir.js";
 import { sqliteWorkerOwnerProbe as probe } from "../../../infra/sqlite-worker-owner-probe.test-support.js";
 import { resolvePreferredOpenClawTmpDir } from "../../../infra/tmp-openclaw-dir.js";
-import { getActiveGatewayRootWorkCount } from "../../../process/gateway-work-admission.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import {
   closeOpenClawStateDatabaseAsync,
@@ -145,21 +144,22 @@ describe("requester wake cancellation rollback", () => {
       try {
         await driver.run();
         driver.controller.resumeRequesterSettleWake(sibling.subagent.runId, sibling.subagent);
-        const retryAt = driver.controller.scheduledRequesterSettleWakeTimers.get(
-          input.subagent.runId,
-        )!.deadline;
         expect(driver.wake).toHaveBeenCalledOnce();
         expect(finalized).not.toHaveBeenCalled();
         stopResult = Promise.allSettled([
-          driver.controller.cancelRequesterSettleWake(input.subagent, () => {}),
+          driver.controller.retireSubagentObligations(input.subagent, () => {}, {
+            requesterNotified: true,
+          }),
         ]);
         await writerEntered.promise;
 
         // Retry callbacks cannot publish a completion while Stop owns admission.
         // The sibling reconciles the shared pending commit through its real owner.
-        await advanceRequesterWakeTime(retryAt - Date.now());
+        driver.controller.resumeRequesterSettleWake(sibling.subagent.runId, sibling.subagent);
         expect(driver.wake).toHaveBeenCalledOnce();
-        expect(getActiveGatewayRootWorkCount()).toBe(0);
+        expect(loadSubagentRegistryFromSqlite().get(input.subagent.runId)?.delivery?.status).toBe(
+          "in_progress",
+        );
         if (outcome === "delivered") {
           database.db.exec("DROP TRIGGER reject_delivered");
         } else {
@@ -196,7 +196,12 @@ describe("requester wake cancellation rollback", () => {
             subagentRuns.get(successor.runId)!,
           );
         }
-        await advanceRequesterWakeTime(60_000);
+        await advanceRequesterWakeTime(60_000, () =>
+          driver.controller.resumeRequesterSettleWake(
+            sibling.subagent.runId,
+            subagentRuns.get(sibling.subagent.runId)!,
+          ),
+        );
 
         expect(driver.wake).toHaveBeenCalledTimes(outcome === "replay budget" ? 2 : 1);
         const stored = loadSubagentRegistryFromSqlite();
@@ -251,7 +256,7 @@ describe("requester wake cancellation rollback", () => {
         database.db.exec("DROP TRIGGER IF EXISTS reject_replay");
         releaseWriter.resolve();
         await stopResult;
-        driver.controller.clearScheduledResumeTimers();
+        driver.controller.clearRuntimeState();
         await advanceRequesterWakeTime(0);
         vi.useRealTimers();
       }

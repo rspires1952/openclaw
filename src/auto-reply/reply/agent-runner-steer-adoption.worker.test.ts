@@ -9,18 +9,19 @@ import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { beginRestartRecoveryTerminalDelivery } from "../../config/sessions/restart-recovery-receipt.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { bindSessionControllerSourceTurnId } from "../../sessions/session-controller.js";
+import { getSessionControllerEntryForOperation } from "../../sessions/session-controller.state.js";
+import { testing } from "../../sessions/session-controller.test-support.js";
 import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import { observeMainThreadSql } from "../../test-utils/main-thread-sql-spies.test-support.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { runActiveReplySteer } from "./agent-runner-steer-adoption.js";
 import { createQueueTestRun } from "./queue.test-helpers.js";
-import { clearFollowupDrainCallback } from "./queue/drain.js";
-import { clearFollowupQueue, getExistingFollowupQueue } from "./queue/state.js";
+import { clearSessionQueues } from "./queue/cleanup.js";
+import { getExistingFollowupQueue } from "./queue/state.js";
 import type { FollowupRun } from "./queue/types.js";
 import type { ReplyOperationRunState } from "./reply-operation-run-state.js";
-import { replyRunRegistry } from "./reply-run-registry.registry.js";
 import { createTestReplyOperation } from "./reply-run-registry.test-helpers.js";
-import { testing } from "./reply-run-registry.test-support.js";
 import * as replyToolAuthority from "./reply-tool-authority.js";
 import { admitReplyTurn } from "./reply-turn-admission.js";
 import * as steeringDelivery from "./steering-delivery-preparation.js";
@@ -28,7 +29,7 @@ import { createMockTypingController } from "./test-helpers.js";
 import { createTypingSignaler } from "./typing-mode.js";
 
 afterEach(() => {
-  testing.resetReplyRunRegistry();
+  testing.resetSessionControllerForTest();
   vi.restoreAllMocks();
 });
 
@@ -66,6 +67,7 @@ it("adopts active steering through prepared policy without caller-thread SQL", a
     const delivered: string[] = [];
     operation.attachBackend({
       kind: "embedded",
+      supportsTranscriptCommitWait: true,
       cancel() {},
       toolAuthorityFingerprint: fingerprint,
       messageInjectionV2: {
@@ -86,7 +88,6 @@ it("adopts active steering through prepared policy without caller-thread SQL", a
     const typing = createMockTypingController();
     const resultState: ReplyOperationRunState = {};
     const followup = vi.fn(async () => {});
-    const releaseAdmissionTicket = vi.fn();
     const calls = observeMainThreadSql();
     try {
       await expect(
@@ -95,7 +96,6 @@ it("adopts active steering through prepared policy without caller-thread SQL", a
           opts: { runId: "incoming-steer" },
           providedReplyOperation: operation,
           queueKey: key,
-          releaseAdmissionTicket,
           replyOperationRunState: resultState,
           resolvedQueue: { mode: "steer", debounceMs: 0 },
           restartRecoverySourceTurnId: undefined,
@@ -111,12 +111,10 @@ it("adopts active steering through prepared policy without caller-thread SQL", a
       expect(delivered).toEqual([run.prompt]);
       expect(resultState.admission).toEqual({ status: "accepted", mode: "steer" });
       expect(followup).not.toHaveBeenCalled();
-      expect(releaseAdmissionTicket).toHaveBeenCalledOnce();
       calls.expectIdle();
     } finally {
       calls.restore();
-      clearFollowupQueue(key);
-      clearFollowupDrainCallback(key);
+      clearSessionQueues([key], getSessionControllerEntryForOperation(operation).target);
       operation.complete();
     }
   });
@@ -162,7 +160,7 @@ it.for(
         replyToolAuthority.prepareReplyToolAuthority(run),
       );
       const fingerprint = await operation.bindToolAuthorityRouteAsync(run.run);
-      replyRunRegistry.bindSourceTurnId(operation, sourceTurnId);
+      bindSessionControllerSourceTurnId(operation, sourceTurnId);
       const native = createNativeSessionBindingAuthority(
         [
           {
@@ -195,6 +193,7 @@ it.for(
       const delivered: string[] = [];
       operation.attachBackend({
         kind: "embedded",
+        supportsTranscriptCommitWait: true,
         runId: "active-run",
         cancel() {},
         toolAuthorityFingerprint: fingerprint,
@@ -227,6 +226,7 @@ it.for(
             agentId: queued.run.agentId,
             sessionId: queued.run.sessionId,
             sessionKey: key,
+            mailboxClaim: queued.controllerInput?.claim,
             kind: "queued_followup",
             resetTriggered: false,
           });
@@ -247,7 +247,6 @@ it.for(
         opts: { runId: messageId },
         providedReplyOperation: operation,
         queueKey: key,
-        releaseAdmissionTicket() {},
         replyOperationRunState: resultState,
         resolvedQueue: { mode: "steer", debounceMs: 0 },
         restartRecoverySourceTurnId: undefined,
@@ -307,7 +306,8 @@ it.for(
           expect(delivered).toEqual([]);
           expect(resultState.admission).toEqual({ status: "accepted", mode: "followup" });
           expect([...retained]).toEqual([run]);
-          expect(run.steerPending).toBeUndefined();
+          expect(run.controllerInput).toMatchObject({ phase: "waiting" });
+          expect(run.controllerInput?.injection).toBeUndefined();
           operation.complete();
           expect(await withinTest(followupDelivered.promise, signal)).toBe(run);
           expect(followup).toHaveBeenCalledOnce();
@@ -315,8 +315,7 @@ it.for(
       } finally {
         resume.resolve();
         await settlement;
-        clearFollowupQueue(key);
-        clearFollowupDrainCallback(key);
+        clearSessionQueues([key], getSessionControllerEntryForOperation(operation).target);
         operation.complete();
         await Promise.allSettled(pendingFollowups);
       }

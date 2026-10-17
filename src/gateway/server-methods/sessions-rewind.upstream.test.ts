@@ -7,7 +7,7 @@ import * as workerAdmission from "../../infra/sqlite-worker-operation-admission.
 import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createPluginRecord } from "../../plugins/status.test-helpers.js";
-import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
+import { runSessionMutation } from "../../sessions/session-controller.lifecycle.js";
 import {
   captureSessionUpstreamLinkReadSource,
   prepareSessionUpstreamLink,
@@ -223,7 +223,7 @@ it("refuses a shared-state owner retired while rewind waits for the lifecycle lo
     const before = await readMutationStorage(scope);
     const entered = createDeferredCore();
     const release = createDeferredCore();
-    const holding = runExclusiveSessionLifecycleMutation("archive", {
+    const holding = runSessionMutation({
       scope: resolveSessionStorePathCore(undefined, { agentId: scope.agentId }),
       identities: [scope.sessionId],
       run: async () => {

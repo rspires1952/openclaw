@@ -1,24 +1,28 @@
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, onTestFinished, vi } from "vitest";
+import { bindGatewayContextResolver } from "../../plugins/runtime/gateway-request-scope.js";
 import {
-  createReplyOperation,
-  replyRunRegistry,
-} from "../../auto-reply/reply/reply-run-registry.js";
+  beginSessionEffect,
+  captureSessionTarget,
+  isCompetingSessionControllerWorkActive,
+  SESSION_CONTROLLER_DRAIN_TIMEOUT_MS,
+  withSessionControllerOwner,
+} from "../../sessions/session-controller.lifecycle.js";
 import {
-  beginSessionWorkAdmission,
-  isCompetingSessionWorkAdmissionActive,
-  SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS,
-} from "../../sessions/session-lifecycle-admission.js";
-import { runWithChatAbortExecution } from "../chat-abort-lifecycle-internal.js";
-import { registerChatAbortController, type ChatAbortControllerEntry } from "../chat-abort.js";
+  releaseSessionControllerClaim,
+  retireSessionControllerInput,
+} from "../../sessions/session-controller.mailbox.js";
+import { createReplyOperation } from "../../sessions/session-controller.operation.js";
+import { getRpcSource } from "../../sessions/session-controller.rpc-sources.js";
+import { registerChatAbortController } from "../chat-abort.js";
+import { claimRpcSourceForTest } from "../test-helpers.rpc-source.js";
 import { waitForTerminalSessionRunSettlement } from "./session-run-settlement.js";
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 
 function fixture() {
-  const context = { chatAbortControllers: new Map<string, ChatAbortControllerEntry>() };
   const target = {
-    context,
+    context: {},
     storePath: "terminal-session-store",
     requestedKey: "global",
     canonicalKey: "global",
@@ -26,38 +30,55 @@ function fixture() {
     agentId: "main",
     defaultAgentId: "main",
   };
+  const controllerTarget = captureSessionTarget({
+    storeScope: target.storePath,
+    sessionKey: target.canonicalKey,
+    incarnation: target.sessionId,
+    agentId: target.agentId,
+  });
   const register = (options?: {
     runId?: string;
     agentId?: string;
     sessionKey?: string;
     sessionId?: string;
+    storePath?: string;
     terminal?: boolean;
     kind?: "agent";
   }) => {
     const registration = registerChatAbortController({
-      chatAbortControllers: context.chatAbortControllers,
       runId: options?.runId ?? "terminal-run",
       sessionId: options?.sessionId ?? target.sessionId,
       sessionKey: options?.sessionKey ?? target.canonicalKey,
       agentId: options?.agentId ?? target.agentId,
+      target: captureSessionTarget({
+        storeScope: options?.storePath ?? target.storePath,
+        sessionKey: options?.sessionKey ?? target.canonicalKey,
+        incarnation: options?.sessionId ?? target.sessionId,
+        agentId: options?.agentId ?? target.agentId,
+      }),
       timeoutMs: 60_000,
       kind: options?.kind,
     });
-    if (!registration.entry) {
+    if (!registration.registered) {
       throw new Error("Missing registered run");
     }
+    onTestFinished(async () => {
+      const claim = registration.entry.input.claim;
+      claim?.operation?.complete();
+      if (claim) {
+        releaseSessionControllerClaim(claim);
+      }
+      registration.cleanup();
+      retireSessionControllerInput(registration.entry.input);
+      await registration.entry.input.settlement.promise;
+    });
     if (options?.terminal !== false) {
-      registration.entry.projectSessionTerminalObservedAt = Date.now();
+      registration.entry.adapter.projectSessionTerminalObservedAt = Date.now();
     }
     return registration;
   };
-  const admit = () =>
-    beginSessionWorkAdmission({
-      scope: target.storePath,
-      identities: [target.canonicalKey, target.sessionId],
-      assertAllowed: () => {},
-    });
-  return { target, register, admit };
+  const admit = () => beginSessionEffect({ target: controllerTarget, assertAllowed: () => {} });
+  return { target, controllerTarget, register, admit };
 }
 
 it.each([
@@ -70,8 +91,8 @@ it.each([
   const admission = await admit();
   try {
     expect(await waitForTerminalSessionRunSettlement(target)).toBe(false);
-    expect(isCompetingSessionWorkAdmissionActive(target.storePath, [target.sessionId])).toBe(true);
-    expect(target.context.chatAbortControllers.size).toBe(1);
+    expect(isCompetingSessionControllerWorkActive(target.storePath, [target.sessionId])).toBe(true);
+    expect(getRpcSource("terminal-run")).toBe(registration.entry);
     expect(registration.controller.signal.aborted).toBe(false);
   } finally {
     registration.cleanup();
@@ -80,13 +101,14 @@ it.each([
 });
 
 it("joins captured terminal owners without waiting for its caller or a successor admission", async () => {
-  const { target, register, admit } = fixture();
+  const { target, controllerTarget, register, admit } = fixture();
   const registration = register();
   const caller = await admit();
   const reply = createReplyOperation({
     sessionKey: target.canonicalKey,
     sessionId: target.sessionId,
     agentId: target.agentId,
+    target: controllerTarget,
     resetTriggered: false,
   });
   reply.freezeAbort();
@@ -105,7 +127,6 @@ it("joins captured terminal owners without waiting for its caller or a successor
     expect(await waiting).toBe(true);
     expect(caller.isActive()).toBe(true);
     expect(successor.isActive()).toBe(true);
-    expect(isCompetingSessionWorkAdmissionActive(target.storePath, [target.sessionId])).toBe(true);
   } finally {
     registration.cleanup();
     reply.complete();
@@ -128,7 +149,7 @@ it.each(["timeout", "cancel"] as const)(
         controller.abort();
         await rejected;
       } else {
-        await vi.advanceTimersByTimeAsync(SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS);
+        await vi.advanceTimersByTimeAsync(SESSION_CONTROLLER_DRAIN_TIMEOUT_MS);
         expect(await waiting).toBe(false);
       }
       expect(registration.controller.signal.aborted).toBe(false);
@@ -140,47 +161,32 @@ it.each(["timeout", "cancel"] as const)(
   },
 );
 
-it.each(["none", "chat", "reply"] as const)(
-  "excludes only the in-band execution while joining another %s writer",
-  async (otherOwner) => {
+it.each([false, true])(
+  "excludes only the in-band turn while joining another terminal source (other=%s)",
+  async (hasOther) => {
     const { target, register, admit } = fixture();
     const caller = register({ kind: "agent", runId: "caller-run" });
+    const release = await claimRpcSourceForTest(caller.entry);
+    const operation = caller.entry.input.claim!.operation!;
     const admission = await admit();
-    const other = otherOwner === "chat" ? register() : undefined;
-    const reply = createReplyOperation({
-      sessionKey: target.canonicalKey,
-      sessionId: target.sessionId,
-      agentId: target.agentId,
-      resetTriggered: false,
-    });
-    if (otherOwner !== "reply") {
-      replyRunRegistry.bindSourceTurnId(reply, "caller-run");
-    }
-    reply.freezeAbort();
+    const other = hasOther ? register() : undefined;
     let settled = false;
     const waiting = admission.run(() =>
-      runWithChatAbortExecution(
-        caller.entry,
-        async () => {
-          expect(await waitForTerminalSessionRunSettlement(target)).toBe(true);
-          settled = true;
-        },
-        caller.cleanup,
-      ),
+      withSessionControllerOwner(operation, async () => {
+        expect(await waitForTerminalSessionRunSettlement(target)).toBe(true);
+        settled = true;
+      }),
     );
     try {
       await vi.advanceTimersByTimeAsync(0);
-      expect(settled).toBe(otherOwner === "none");
+      expect(settled).toBe(!hasOther);
       other?.cleanup();
-      if (otherOwner === "reply") {
-        reply.complete();
-      }
       await waiting;
       expect(settled).toBe(true);
       expect(admission.isActive()).toBe(true);
     } finally {
       other?.cleanup();
-      reply.complete();
+      release();
       admission.release();
       await waiting;
       caller.cleanup();
@@ -200,10 +206,30 @@ it("refuses an acquired live admission without waiting for an older terminal own
     await vi.advanceTimersByTimeAsync(0);
     expect(result).toBe(false);
     expect(live.isActive()).toBe(true);
-    expect(target.context.chatAbortControllers.size).toBe(1);
+    expect(getRpcSource("terminal-run")).toBe(terminal.entry);
   } finally {
     terminal.cleanup();
     live.release();
     await waiting;
   }
 });
+
+it.each(["store", "Gateway"] as const)(
+  "ignores another %s's source with the same logical identity",
+  async (dimension) => {
+    const { target, register } = fixture();
+    const registration = register({
+      terminal: false,
+      storePath: dimension === "store" ? "other-store" : undefined,
+    });
+    if (dimension === "Gateway") {
+      bindGatewayContextResolver(registration.entry.input, () => undefined);
+    }
+    try {
+      expect(await waitForTerminalSessionRunSettlement(target)).toBe(true);
+      expect(registration.controller.signal.aborted).toBe(false);
+    } finally {
+      registration.cleanup();
+    }
+  },
+);

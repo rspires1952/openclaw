@@ -6,10 +6,10 @@ import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
 import * as workerAdmission from "../../infra/sqlite-worker-operation-admission.js";
 import { sqliteWorkerOwnerProbe as probe } from "../../infra/sqlite-worker-owner-probe.test-support.js";
 import {
-  beginSessionWorkAdmission,
-  isSessionLifecycleMutationActive,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
+  beginSessionEffect,
+  isSessionMutationActive,
+  runSessionMutation,
+} from "../../sessions/session-controller.lifecycle.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
   openOpenClawAgentDatabase,
@@ -391,7 +391,7 @@ it("resolves protection once before capping aged candidates", async () => {
     sessionId: "planner-2",
     updatedAt: Date.now() - 8 * 24 * 60 * 60 * 1000,
   });
-  const admission = await beginSessionWorkAdmission({
+  const admission = await beginSessionEffect({
     scope: storePath,
     identities: ["planner-0"],
     assertAllowed: () => {},
@@ -402,7 +402,7 @@ it("resolves protection once before capping aged candidates", async () => {
     dispose() {},
   }));
   try {
-    await runExclusiveSessionLifecycleMutation("archive", {
+    await runSessionMutation({
       scope: storePath,
       identities: [key(1)],
       run: async () => {
@@ -547,11 +547,11 @@ it.each(["session-key", "session-id"] as const)(
       );
     const identity = identityKind === "session-key" ? target.sessionKey : target.sessionId;
 
-    await runExclusiveSessionLifecycleMutation("archive", {
+    await runSessionMutation({
       scope: storePath,
       identities: [identity],
       run: async () => {
-        expect(isSessionLifecycleMutationActive(storePath, [identity])).toBe(true);
+        expect(isSessionMutationActive(storePath, [identity])).toBe(true);
         const plan = maintain();
         expect(
           loadSessionEntry(target)?.archivedAt,
@@ -567,7 +567,7 @@ it.each(["session-key", "session-id"] as const)(
       },
     });
 
-    expect(isSessionLifecycleMutationActive(storePath, [identity])).toBe(false);
+    expect(isSessionMutationActive(storePath, [identity])).toBe(false);
     expect(maintain(true).archived).toBe(1);
     expect(loadSessionEntry(target)).toMatchObject({
       archivedAt: expect.any(Number),

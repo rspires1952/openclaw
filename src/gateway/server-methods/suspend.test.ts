@@ -34,8 +34,6 @@ function invoke(method: keyof typeof suspendHandlers, params: unknown) {
       context: {
         cron: { pauseScheduling, resumeScheduling },
         logGateway: { warn, info },
-        chatAbortControllers: new Map(),
-        chatQueuedTurns: new Map(),
       },
     } as unknown as Parameters<typeof handler>[0]),
   ).then(() => ({ respond, pauseScheduling, resumeScheduling, info }));

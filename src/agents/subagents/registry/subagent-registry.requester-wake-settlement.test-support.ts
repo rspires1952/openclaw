@@ -4,10 +4,12 @@ import { createSubagentRunParams } from "../../subagent-test-fixtures.test-helpe
 import { maybeWakeRequesterAfterAllChildrenSettled } from "../announce/subagent-announce.requester-settle-wake.js";
 import { mutateRequesterCompletionBatch } from "../completion/subagent-completion-admission.store.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
+import { mutateSubagentRuns } from "./subagent-registry-persistence.js";
 import { buildScopedSubagentRunReadIndexFromRuns } from "./subagent-registry-queries.js";
 import type { GatewayRequest } from "./subagent-registry.lifecycle-fixture.test-support.js";
 import { createRequesterYieldTool } from "./subagent-registry.requester-wake-receipts.test-support.js";
 import * as registry from "./subagent-registry.test-helpers.js";
+import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 export function registerRequesterWakeSettlementBoundaryTests({
   requesterSessionKey,
@@ -105,8 +107,7 @@ export function registerRequesterWakeSettlementBoundaryTests({
     });
     expect(registry.getSubagentRunByRunId("old-grandchild")?.cleanupCompletedAt).toBeUndefined();
   });
-
-  it("delivers a stale requester batch despite foreign active work in a global session", async () => {
+  it("delivers after its owned descendant settles despite foreign active work in a global session", async () => {
     vi.setSystemTime(100_000);
     useGlobalSessionScope();
     await registry.addSubagentRunForTests({
@@ -164,7 +165,7 @@ export function registerRequesterWakeSettlementBoundaryTests({
       execution: { status: "running", startedAt: 3_100 },
     });
 
-    const transitions: Array<{ nextAttemptAt?: number }> = [];
+    const transitions: Array<{ status: string; attemptCount: number }> = [];
     const waits: Array<number | undefined> = [];
     const completions: Array<{ delivered: boolean; error?: string }> = [];
     const runWake = () => {
@@ -185,11 +186,12 @@ export function registerRequesterWakeSettlementBoundaryTests({
             assertCurrent: () => {},
             onCommitted: () => {},
             onPublished: () =>
-              onPublished(entries.map((entry) => registry.getSubagentRunByRunId(entry.runId)!)),
+              onPublished?.(entries.map((entry) => subagentRuns.get(entry.runId)!)),
           });
           expect(publication).toEqual({ applied: true, publication: "published" });
           transitions.push({
-            nextAttemptAt: state.nextAttemptAt,
+            status: state.status,
+            attemptCount: state.attemptCount,
           });
         },
         completeBatch: async (entries, _rearmGeneration, outcome) => {
@@ -212,17 +214,26 @@ export function registerRequesterWakeSettlementBoundaryTests({
     expect(waits).toEqual([302_200]);
     expect(completions).toEqual([]);
 
-    await expect(runWake()).resolves.toBe(false);
-    expect(transitions).toHaveLength(0);
-
-    await vi.advanceTimersByTimeAsync(202_200);
-    // The spent stale-blocker wait delivers the completed batch instead of
-    // terminalizing it as undelivered.
+    // Descendant settlement makes this recorded cohort runnable. Foreign work
+    // sharing the logical key still cannot hold this physical requester's wake.
+    await mutateSubagentRuns(["run-main-stale"], (rows) => {
+      const stale = rows.get("run-main-stale");
+      if (!stale) {
+        throw new Error("expected the owned descendant");
+      }
+      const settled: SubagentRunRecord = {
+        ...stale,
+        delivery: { status: "delivered", disposition: "delivered" },
+        cleanupCompletedAt: Date.now(),
+      };
+      return {
+        value: undefined,
+        postimages: new Map([[stale.runId, settled]]),
+      };
+    });
     await expect(runWake()).resolves.toBe(true);
+    expect(transitions).toEqual([{ status: "dispatching", attemptCount: 1 }]);
     expect(getRequesterWakeCalls()).toHaveLength(1);
-    expect(getRequesterWakeCalls()[0]?.params?.message).toContain(
-      "a descendant result below it was still undelivered",
-    );
     expect(completions).toEqual([{ delivered: true, error: undefined }]);
     expect(registry.getSubagentRunByRunId("run-main-batch")?.requesterSettleWake).toBeUndefined();
     expect(

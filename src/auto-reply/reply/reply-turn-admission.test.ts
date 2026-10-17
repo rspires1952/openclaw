@@ -1,3 +1,4 @@
+import { setImmediate } from "node:timers/promises";
 import { afterEach, expect, it, vi } from "vitest";
 import { createDeferred, withinTest } from "../../../test/helpers/promise.js";
 import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
@@ -9,23 +10,23 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import type { InternalSessionEntry as SessionEntry } from "../../config/sessions/types.js";
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
-import {
-  resetDiagnosticRunActivityForTest,
-  RUN_STALE_TAKEOVER_MS,
-} from "../../logging/diagnostic-run-activity.js";
-import { markDiagnosticToolStartedForTest } from "../../logging/diagnostic-run-activity.test-support.js";
-import {
-  getTerminalSessionWorkAdmissionRelease,
-  interruptSessionWorkAdmissions,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
-import { REPLY_RUN_TERMINAL_SETTLE_TIMEOUT_MS } from "./reply-run-registry.contracts.js";
+import { resetDiagnosticRunActivityForTest } from "../../logging/diagnostic-run-activity.js";
 import {
   createReplyOperation,
-  REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS,
-  replyRunRegistry,
-} from "./reply-run-registry.js";
-import { testing } from "./reply-run-registry.test-support.js";
+  getSessionControllerOperation,
+} from "../../sessions/session-controller.js";
+import {
+  getTerminalSessionWorkAdmissionRelease,
+  interruptSessionControllerEffects,
+  runSessionMutation,
+} from "../../sessions/session-controller.lifecycle.js";
+import {
+  claimSessionControllerTask,
+  releaseSessionControllerClaim,
+  reserveSessionControllerSource,
+  retireSessionControllerInput,
+} from "../../sessions/session-controller.mailbox.js";
+import { testing } from "../../sessions/session-controller.test-support.js";
 import { runWithReplyOperationLifecycleAdmission } from "./reply-turn-admission.js";
 import { admitTestReplyTurn, createSessionStore } from "./reply-turn-admission.test-support.js";
 
@@ -109,7 +110,7 @@ function tombstoneEntry(): SessionEntry {
 async function holdMutation(storePath: string, run: () => Promise<unknown> = async () => {}) {
   const started = createDeferred();
   const release = createDeferred();
-  const mutation = runExclusiveSessionLifecycleMutation("patch", {
+  const mutation = runSessionMutation({
     scope: storePath,
     identities: [sessionKey, sessionId],
     run: async () => {
@@ -140,12 +141,16 @@ async function expectRecoveryReleased(storePath: string, key = sessionKey) {
     ).toBeUndefined(),
   );
 }
-function interrupt(storePath: string, run: () => Promise<void>, reason?: Error) {
+function interrupt(
+  storePath: string,
+  run: () => Promise<void>,
+  reason: Error = new Error("Synthetic user interruption"),
+) {
   const target = { scope: storePath, identities: [sessionKey, sessionId] };
-  return runExclusiveSessionLifecycleMutation("patch", {
+  return runSessionMutation({
     ...target,
     prepare: async () => {
-      await interruptSessionWorkAdmissions({ ...target, reason });
+      await interruptSessionControllerEffects({ ...target, reason });
     },
     run,
   });
@@ -155,7 +160,7 @@ afterEach(async () => {
     await vi.runOnlyPendingTimersAsync();
     vi.useRealTimers();
   }
-  testing.resetReplyRunRegistry();
+  testing.resetSessionControllerForTest();
   resetDiagnosticRunActivityForTest();
   releaseMocks.beforeRelease.mockClear();
   releaseMocks.schedule.mockClear();
@@ -360,134 +365,6 @@ it("skips an aborted reply waiting behind a lifecycle mutation", async () => {
   await release();
   await expect(admission).resolves.toEqual({ status: "skipped", reason: "aborted" });
 });
-it("keeps an already-waiting follow-up behind the delivery barrier", async () => {
-  vi.useFakeTimers();
-  const active = operation();
-  const barrier = createDeferred();
-  let settled = false;
-  const admission = admit({ sessionId: "queued-session", kind: "queued_followup" }).then(
-    (result) => {
-      settled = true;
-      return result;
-    },
-  );
-  try {
-    await vi.advanceTimersByTimeAsync(0);
-    active.completeWithAfterClearBarrier(barrier.promise);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(settled).toBe(false);
-  } finally {
-    active.complete();
-    barrier.resolve();
-    owned(await admission).complete();
-  }
-});
-it("skips heartbeat turns while delivery settles", async () => {
-  const active = operation();
-  const barrier = createDeferred();
-  active.completeWithAfterClearBarrier(barrier.promise);
-  await expect(admit({ sessionId: "heartbeat-session", kind: "heartbeat" })).resolves.toEqual({
-    status: "skipped",
-    reason: "active-run",
-  });
-  barrier.resolve();
-  await barrier.promise;
-});
-it("uses the active run's final session id after waiting", async () => {
-  const active = operation();
-  active.setPhase("preflight_compacting");
-  const admission = admit({ sessionId: "new-session" });
-  await Promise.resolve();
-  active.updateSessionId("post-compact-session");
-  active.complete();
-  const result = owned(await admission);
-  expect(result.sessionId).toBe("post-compact-session");
-  result.complete();
-});
-it("keeps visible turns waiting while an active operation is still fresh", async () => {
-  vi.useFakeTimers();
-  const active = operation();
-  active.setPhase("running");
-  active.recordActivity();
-  const controller = new AbortController();
-  let settled = false;
-  const admission = admit({
-    sessionId: "waiting-session",
-    upstreamAbortSignal: controller.signal,
-  }).then((result) => {
-    settled = true;
-    return result;
-  });
-  await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
-  expect(settled).toBe(false);
-  expect(replyRunRegistry.get(sessionKey)).toBe(active);
-  controller.abort();
-  await expect(admission).resolves.toMatchObject({
-    status: "skipped",
-    reason: "aborted",
-    activeOperation: active,
-  });
-});
-it("defers takeover to the blocked-tool floor while a quiet tool is active", async () => {
-  vi.useFakeTimers();
-  const startedAt = Date.now();
-  const active = operation();
-  const cancel = vi.fn(() => active.complete());
-  active.attachBackend({ kind: "embedded", cancel, isStreaming: () => true });
-  active.setPhase("running");
-  markDiagnosticToolStartedForTest({ ...scope, toolName: "exec", toolCallId: "tool-quiet-1" });
-  vi.setSystemTime(startedAt + 12 * 60_000);
-  const controller = new AbortController();
-  let settled = false;
-  const admission = admit({
-    sessionId: "replacement",
-    upstreamAbortSignal: controller.signal,
-  }).then((result) => {
-    settled = true;
-    return result;
-  });
-  await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
-  expect(settled).toBe(false);
-  expect(cancel).not.toHaveBeenCalled();
-  vi.setSystemTime(startedAt + 16 * 60_000);
-  await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
-  const result = owned(await admission);
-  expect(active.result).toEqual({ kind: "failed", code: "run_stalled" });
-  result.complete();
-  controller.abort();
-});
-it("does not let queued followups reclaim a stale active operation", async () => {
-  vi.useFakeTimers();
-  const startedAt = Date.now();
-  const active = operation();
-  const cancel = vi.fn();
-  active.attachBackend({ kind: "embedded", cancel, isStreaming: () => true });
-  active.setPhase("running");
-  vi.setSystemTime(startedAt + RUN_STALE_TAKEOVER_MS + 1);
-  const admission = admit({ sessionId: "replacement", kind: "queued_followup", waitTimeoutMs: 1 });
-  await Promise.resolve();
-  await vi.advanceTimersByTimeAsync(100);
-  await expect(admission).resolves.toMatchObject({
-    status: "skipped",
-    reason: "active-run",
-    activeOperation: active,
-  });
-  expect(cancel).not.toHaveBeenCalled();
-  expect(replyRunRegistry.get(sessionKey)).toBe(active);
-  active.complete();
-});
-it("lets visible turns reclaim terminal operations after settle grace elapsed", async () => {
-  vi.useFakeTimers();
-  const active = operation();
-  active.setPhase("running");
-  active.abortByUser();
-  const admission = admit({ sessionId: "replacement" });
-  await vi.advanceTimersByTimeAsync(REPLY_RUN_TERMINAL_SETTLE_TIMEOUT_MS);
-  const result = owned(await admission);
-  expect(active.result).toEqual({ kind: "aborted", code: "aborted_by_user" });
-  expect(replyRunRegistry.get(sessionKey)).not.toBe(active);
-  result.complete();
-});
 it.for([false, true])(
   "adopts a source-keyed command reservation and preserves restart=%s on interruption",
   async (restart, { signal }) => {
@@ -505,8 +382,8 @@ it.for([false, true])(
       ),
     ).toBe(reservation);
     expect(reservation.key).toBe(sessionKey);
-    expect(replyRunRegistry.get(sourceKey)).toBeUndefined();
-    expect(replyRunRegistry.get(sessionKey)).toBe(reservation);
+    expect(getSessionControllerOperation(sourceKey)).toBeUndefined();
+    expect(getSessionControllerOperation(sessionKey)).toBe(reservation);
     reservation.setPhase("running");
     const aborted = createDeferred();
     reservation.abortSignal.addEventListener("abort", () => aborted.resolve(), { once: true });
@@ -555,10 +432,112 @@ it("skips adoption without waiting when the target run slot is owned", async () 
     activeOperation: blocker,
   });
   expect(reservation.key).toBe(sourceKey);
-  expect(replyRunRegistry.get(sourceKey)).toBe(reservation);
-  expect(replyRunRegistry.get(sessionKey)).toBe(blocker);
+  expect(getSessionControllerOperation(sourceKey)).toBe(reservation);
+  expect(getSessionControllerOperation(sessionKey)).toBe(blocker);
   expect(reservation.result).toBeNull();
   expect(loadSessionEntry({ storePath, sessionKey })).toEqual(before);
   blocker.complete();
   reservation.complete();
+});
+
+it("binds the originating transcript leaf to the admitted operation", async () => {
+  const admitted = owned(await admit({ originatingLeafEntryId: "leaf-before-run" }));
+  expect(admitted.originatingLeafEntryId).toBe("leaf-before-run");
+  admitted.complete();
+});
+
+it.each([false, true])(
+  "rechecks a reset committed before admission, expected-session=%s",
+  async (expected) => {
+    const storePath = store();
+    const release = await holdMutation(storePath, () =>
+      replaceSessionEntry(
+        { sessionKey, storePath },
+        {
+          sessionId: "reset-session",
+          updatedAt: 200,
+        },
+      ),
+    );
+    const admission = admit({ storePath, expectedSessionId: expected ? sessionId : undefined });
+    await release();
+    if (expected) {
+      await expect(admission).rejects.toMatchObject({ code: "SESSION_WORK_START_CHANGED" });
+    } else {
+      const result = owned(await admission);
+      expect(result.sessionId).toBe("reset-session");
+      result.complete();
+    }
+  },
+);
+
+for (const outcome of ["retired", "cancelled"] as const) {
+  it(`waits without spinning on raw source preparation until ${outcome}`, async ({ signal }) => {
+    const input = reserveSessionControllerSource(sessionKey, { policy: { mode: "followup" } });
+    const abort = new AbortController();
+    let settled = false;
+    const pending = admit({ upstreamAbortSignal: abort.signal }).then((result) => {
+      settled = true;
+      return result;
+    });
+    try {
+      await withinTest(setImmediate(), signal);
+      expect(settled).toBe(false);
+      if (outcome === "cancelled") {
+        abort.abort();
+      } else {
+        retireSessionControllerInput(input);
+      }
+      const result = await withinTest(pending, signal);
+      if (outcome === "cancelled") {
+        expect(result).toEqual({ status: "skipped", reason: "aborted" });
+        expect(input.phase).toBe("preparing");
+      } else {
+        owned(result).complete();
+      }
+    } finally {
+      abort.abort();
+      retireSessionControllerInput(input);
+      const result = await pending;
+      if (result.status === "owned") {
+        result.operation.complete();
+      }
+      await input.settlement.promise;
+    }
+  });
+}
+
+it("resumes raw-source admission after writer fencing without waiting for producer cleanup", async ({
+  signal,
+}) => {
+  const input = reserveSessionControllerSource(sessionKey, { policy: { mode: "followup" } });
+  const abort = new AbortController();
+  const pending = admit({ upstreamAbortSignal: abort.signal });
+  let sourceOperation: ReturnType<typeof operation> | undefined;
+  try {
+    await withinTest(setImmediate(), signal);
+    const claim = await claimSessionControllerTask(input, () => {});
+    sourceOperation = operation({ mailboxClaim: claim });
+    sourceOperation.registerTerminalProducerFence(async () => true);
+    expect(await sourceOperation.retireAdmissionAfterFencing()).toBe(true);
+    expect(sourceOperation.admissionRetired).toBe(true);
+    expect(input.phase).toBe("claimed");
+    const successor = owned(await withinTest(pending, signal));
+    expect(getSessionControllerOperation(sessionKey)).toBe(successor);
+    expect(input.phase).toBe("claimed");
+    successor.complete();
+  } finally {
+    abort.abort();
+    sourceOperation?.complete();
+    if (input.claim) {
+      releaseSessionControllerClaim(input.claim);
+    } else {
+      retireSessionControllerInput(input);
+    }
+    const result = await pending;
+    if (result.status === "owned") {
+      result.operation.complete();
+    }
+    await input.settlement.promise;
+  }
 });

@@ -126,18 +126,32 @@ describe("nested settled-turn finalization ownership", () => {
       ];
       let toolRuns = 0;
       let finalizerRuns = 0;
+      // Each attempt, including the tool-free finalizer, must arrive under the child's own turn.
+      const attemptTurns: Array<EmbeddedRunAttemptParams["replyOperation"]> = [];
+      const expectFinalizerBorrowsChildTurn = () => {
+        expect(attemptTurns).toHaveLength(finalization === "empty" ? 3 : 2);
+        expect(attemptTurns[0]).toBeDefined();
+        for (const turn of attemptTurns) {
+          expect(turn).toBe(attemptTurns[0]);
+        }
+      };
       runAttempt.mockImplementation(async (params: EmbeddedRunAttemptParams) => {
+        attemptTurns.push(params.replyOperation);
         const handle = createEmbeddedRunHandle({
           runId: params.runId,
           toolAuthorityFingerprint: params.toolAuthorityFingerprint,
         });
-        setActiveEmbeddedRun(
+        const attachment = setActiveEmbeddedRun(
           params.sessionId,
           handle,
           params.sessionKey,
           params.sessionFile,
           params.agentId,
+          params.replyOperation,
         );
+        if (!attachment) {
+          throw new Error("Finalization proof requires an attached embedded run");
+        }
         try {
           const sessionKey = params.sessionTarget?.sessionKey;
           if (!sessionKey) {
@@ -199,7 +213,14 @@ describe("nested settled-turn finalization ownership", () => {
             settledTurnFinalizationContext: { source: "openclaw-transcript", messages },
           });
         } finally {
-          clearActiveEmbeddedRun(params.sessionId, handle, params.sessionKey);
+          clearActiveEmbeddedRun(
+            params.sessionId,
+            handle,
+            params.sessionKey,
+            params.sessionFile,
+            undefined,
+            attachment,
+          );
         }
       });
       let release!: () => void;
@@ -260,12 +281,14 @@ describe("nested settled-turn finalization ownership", () => {
           await expect(child).rejects.toThrow("admitted run authority is no longer active");
           expect(toolRuns).toBe(1);
           expect(finalizerRuns).toBe(1);
+          expectFinalizerBorrowsChildTurn();
           expect(await readMessages(target)).toHaveLength(messages.length);
           return;
         }
         const result = await child;
         expect(toolRuns).toBe(1);
         expect(finalizerRuns).toBe(finalization === "empty" ? 2 : 1);
+        expectFinalizerBorrowsChildTurn();
         const transcript = await readMessages(target);
         if (finalization === "answer") {
           expect(result?.payloads).toEqual([

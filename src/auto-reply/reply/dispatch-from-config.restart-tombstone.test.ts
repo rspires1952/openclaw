@@ -24,12 +24,12 @@ const notice =
 
 let dispatchReplyFromConfig: typeof import("./dispatch-from-config.js").dispatchReplyFromConfig;
 let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
-let resetReplyRunRegistry: () => void;
+let resetSessionControllerForTest: () => void;
 beforeAll(async () => {
   ({ dispatchReplyFromConfig } = await import("./dispatch-from-config.js"));
   ({ resetInboundDedupe } = await import("./inbound-dedupe.js"));
-  const { testing } = await import("./reply-run-registry.test-support.js");
-  resetReplyRunRegistry = () => testing.resetReplyRunRegistry();
+  const { testing } = await import("../../sessions/session-controller.test-support.js");
+  resetSessionControllerForTest = () => testing.resetSessionControllerForTest();
 });
 
 describe("restart tombstone channel feedback", () => {
@@ -41,7 +41,7 @@ describe("restart tombstone channel feedback", () => {
 
   beforeEach(() => {
     clearAgentHarnesses();
-    resetReplyRunRegistry();
+    resetSessionControllerForTest();
     resetInboundDedupe();
     resetPluginTtsAndThreadMocks();
     setActivePluginRegistry(

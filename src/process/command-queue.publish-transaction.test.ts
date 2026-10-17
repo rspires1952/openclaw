@@ -2,7 +2,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { createDeferred, withTestTimeout } from "../../test/helpers/promise.js";
 import {
-  clearCommandLane,
   enqueueCommandInLane,
   getCommandLaneSnapshot,
   publishLaneConfiguration,
@@ -15,6 +14,7 @@ const HOOK = "hook-dispatch";
 const DELIVERY = "delivery-dispatch";
 const GROUP = "cron-hooks";
 const MOVED_GROUP = "cron-delivery";
+let cancellation: AbortController;
 
 type LaneGroupSpec = NonNullable<Parameters<typeof publishLaneConfiguration>[0]["groups"]>[string];
 
@@ -27,12 +27,14 @@ function clearCommandLaneGroup(group: string): void {
 }
 
 beforeEach(() => {
+  cancellation = new AbortController();
   resetAllLanes();
   clearCommandLaneGroup(GROUP);
   clearCommandLaneGroup(MOVED_GROUP);
 });
 
 afterEach(() => {
+  cancellation.abort();
   clearCommandLaneGroup(GROUP);
   clearCommandLaneGroup(MOVED_GROUP);
   resetAllLanes();
@@ -48,21 +50,28 @@ describe("publishLaneConfiguration", () => {
     let peak = 0;
     const publishedStarts = createDeferred();
     const gates: Array<{ resolve: () => void }> = [];
+    const cancellations: AbortController[] = [];
     const runs: Array<Promise<unknown>> = [];
     const park = (lane: string) => {
       const g = createDeferred();
+      const owner = new AbortController();
       gates.push(g);
+      cancellations.push(owner);
       runs.push(
-        enqueueCommandInLane(lane, async () => {
-          active += 1;
-          // Sample before any task can retire to catch transient over-admission.
-          peak = Math.max(peak, active);
-          if (active >= 8) {
-            publishedStarts.resolve();
-          }
-          await g.promise;
-          active -= 1;
-        }),
+        enqueueCommandInLane(
+          lane,
+          async () => {
+            active += 1;
+            // Sample before any task can retire to catch transient over-admission.
+            peak = Math.max(peak, active);
+            if (active >= 8) {
+              publishedStarts.resolve();
+            }
+            await g.promise;
+            active -= 1;
+          },
+          { abortSignal: owner.signal },
+        ),
       );
     };
     for (let i = 0; i < 12; i++) {
@@ -98,8 +107,7 @@ describe("publishLaneConfiguration", () => {
       for (const g of gates) {
         g.resolve();
       }
-      clearCommandLane(CRON);
-      clearCommandLane(HOOK);
+      cancellations.forEach((owner) => owner.abort());
       await Promise.allSettled(runs);
     }
   });
@@ -120,7 +128,7 @@ describe("publishLaneConfiguration", () => {
         cronStarted.resolve();
         await cronGate.promise;
       },
-      { priority: "background" },
+      { priority: "background", abortSignal: cancellation.signal },
     );
     const newerHook = enqueueCommandInLane(
       HOOK,
@@ -129,7 +137,7 @@ describe("publishLaneConfiguration", () => {
         hookStarted.resolve();
         await hookGate.promise;
       },
-      { priority: "background" },
+      { priority: "background", abortSignal: cancellation.signal },
     );
 
     try {
@@ -156,8 +164,7 @@ describe("publishLaneConfiguration", () => {
     } finally {
       cronGate.resolve();
       hookGate.resolve();
-      clearCommandLane(CRON);
-      clearCommandLane(HOOK);
+      cancellation.abort();
       await Promise.allSettled([olderCron, newerHook]);
     }
   });
@@ -194,7 +201,9 @@ describe("publishLaneConfiguration", () => {
     // Reject before mutating: a later enqueue must not dispatch the preserved queue.
     setCommandLaneConcurrency(CRON, 0);
     const gates = Array.from({ length: 4 }, () => createDeferred());
-    const runs = gates.map((g) => enqueueCommandInLane(CRON, async () => await g.promise));
+    const runs = gates.map((g) =>
+      enqueueCommandInLane(CRON, async () => await g.promise, { abortSignal: cancellation.signal }),
+    );
     expect(getCommandLaneSnapshot(CRON).maxConcurrent).toBe(0);
 
     expect(() =>
@@ -214,14 +223,16 @@ describe("publishLaneConfiguration", () => {
     expect(getCommandLaneSnapshot(CRON).group).toBeUndefined();
 
     const extra = createDeferred();
-    const extraRun = enqueueCommandInLane(CRON, async () => await extra.promise);
+    const extraRun = enqueueCommandInLane(CRON, async () => await extra.promise, {
+      abortSignal: cancellation.signal,
+    });
     expect(getCommandLaneSnapshot(CRON).activeCount).toBe(0);
 
     for (const g of gates) {
       g.resolve();
     }
     extra.resolve();
-    clearCommandLane(CRON);
+    cancellation.abort();
     await Promise.allSettled([...runs, extraRun]);
   });
 
@@ -262,7 +273,9 @@ describe("publishLaneConfiguration", () => {
     setCommandLaneGroup(GROUP, { budget: 2, members: [CRON, HOOK] });
 
     const gates = Array.from({ length: 5 }, () => createDeferred());
-    const runs = gates.map((g) => enqueueCommandInLane(CRON, async () => await g.promise));
+    const runs = gates.map((g) =>
+      enqueueCommandInLane(CRON, async () => await g.promise, { abortSignal: cancellation.signal }),
+    );
     expect(getCommandLaneSnapshot(CRON).activeCount).toBe(2);
     expect(getCommandLaneSnapshot(CRON).queuedCount).toBe(3);
 
@@ -286,7 +299,9 @@ describe("publishLaneConfiguration", () => {
     });
 
     const gates = Array.from({ length: 3 }, () => createDeferred());
-    const runs = gates.map((g) => enqueueCommandInLane(CRON, async () => await g.promise));
+    const runs = gates.map((g) =>
+      enqueueCommandInLane(CRON, async () => await g.promise, { abortSignal: cancellation.signal }),
+    );
     expect(getCommandLaneSnapshot(CRON).activeCount).toBe(3);
 
     // Narrowing cannot evict running work or admit more while over budget.
@@ -297,7 +312,9 @@ describe("publishLaneConfiguration", () => {
       },
     });
     const extra = createDeferred();
-    const blocked = enqueueCommandInLane(CRON, async () => await extra.promise);
+    const blocked = enqueueCommandInLane(CRON, async () => await extra.promise, {
+      abortSignal: cancellation.signal,
+    });
 
     expect(getCommandLaneSnapshot(CRON).activeCount).toBe(3);
     expect(getCommandLaneSnapshot(CRON).blockedBy).toBe("group-budget");
@@ -306,7 +323,7 @@ describe("publishLaneConfiguration", () => {
       g.resolve();
     }
     extra.resolve();
-    clearCommandLane(CRON);
+    cancellation.abort();
     await Promise.allSettled([...runs, blocked]);
   });
 });

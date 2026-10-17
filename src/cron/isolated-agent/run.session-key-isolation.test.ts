@@ -2,7 +2,7 @@ import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { runInitialModelFallbackAttempt } from "../../agents/test-helpers/model-fallback-runner.test-support.js";
-import { isSessionWorkAdmissionActive } from "../../sessions/session-lifecycle-admission.js";
+import { isSessionControllerWorkActive } from "../../sessions/session-controller.lifecycle.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { mockCall } from "../../test-utils/mock-call-assertions.js";
 import { makeIsolatedAgentJobFixture, makeIsolatedAgentParamsFixture } from "./job-fixtures.js";
@@ -51,7 +51,7 @@ describe("runCronIsolatedAgentTurn isolated session identity", () => {
     mockRunCronFallbackPassthrough();
     removeCronRunContinuationSessionIfIdleMock.mockImplementation(async (sessionKey) => {
       expect(sessionKey).toMatch(/:run:run-[ab]$/u);
-      expect(isSessionWorkAdmissionActive("/tmp/store.json", [sessionKey])).toBe(false);
+      expect(isSessionControllerWorkActive("/tmp/store.json", [sessionKey])).toBe(false);
     });
     const params = makeIsolatedAgentParamsFixture({
       sessionKey: "cron:daily-monitor",

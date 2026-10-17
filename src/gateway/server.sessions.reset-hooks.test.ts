@@ -14,7 +14,7 @@ import { memorySessionActorOwners } from "../config/sessions/session-actor-memor
 import type { InternalSessionEntry } from "../config/sessions/types.js";
 import type { PluginHookSessionContext } from "../plugins/session-end-transcript.js";
 import { readAttachedSessionEndTranscriptSourceForTest } from "../plugins/session-end-transcript.test-support.js";
-import { beginSessionWorkAdmission } from "../sessions/session-lifecycle-admission.js";
+import { beginSessionEffect } from "../sessions/session-controller.lifecycle.js";
 import { resolveIncognitoOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.js";
 import { embeddedRunMock, testState, writeSessionStore } from "./test-helpers.js";
 import {
@@ -632,7 +632,7 @@ test("sessions.create waits for the parent run lifecycle before firing hooks", a
 test("sessions.create waits for the parent work admission to release", async () => {
   const { storePath } = await createSessionStoreDir();
   await writeMainSessionEntry("sess-finishing-parent");
-  const admission = await beginSessionWorkAdmission({
+  const admission = await beginSessionEffect({
     scope: storePath,
     identities: ["agent:main:main", "sess-finishing-parent"],
     assertAllowed: () => {},
@@ -659,7 +659,7 @@ test("sessions.create fences new parent work while rollover hooks run", async ()
   const hookEntered = createDeferred();
   const releaseHook = createDeferred();
   const admissionController = new AbortController();
-  let admission: ReturnType<typeof beginSessionWorkAdmission> | undefined;
+  let admission: ReturnType<typeof beginSessionEffect> | undefined;
   sessionHookMocks.triggerInternalHook.mockImplementationOnce(async () => {
     hookEntered.resolve();
     await releaseHook.promise;
@@ -696,7 +696,7 @@ test("sessions.create fences new parent work while rollover hooks run", async ()
     expect(sessionHookMocks.triggerInternalHook).toHaveBeenCalledTimes(1);
 
     let admissionStarted = false;
-    admission = beginSessionWorkAdmission({
+    admission = beginSessionEffect({
       scope: storePath,
       identities: ["agent:main:main", "sess-parent-fenced"],
       signal: admissionController.signal,
@@ -738,8 +738,6 @@ test("sessions.create with emitCommandHooks=true resets parent in place when ses
       storePath,
       content: "hello before /new",
     });
-    embeddedRunMock.activeIds.add("sess-parent-dms");
-
     const result = await directSessionReq<{
       ok: boolean;
       key: string;

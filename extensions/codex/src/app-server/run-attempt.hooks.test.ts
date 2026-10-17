@@ -15,6 +15,7 @@ import { initializeGlobalHookRunner } from "openclaw/plugin-sdk/hook-runtime";
 import {
   createMockPluginRegistry,
   onTrustedInternalDiagnosticEvent,
+  withAdmittedSessionTurnForTest,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { setRuntimeConfigSnapshot } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { describe, expect, it, vi } from "vitest";
@@ -34,7 +35,7 @@ import {
 } from "./run-attempt-test-harness.js";
 
 type ReplyBackend = Parameters<
-  NonNullable<ReturnType<typeof createParams>["replyOperation"]>["attachBackend"]
+  Parameters<Parameters<typeof withAdmittedSessionTurnForTest>[1]>[0]["attachBackend"]
 >[0];
 
 function readTurnStartText(harness: ReturnType<typeof createStartedThreadHarness>): string {
@@ -48,6 +49,40 @@ function readTurnStartText(harness: ReturnType<typeof createStartedThreadHarness
   expect(text).toContain("[assistant]\nexisting context");
   expect(text).toMatch(/<\/conversation_context>\n\nCurrent user request:\nhello$/);
   return text;
+}
+
+// Runs the attempt inside its real controller turn, as a Gateway run would, and
+// observes how Codex uses that operation. The turn completes after the attempt.
+async function runWithObservedReplyTurn(params: ReturnType<typeof createParams>) {
+  const started = createDeferred<{
+    run: ReturnType<typeof runCodexAppServerAttempt>;
+    attachBackend: ReturnType<typeof vi.fn>;
+    detachBackend: ReturnType<typeof vi.fn>;
+    freezeAbort: ReturnType<typeof vi.fn>;
+  }>();
+  const turnSettled = withAdmittedSessionTurnForTest(
+    { sessionKey: params.sessionKey!, sessionId: params.sessionId },
+    async (operation) => {
+      const observed = {
+        attachBackend: vi.spyOn(operation, "attachBackend"),
+        detachBackend: vi.spyOn(operation, "detachBackend"),
+        freezeAbort: vi.spyOn(operation, "freezeAbort"),
+        run: runCodexAppServerAttempt(params),
+      };
+      started.resolve(observed);
+      await observed.run.catch(() => undefined);
+    },
+  );
+  void turnSettled.catch(started.reject);
+  const observed = await started.promise;
+  return {
+    ...observed,
+    turnSettled,
+    replyBackend: () =>
+      observed.attachBackend.mock.calls.at(-1)?.[0] as
+        | Pick<ReplyBackend, "cancel" | "isAbortable">
+        | undefined,
+  };
 }
 
 function holdAgentEnd() {
@@ -290,16 +325,9 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     const onRunAgentEvent = vi.fn();
     const params = createTestParams();
     params.onAgentEvent = onRunAgentEvent;
-    const attachBackend = vi.fn();
-    const detachBackend = vi.fn();
-    const freezeAbort = vi.fn();
-    params.replyOperation = {
-      attachBackend,
-      detachBackend,
-      freezeAbort,
-    } as unknown as NonNullable<typeof params.replyOperation>;
     const harness = createStartedThreadHarness();
-    const run = runCodexAppServerAttempt(params);
+    const { run, turnSettled, attachBackend, detachBackend, freezeAbort } =
+      await runWithObservedReplyTurn(params);
     let settled = false;
     void run.then(() => {
       settled = true;
@@ -350,30 +378,28 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
     expect(terminalLifecycleEvents[0]?.data).toMatchObject({ phase: "end" });
     expect(terminalLifecycleEvents[0]?.data.aborted).toBeUndefined();
     expect(detachBackend).toHaveBeenCalledWith(replyBackend);
+    await turnSettled;
     expect(resolveActiveEmbeddedRunSessionId("agent:main:session-1")).toBeUndefined();
   });
 
   it("keeps replay-safe client-close recovery cancellable during agent_end", async () => {
     const { agentEnd, releaseAgentEnd } = holdAgentEnd();
     const onAttemptAbort = vi.fn();
-    let replyBackend: Pick<ReplyBackend, "cancel" | "isAbortable"> | undefined;
     const params = createTestParams();
     params.onAttemptAbort = onAttemptAbort;
-    const freezeAbort = vi.fn();
-    params.replyOperation = {
-      attachBackend: (backend: ReplyBackend) => {
-        replyBackend = backend;
-      },
-      detachBackend: vi.fn(),
-      freezeAbort,
-    } as unknown as NonNullable<typeof params.replyOperation>;
     const harness = createStartedThreadHarness();
-    const run = runCodexAppServerAttempt(params);
+    const {
+      run,
+      turnSettled,
+      freezeAbort,
+      replyBackend: readReplyBackend,
+    } = await runWithObservedReplyTurn(params);
 
     await run.waitForTurnAccepted();
     harness.close();
     await vi.waitFor(() => expect(agentEnd).toHaveBeenCalledTimes(1), fastWait);
 
+    const replyBackend = readReplyBackend();
     expect(replyBackend?.isAbortable?.()).toBe(true);
     replyBackend?.cancel("user_abort");
     expect(onAttemptAbort).toHaveBeenCalledTimes(1);
@@ -389,74 +415,88 @@ describe("runCodexAppServerAttempt hooks and model diagnostics", () => {
       replaySafe: true,
     });
     expect(freezeAbort).not.toHaveBeenCalled();
+    await turnSettled;
   });
 
-  it("keeps ordinary failed turns cancellable until the orchestrator settles", async () => {
-    const { agentEnd, releaseAgentEnd } = holdAgentEnd();
-    const onAttemptAbort = vi.fn();
-    const onRunAgentEvent = vi.fn<NonNullable<ReturnType<typeof createParams>["onAgentEvent"]>>();
-    let replyBackend: Pick<ReplyBackend, "cancel" | "isAbortable"> | undefined;
-    const params = createTestParams();
-    params.onAttemptAbort = onAttemptAbort;
-    params.onAgentEvent = onRunAgentEvent;
-    const freezeAbort = vi.fn();
-    params.replyOperation = {
-      attachBackend: (backend: ReplyBackend) => {
-        replyBackend = backend;
-      },
-      detachBackend: vi.fn(),
-      freezeAbort,
-    } as unknown as NonNullable<typeof params.replyOperation>;
-    const harness = createStartedThreadHarness();
-    const run = runCodexAppServerAttempt(params);
+  it.each([
+    {
+      label: "failed",
+      status: "failed",
+      error: { message: "codex exploded" },
+      expectedPromptError: "codex exploded",
+      expectedClassification: undefined,
+    },
+    {
+      label: "empty completed",
+      status: "completed",
+      error: null,
+      expectedPromptError: null,
+      expectedClassification: "empty",
+    },
+  ] as const)(
+    "keeps ordinary $label turns cancellable until the orchestrator settles",
+    async ({ status, error, expectedPromptError, expectedClassification }) => {
+      const { agentEnd, releaseAgentEnd } = holdAgentEnd();
+      const onAttemptAbort = vi.fn();
+      const onRunAgentEvent = vi.fn<NonNullable<ReturnType<typeof createParams>["onAgentEvent"]>>();
+      const params = createTestParams();
+      params.onAttemptAbort = onAttemptAbort;
+      params.onAgentEvent = onRunAgentEvent;
+      const harness = createStartedThreadHarness();
+      const {
+        run,
+        turnSettled,
+        freezeAbort,
+        replyBackend: readReplyBackend,
+      } = await runWithObservedReplyTurn(params);
 
-    await harness.waitForMethod("turn/start");
-    await harness.notify({
-      method: "turn/completed",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        turn: {
-          id: "turn-1",
-          status: "failed",
-          items: [],
-          error: { message: "codex exploded" },
+      await run.waitForTurnAccepted();
+      await harness.notify({
+        method: "turn/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          turn: { id: "turn-1", status, items: [], error },
         },
-      },
-    });
-    await vi.waitFor(() => expect(agentEnd).toHaveBeenCalledTimes(1), fastWait);
+      });
+      await vi.waitFor(() => expect(agentEnd).toHaveBeenCalledTimes(1), fastWait);
 
-    expect(replyBackend?.isAbortable?.()).toBe(true);
-    replyBackend?.cancel("user_abort");
-    expect(onAttemptAbort).toHaveBeenCalledTimes(1);
+      const replyBackend = readReplyBackend();
+      expect(replyBackend?.isAbortable?.()).toBe(true);
+      replyBackend?.cancel("user_abort");
+      expect(onAttemptAbort).toHaveBeenCalledTimes(1);
 
-    releaseAgentEnd();
-    const result = await run;
-    expect(readAttemptTerminal(result)).toMatchObject({
-      aborted: false,
-      promptError: "codex exploded",
-    });
-    expect(result.agentHarnessResultClassification).toBeUndefined();
-    expect(freezeAbort).not.toHaveBeenCalled();
-    const events = onRunAgentEvent.mock.calls.map(([event]) => event);
-    expect(
-      events.find((event) => event.stream === "lifecycle" && event.data.phase === "start"),
-    ).toMatchObject({ data: { startedAt: expect.any(Number) } });
-    expect(
-      events.find((event) => event.stream === "lifecycle" && event.data.phase === "error"),
-    ).toMatchObject({
-      data: {
-        startedAt: expect.any(Number),
-        endedAt: expect.any(Number),
-        error: "codex exploded",
-      },
-    });
-    expect(events.some((event) => event.stream === "assistant")).toBe(false);
-    expect(mockCall(agentEnd, "agent_end")).toMatchObject([
-      { success: false, error: "codex exploded" },
-      { runId: "run-1", sessionId: "session-1" },
-    ]);
-  });
+      releaseAgentEnd();
+      const result = await run;
+      expect(readAttemptTerminal(result)).toMatchObject({
+        aborted: false,
+        promptError: expectedPromptError,
+      });
+      expect(result.agentHarnessResultClassification).toBe(expectedClassification);
+      expect(freezeAbort).not.toHaveBeenCalled();
+      await turnSettled;
+      if (status === "failed") {
+        const events = onRunAgentEvent.mock.calls.map(([event]) => event);
+        expect(
+          events.find((event) => event.stream === "lifecycle" && event.data.phase === "start"),
+        ).toMatchObject({ data: { startedAt: expect.any(Number) } });
+        expect(
+          events.find((event) => event.stream === "lifecycle" && event.data.phase === "error"),
+        ).toMatchObject({
+          data: {
+            startedAt: expect.any(Number),
+            endedAt: expect.any(Number),
+            error: "codex exploded",
+          },
+        });
+        expect(events.some((event) => event.stream === "assistant")).toBe(false);
+        expect(mockCall(agentEnd, "agent_end")).toMatchObject([
+          { success: false, error: "codex exploded" },
+          { runId: "run-1", sessionId: "session-1" },
+        ]);
+      }
+    },
+  );
 
   it("does not wait for agent_end hooks before resolving channel-backed codex turns", async () => {
     const { agentEnd, releaseAgentEnd } = holdAgentEnd();

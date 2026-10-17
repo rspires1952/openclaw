@@ -34,12 +34,16 @@ import {
 } from "./subagent-session-metrics.js";
 import { resolveCompletionFromSessionEntry } from "./subagent-session-reconciliation.js";
 
+/** A kill no operation settlement confirmed is reconciled by the sweeper after this window. */
 export const PROVISIONAL_KILL_RECONCILIATION_MS = 5 * 60_000;
+export const GATEWAY_ADMISSION_RETRY_DELAY_MS = 1_000;
 export const MIN_ANNOUNCE_RETRY_DELAY_MS = 15_000;
 const MAX_ANNOUNCE_RETRY_DELAY_MS = 5 * 60_000;
 const ANNOUNCE_RETRY_JITTER = 0.2;
 export const ANNOUNCE_EXPIRY_MS = 5 * 60_000;
 export const ANNOUNCE_COMPLETION_HARD_EXPIRY_MS = 30 * 60_000;
+/** The durable media outbox owns its own delivery window, independent of the mailbox. */
+export const SESSION_DELIVERY_DEADLINE_MS = ANNOUNCE_COMPLETION_HARD_EXPIRY_MS;
 
 const ANNOUNCE_RETRY_BACKOFF = {
   initialMs: MIN_ANNOUNCE_RETRY_DELAY_MS,

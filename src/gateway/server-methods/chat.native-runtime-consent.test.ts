@@ -11,6 +11,7 @@ import * as replyInitialization from "../../config/sessions/session-accessor.res
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { listSessionEntries, upsertSessionEntry } from "../../plugin-sdk/session-store-runtime.js";
 import { readVisibleSessionTranscriptMessageEntries } from "../../plugin-sdk/session-transcript-runtime.js";
+import { rpcSourceTesting } from "../../sessions/session-lifecycle-admission.test-support.js";
 import {
   closeOpenClawAgentDatabasesAsync,
   openOpenClawAgentDatabase,
@@ -147,7 +148,7 @@ it.each([false, true])(
           expect(persisted.modelOverride).toBeUndefined();
           expect(persisted.agentRuntimeOverride).toBeUndefined();
         }
-        expect(context.chatAbortControllers.size).toBe(0);
+        expect(rpcSourceTesting.size).toBe(0);
       } finally {
         await native.service.stop?.(native.context);
       }
@@ -222,7 +223,7 @@ it.each([
         );
         expect(respond.mock.calls[0]?.[2]?.details).not.toHaveProperty("recovery");
         expect(listSessionEntries({ agentId: "main", readOnly: true })).toEqual([]);
-        expect(context.chatAbortControllers.size).toBe(0);
+        expect(rpcSourceTesting.size).toBe(0);
       } finally {
         await native.service.stop?.(native.context);
       }
@@ -300,7 +301,7 @@ it.each(["authority", "mandatory policy", "competing entry"] as const)(
           expect(entries).toEqual([]);
         }
         expect(entries.every(({ entry }) => entry.nativeRuntimeConsent === undefined)).toBe(true);
-        expect(context.chatAbortControllers.size).toBe(0);
+        expect(rpcSourceTesting.size).toBe(0);
       } finally {
         release.resolve();
         await outcome;
@@ -377,7 +378,7 @@ it.runIf(process.platform !== "win32")(
           "Reply initialization database changed after its snapshot",
         );
         expect(respond).not.toHaveBeenCalled();
-        expect(context.chatAbortControllers.size).toBe(0);
+        expect(rpcSourceTesting.size).toBe(0);
       } finally {
         release.resolve();
         await outcome;

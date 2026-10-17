@@ -6,6 +6,7 @@ import {
   createAdmittedGatewayToolCallerIdentity,
   withGatewayToolCallerIdentity,
 } from "../../../agents/tools/gateway-caller-context.js";
+import { getCurrentSessionControllerOwner } from "../../../sessions/session-controller.lifecycle.js";
 
 export async function withRegisteredNativeEmbeddedRun<T>(
   params: Pick<RunEmbeddedAgentParams, "preparedRunAdmission" | "runId" | "sessionTarget">,
@@ -25,7 +26,18 @@ export async function withRegisteredNativeEmbeddedRun<T>(
     }),
     async () => {
       const handle = createEmbeddedRunHandle({ runId: params.runId });
-      embeddedRuns.setActiveEmbeddedRun(sessionId, handle, sessionKey);
+      const operation = getCurrentSessionControllerOwner();
+      if (!operation) {
+        throw new Error("Talk native fixture has no controller-owned turn");
+      }
+      embeddedRuns.setActiveEmbeddedRun(
+        sessionId,
+        handle,
+        sessionKey,
+        undefined,
+        agentId,
+        operation,
+      );
       try {
         return await run(admittedRunContext);
       } finally {

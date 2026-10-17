@@ -1,22 +1,15 @@
 // Tests gateway active-run matching by logical session key and backing id.
-import { expect, it } from "vitest";
+import { afterEach, expect, it, onTestFinished } from "vitest";
 import type { EmbeddedAgentQueueHandle } from "../../agents/embedded-agent-runner/run-state.js";
+import { abortEmbeddedAgentRun } from "../../agents/embedded-agent-runner/runs.js";
 import {
-  abortEmbeddedAgentRun,
-  clearActiveEmbeddedRun,
-  isEmbeddedAgentRunActive,
-  resolveEmbeddedAgentRunProgressState,
-  setActiveEmbeddedRun,
-  waitForEmbeddedAgentRunEnd,
-} from "../../agents/embedded-agent-runner/runs.js";
+  clearTestEmbeddedRun as clearActiveEmbeddedRun,
+  registerTestEmbeddedRun,
+} from "../../agents/embedded-agent-runner/runs.test-support.js";
 import {
   addSubagentRunForTests,
   resetSubagentRegistryForTests,
 } from "../../agents/subagents/registry/subagent-registry.test-helpers.js";
-import {
-  createReplyOperation,
-  markReplyOperationExecutionStarted,
-} from "../../auto-reply/reply/reply-run-registry.js";
 import { admitReplyTurn } from "../../auto-reply/reply/reply-turn-admission.js";
 import {
   clearRuntimeConfigSnapshot,
@@ -32,39 +25,129 @@ import {
   clearAgentRunContext,
   registerAgentRunContext,
 } from "../../infra/agent-run-registry.js";
+import { bindGatewayContextResolver } from "../../plugins/runtime/gateway-request-scope.js";
+import {
+  createReplyOperation as createControllerOperation,
+  markReplyOperationExecutionStarted,
+} from "../../sessions/session-controller.js";
+import { captureSessionTarget } from "../../sessions/session-controller.lifecycle.js";
+import { retireSessionControllerInput } from "../../sessions/session-controller.mailbox.js";
+import { waitForSessionRunEnd } from "../../sessions/session-controller.native-runtime.js";
+import {
+  isSessionRunActive,
+  resolveSessionRunProgressState,
+} from "../../sessions/session-controller.queries.js";
+import type {
+  RpcSourceAdapter,
+  RpcSourceIdentity,
+} from "../../sessions/session-controller.rpc-sources.js";
+import { rpcSourceTesting } from "../../sessions/session-lifecycle-admission.test-support.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { registerChatAbortController } from "../chat-abort.js";
 import { buildGatewaySessionSnapshot } from "../session-event-payload.js";
+import { createRpcSourceForTest, claimRpcSourceForTest } from "../test-helpers.rpc-source.js";
 import {
   createVisibleActiveSessionRunProjector,
   hasRegisteredChatRunForSessionKey,
-  hasTrackedActiveSessionRun,
   resolveVisibleActiveSessionRunState,
 } from "./session-active-runs.js";
+
+const releaseFixtureSources: Array<() => void> = [];
+const storePath = "/synthetic/active-projection/sessions";
+
+function setActiveEmbeddedRun(
+  sessionId: string,
+  handle: EmbeddedAgentQueueHandle,
+  sessionKey: string,
+) {
+  return registerTestEmbeddedRun(
+    sessionId,
+    handle,
+    sessionKey,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { storeScope: storePath },
+  );
+}
+
+function createReplyOperation(params: Parameters<typeof createControllerOperation>[0]) {
+  return createControllerOperation({
+    ...params,
+    target: captureSessionTarget({
+      storeScope: storePath,
+      sessionKey: params.sessionKey,
+      incarnation: params.sessionId,
+      agentId: params.agentId,
+    }),
+  });
+}
+
+afterEach(() => {
+  for (const release of releaseFixtureSources.splice(0).toReversed()) {
+    release();
+  }
+});
+async function activeSources(
+  entries: Array<
+    [
+      string,
+      Partial<RpcSourceAdapter> &
+        Partial<RpcSourceIdentity> & {
+          projectSessionActive?: boolean;
+          storeScope?: string;
+          queued?: boolean;
+        },
+    ]
+  >,
+) {
+  const refs = await Promise.all(
+    entries.map(async ([runId, metadata]) => {
+      const { sessionKey, sessionId, agentId, storeScope, queued, ...adapter } = metadata;
+      const ref = createRpcSourceForTest(adapter, {
+        runId,
+        storeScope: storeScope ?? storePath,
+        sessionKey,
+        sessionId: sessionId ?? `fixture-${runId}`,
+        agentId,
+        accepted: true,
+      });
+      if (!queued) {
+        releaseFixtureSources.push(await claimRpcSourceForTest(ref));
+      }
+      return [runId, ref] as const;
+    }),
+  );
+  return new Map(refs);
+}
 
 type ActiveRunParams = Parameters<typeof resolveVisibleActiveSessionRunState>[0];
 
 function visibleState(
   sessionKey: string,
-  options: Omit<ActiveRunParams, "context" | "requestedKey" | "canonicalKey"> = {},
+  options: Omit<ActiveRunParams, "requestedKey" | "canonicalKey" | "storePath"> = {},
 ) {
-  const { projectedAgentRunIndex, ...scope } = options;
-  return createVisibleActiveSessionRunProjector(
-    {},
-    projectedAgentRunIndex,
-  )({
+  return resolveVisibleActiveSessionRunState({
+    storePath,
     requestedKey: sessionKey,
     canonicalKey: sessionKey,
-    ...scope,
+    ...options,
   });
 }
 
-it("projects ordinary startup as active before execution starts", () => {
+it("projects an accepted source before its exact controller claim starts", async () => {
   const sessionKey = "agent:main:queued";
   const sessionId = "queued-session";
   const runId = "queued-run";
-  const chatAbortControllers = new Map();
+  rpcSourceTesting.clear();
   const registration = registerChatAbortController({
-    chatAbortControllers,
+    target: captureSessionTarget({
+      storeScope: storePath,
+      sessionKey,
+      incarnation: sessionId,
+      agentId: "main",
+    }),
     runId,
     sessionId,
     sessionKey,
@@ -74,14 +157,21 @@ it("projects ordinary startup as active before execution starts", () => {
   });
   const state = () =>
     resolveVisibleActiveSessionRunState({
-      context: { chatAbortControllers } as never,
+      storePath,
       requestedKey: sessionKey,
       canonicalKey: sessionKey,
       sessionId,
       agentId: "main",
     });
 
-  expect(state()).toEqual({ active: true, runIds: [runId] });
+  onTestFinished(() => registration.cleanup());
+  registration.initializeTiming();
+
+  expect(state()).toEqual({ active: true, runIds: [runId], status: "queued" });
+  if (!registration.entry) {
+    throw new Error("Missing RPC source");
+  }
+  releaseFixtureSources.push(await claimRpcSourceForTest(registration.entry));
   expect(registration.markExecutionStarted()).toBe(true);
   expect(state()).toEqual({ active: true, runIds: [runId] });
   expect(registration.markExecutionStarted()).toBe(false);
@@ -107,7 +197,7 @@ it("projects direct subagent activity only for its own current-lifecycle session
   registerAgentRunContext("run-attachment-fix", { sessionKey: childKey, agentId: "main" });
   expect(
     resolveVisibleActiveSessionRunState({
-      context: {},
+      storePath,
       requestedKey: childKey,
       canonicalKey: childKey,
       agentId: "main",
@@ -148,16 +238,29 @@ it("projects direct subagent activity only for its own current-lifecycle session
   }
 });
 
-it("keeps terminal persistence visible only to chat history", () => {
+it("keeps terminal persistence visible only to chat history", async () => {
   const terminal = {
     sessionKey: "agent:main:main",
     sessionId: "session-main",
     projectSessionActive: false,
     projectSessionTerminalPending: true,
   };
-  const context = { chatAbortControllers: new Map([["run-terminal", terminal]]) } as never;
+  const terminalRef = createRpcSourceForTest(
+    {
+      projectSessionActive: terminal.projectSessionActive,
+      projectSessionTerminalPending: terminal.projectSessionTerminalPending,
+    },
+    {
+      sessionKey: terminal.sessionKey,
+      storeScope: storePath,
+      sessionId: terminal.sessionId,
+      agentId: "main",
+    },
+  );
+  rpcSourceTesting.reset([["run-terminal", terminalRef]]);
+  releaseFixtureSources.push(() => retireSessionControllerInput(terminalRef.input));
   const params = {
-    context,
+    storePath,
     requestedKey: terminal.sessionKey,
     canonicalKey: terminal.sessionKey,
     sessionId: terminal.sessionId,
@@ -169,15 +272,62 @@ it("keeps terminal persistence visible only to chat history", () => {
     resolveVisibleActiveSessionRunState({ ...params, includeTerminalPersistence: true }),
   ).toEqual({ active: true });
 
-  terminal.projectSessionTerminalPending = false;
+  terminalRef.adapter.projectSessionTerminalPending = false;
+  terminalRef.adapter.projectSessionTerminalPersisted = true;
   expect(
     resolveVisibleActiveSessionRunState({ ...params, includeTerminalPersistence: true }),
   ).toEqual({ active: false, runIds: [] });
 });
 
-it("matches session-id-only gateway runs during archive admission", () => {
-  const context = {
-    chatAbortControllers: new Map([
+it("keeps prebuilt active-run indexes in parity with per-row scans", async () => {
+  rpcSourceTesting.reset(
+    await activeSources([
+      ["run-main", { sessionKey: "agent:main:main", sessionId: "session-main" }],
+      ["run-global", { sessionKey: "global", agentId: "work" }],
+      ["run-hidden", { sessionKey: "agent:main:hidden", projectSessionActive: false }],
+    ]),
+  );
+  registerAgentRunContext("projected-key", {
+    projectSessionActive: true,
+    sessionKey: "agent:main:projected",
+  });
+  registerAgentRunContext("projected-id", {
+    projectSessionActive: true,
+    agentId: "main",
+    sessionId: "session-projected",
+  });
+  try {
+    const project = createVisibleActiveSessionRunProjector();
+    const cases = [
+      { requestedKey: "agent:main:main", canonicalKey: "agent:main:main" },
+      { requestedKey: "agent:main:projected", canonicalKey: "agent:main:projected" },
+      {
+        requestedKey: "agent:main:by-id",
+        canonicalKey: "agent:main:by-id",
+        sessionId: "session-projected",
+      },
+      {
+        requestedKey: "global",
+        canonicalKey: "global",
+        agentId: "work",
+        defaultAgentId: "main",
+      },
+      { requestedKey: "agent:main:missing", canonicalKey: "agent:main:missing" },
+    ];
+    for (const activeCase of cases) {
+      expect(project({ storePath, ...activeCase })).toEqual(
+        resolveVisibleActiveSessionRunState({ storePath, ...activeCase }),
+      );
+    }
+  } finally {
+    clearAgentRunContext("projected-key");
+    clearAgentRunContext("projected-id");
+  }
+});
+
+it("matches session-id-only gateway runs during archive admission", async () => {
+  rpcSourceTesting.reset(
+    await activeSources([
       [
         "run-1",
         {
@@ -187,11 +337,11 @@ it("matches session-id-only gateway runs during archive admission", () => {
         },
       ],
     ]),
-  } as never;
+  );
 
   expect(
     resolveVisibleActiveSessionRunState({
-      context,
+      storePath,
       requestedKey: "agent:main:child",
       canonicalKey: "agent:main:child",
       sessionId: "session-1",
@@ -200,43 +350,37 @@ it("matches session-id-only gateway runs during archive admission", () => {
   ).toBe(true);
 });
 
-it("finds a visible active run for a fully qualified session key", () => {
-  const sessionKey = "agent:main:main";
-  const context = {
-    chatAbortControllers: new Map([
+it("returns deterministic protocol IDs for matching exact sources", async () => {
+  rpcSourceTesting.reset(
+    await activeSources([
       [
-        "replacement-run",
+        "run-z",
         {
-          sessionKey,
-          controlUiVisible: true,
-          projectSessionActive: true,
+          sessionKey: "main",
+          sessionId: "selected",
+          storeScope: storePath,
         },
       ],
-    ]),
-  } as never;
-
-  expect(
-    hasTrackedActiveSessionRun({
-      context,
-      requestedKey: sessionKey,
-      canonicalKey: sessionKey,
-    }),
-  ).toBe(true);
-});
-
-it("returns deterministic visible run ids for the selected session", () => {
-  const context = {
-    chatAbortControllers: new Map([
-      ["run-z", { sessionKey: "main" }],
-      ["run-hidden", { sessionKey: "main", controlUiVisible: false }],
+      [
+        "run-a",
+        {
+          sessionKey: "main",
+          sessionId: "selected",
+          storeScope: storePath,
+          queued: true,
+        },
+      ],
+      [
+        "run-hidden",
+        { sessionKey: "main", sessionId: "selected", controlUiVisible: false, queued: true },
+      ],
       ["run-other", { sessionKey: "other" }],
-      ["run-a", { sessionKey: "main" }],
     ]),
-  } as never;
+  );
 
   expect(
     resolveVisibleActiveSessionRunState({
-      context,
+      storePath,
       requestedKey: "main",
       canonicalKey: "main",
       agentId: "main",
@@ -245,11 +389,30 @@ it("returns deterministic visible run ids for the selected session", () => {
   ).toEqual({ active: true, runIds: ["run-a", "run-z"] });
 });
 
-it("projects reply lifecycle state without hiding independent embedded work", () => {
+it("projects a lifecycle-owned worker run without widening event visibility", async () => {
+  registerAgentRunContext("worker-run", {
+    isControlUiVisible: false,
+    projectSessionActive: true,
+    sessionId: "worker-session",
+    sessionKey: "agent:main:worker",
+  });
+  try {
+    expect(
+      visibleState("agent:main:worker", {
+        sessionId: "worker-session",
+      }),
+    ).toEqual({ active: true });
+  } finally {
+    clearAgentRunContext("worker-run");
+  }
+});
+
+it("projects reply lifecycle state and admits the next backend after producer completion", async () => {
   const sessionKey = "agent:main:reply-settling";
   const sessionId = "reply-settling-session";
-  const project = createVisibleActiveSessionRunProjector({});
-  const state = () => project({ requestedKey: sessionKey, canonicalKey: sessionKey, sessionId });
+  const project = createVisibleActiveSessionRunProjector();
+  const state = () =>
+    project({ storePath, requestedKey: sessionKey, canonicalKey: sessionKey, sessionId });
   const operation = createReplyOperation({ sessionKey, sessionId, resetTriggered: false });
   const replacementHandle: EmbeddedAgentQueueHandle = {
     abort: () => undefined,
@@ -275,9 +438,11 @@ it("projects reply lifecycle state without hiding independent embedded work", ()
     expect(state()).toEqual({ active: true });
     operation.markGlobalLaneWaitEnded();
     expect(operation.abortByUser()).toBe(true);
-    expect(isEmbeddedAgentRunActive(sessionId)).toBe(true);
-    expect(state()).toEqual({ active: false, runIds: [] });
+    expect(isSessionRunActive(sessionId)).toBe(true);
+    expect(visibleState(sessionKey, { sessionId })).toEqual({ active: false, runIds: [] });
 
+    operation.complete();
+    await operation.ownerSettlement;
     setActiveEmbeddedRun(sessionId, replacementHandle, sessionKey);
     expect(state()).toEqual({ active: true });
   } finally {
@@ -286,7 +451,24 @@ it("projects reply lifecycle state without hiding independent embedded work", ()
   }
 });
 
-it("does not project an aborted embedded handle retained for cleanup as active", () => {
+it("preserves an independent lifecycle-owned worker while a reply operation settles", async () => {
+  const sessionKey = "agent:main:worker-overlap";
+  const sessionId = "worker-overlap-session";
+  const operation = createReplyOperation({ sessionKey, sessionId, resetTriggered: false });
+  registerAgentRunContext("worker-overlap-run", {
+    projectSessionActive: true,
+    sessionId,
+    sessionKey,
+  });
+  try {
+    expect(visibleState(sessionKey, { sessionId })).toEqual({ active: true });
+  } finally {
+    operation.complete();
+    clearAgentRunContext("worker-overlap-run");
+  }
+});
+
+it("does not project an aborted embedded handle retained for cleanup as active", async () => {
   const sessionKey = "agent:main:handle-settling";
   const sessionId = "handle-settling-session";
   let aborted = false;
@@ -307,14 +489,34 @@ it("does not project an aborted embedded handle retained for cleanup as active",
     expect(visibleState(sessionKey, { sessionId })).toEqual({ active: true });
 
     expect(abortEmbeddedAgentRun(sessionId)).toBe(true);
-    expect(isEmbeddedAgentRunActive(sessionId)).toBe(true);
+    expect(isSessionRunActive(sessionId)).toBe(true);
     expect(visibleState(sessionKey, { sessionId })).toEqual({ active: false, runIds: [] });
 
+    const source = createRpcSourceForTest(
+      {},
+      { storeScope: storePath, sessionId, sessionKey, accepted: true },
+    );
+    rpcSourceTesting.reset([["new-run", source]]);
+    let admitted = false;
+    const successor = claimRpcSourceForTest(source).then((release) => {
+      admitted = true;
+      releaseFixtureSources.push(release);
+    });
+    await Promise.resolve();
+    expect(admitted).toBe(false);
     expect(
       resolveVisibleActiveSessionRunState({
-        context: {
-          chatAbortControllers: new Map([["new-run", { sessionId, sessionKey }]]),
-        } as never,
+        storePath,
+        requestedKey: sessionKey,
+        canonicalKey: sessionKey,
+        sessionId,
+      }),
+    ).toEqual({ active: true, runIds: ["new-run"], status: "queued" });
+    clearActiveEmbeddedRun(sessionId, handle, sessionKey);
+    await successor;
+    expect(
+      resolveVisibleActiveSessionRunState({
+        storePath,
         requestedKey: sessionKey,
         canonicalKey: sessionKey,
         sessionId,
@@ -325,9 +527,9 @@ it("does not project an aborted embedded handle retained for cleanup as active",
   }
 });
 
-it("counts settled but still registered chat runs for a session key", () => {
-  const context = {
-    chatAbortControllers: new Map([
+it("counts settled but still registered chat runs for a session key", async () => {
+  rpcSourceTesting.reset(
+    await activeSources([
       [
         "run-finalizing",
         {
@@ -339,60 +541,53 @@ it("counts settled but still registered chat runs for a session key", () => {
       ],
       ["run-global-work", { sessionKey: "global", agentId: "work" }],
     ]),
-  } as never;
+  );
 
   expect(
     hasRegisteredChatRunForSessionKey({
-      context,
+      storePath,
       sessionKey: "agent:main:main",
       agentId: undefined,
     }),
   ).toBe(true);
   expect(
     hasRegisteredChatRunForSessionKey({
-      context,
+      storePath,
       sessionKey: "agent:other:other",
       agentId: undefined,
     }),
   ).toBe(false);
   expect(
-    hasRegisteredChatRunForSessionKey({ context, sessionKey: "global", agentId: "work" }),
+    hasRegisteredChatRunForSessionKey({ storePath, sessionKey: "global", agentId: "work" }),
   ).toBe(true);
   expect(
-    hasRegisteredChatRunForSessionKey({ context, sessionKey: "global", agentId: "other" }),
+    hasRegisteredChatRunForSessionKey({ storePath, sessionKey: "global", agentId: "other" }),
   ).toBe(false);
   expect(
-    hasRegisteredChatRunForSessionKey({ context, sessionKey: "global", agentId: undefined }),
-  ).toBe(false);
-  expect(
-    hasRegisteredChatRunForSessionKey({
-      context: {},
-      sessionKey: "agent:main:main",
-      agentId: undefined,
-    }),
+    hasRegisteredChatRunForSessionKey({ storePath, sessionKey: "global", agentId: undefined }),
   ).toBe(false);
 });
 
-it("matches colliding bare active runs by stable owner", () => {
-  const context = {
-    chatAbortControllers: new Map([
-      ["run-ownerless", { sessionKey: "incident-42" }],
+it("matches colliding bare active runs by captured owner", async () => {
+  rpcSourceTesting.reset(
+    await activeSources([
+      ["run-ops", { sessionKey: "incident-42", agentId: "ops" }],
       ["run-research", { sessionKey: "incident-42", agentId: "research" }],
     ]),
-  } as never;
+  );
 
   expect(
     resolveVisibleActiveSessionRunState({
-      context,
+      storePath,
       requestedKey: "incident-42",
       canonicalKey: "incident-42",
       agentId: "ops",
       defaultAgentId: "ops",
     }),
-  ).toEqual({ active: true, runIds: ["run-ownerless"] });
+  ).toEqual({ active: true, runIds: ["run-ops"] });
   expect(
     resolveVisibleActiveSessionRunState({
-      context,
+      storePath,
       requestedKey: "incident-42",
       canonicalKey: "incident-42",
       agentId: "research",
@@ -401,7 +596,7 @@ it("matches colliding bare active runs by stable owner", () => {
   ).toEqual({ active: true, runIds: ["run-research"] });
 });
 
-it("keeps projected bare runs agent-scoped", () => {
+it("keeps projected bare runs agent-scoped", async () => {
   registerAgentRunContext("projected-ops", {
     projectSessionActive: true,
     sessionKey: "incident-42",
@@ -429,7 +624,7 @@ it("keeps projected bare runs agent-scoped", () => {
   }
 });
 
-it("resolves projected ownerless bare runs through the stable default owner", () => {
+it("resolves projected ownerless bare runs through the stable default owner", async () => {
   registerAgentRunContext("projected-ownerless", {
     projectSessionActive: true,
     sessionKey: "incident-42",
@@ -461,49 +656,93 @@ it("resolves projected ownerless bare runs through the stable default owner", ()
 it.each(["agent:main:command", "global"])(
   "keeps an adopted reply's global alias with its captured agent (source=%s)",
   async (sourceKey) => {
-    const sessionId = "adopted-global-session";
-    const operation = createReplyOperation({
-      sessionKey: sourceKey,
-      sessionId,
-      agentId: "main",
-      resetTriggered: false,
-    });
-    try {
-      const admission = await admitReplyTurn({
-        sessionKey: "global",
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const sessionId = "adopted-global-session";
+      const adoptedStorePath = state.statePath("adopted-global.sqlite");
+      const operation = createControllerOperation({
+        sessionKey: sourceKey,
         sessionId,
-        agentId: "ops",
-        kind: "visible",
+        agentId: "main",
         resetTriggered: false,
-        adoptOperation: operation,
+        target: captureSessionTarget({
+          storeScope: adoptedStorePath,
+          sessionKey: sourceKey,
+          incarnation: sessionId,
+          agentId: "main",
+        }),
       });
-      expect(admission.status).toBe("owned");
-      for (const agentId of ["main", "ops"]) {
-        expect(
-          resolveVisibleActiveSessionRunState({
-            context: {},
-            requestedKey: `agent:${agentId}:main`,
-            canonicalKey: "global",
-            sessionId,
-            agentId,
-            defaultAgentId: "main",
-          }).active,
-        ).toBe(agentId === "ops");
+      try {
+        const admission = await admitReplyTurn({
+          storePath: adoptedStorePath,
+          sessionKey: "global",
+          sessionId,
+          agentId: "ops",
+          kind: "visible",
+          resetTriggered: false,
+          adoptOperation: operation,
+        });
+        expect(admission.status).toBe("owned");
+        for (const agentId of ["main", "ops"]) {
+          expect(
+            resolveVisibleActiveSessionRunState({
+              storePath: adoptedStorePath,
+              requestedKey: `agent:${agentId}:main`,
+              canonicalKey: "global",
+              sessionId,
+              agentId,
+              defaultAgentId: "main",
+            }).active,
+          ).toBe(agentId === "ops");
+        }
+      } finally {
+        operation.complete();
+        await operation.ownerSettlement;
       }
-    } finally {
-      operation.complete();
-    }
+    });
   },
 );
 
-it("projects only recorded capacity waits as queued and preserves independent running owners", () => {
+it.each(["store", "Gateway"] as const)(
+  "excludes another %s's source with the same logical session",
+  async (dimension) => {
+    const sessionKey = "agent:main:scoped-projection";
+    const sessionId = "scoped-projection-session";
+    const source = createRpcSourceForTest(
+      {},
+      {
+        sessionKey,
+        sessionId,
+        agentId: "main",
+        storeScope: dimension === "store" ? `${storePath}-other` : storePath,
+      },
+    );
+    rpcSourceTesting.reset([["foreign-run", source]]);
+    releaseFixtureSources.push(await claimRpcSourceForTest(source));
+    if (dimension === "Gateway") {
+      const resolver = () => undefined;
+      bindGatewayContextResolver(source.input, resolver);
+      bindGatewayContextResolver(source.input.claim!.operation!, resolver);
+    }
+    expect(visibleState(sessionKey, { sessionId })).toEqual({ active: false, runIds: [] });
+    expect(hasRegisteredChatRunForSessionKey({ storePath, sessionKey, agentId: "main" })).toBe(
+      false,
+    );
+  },
+);
+
+it("projects only recorded capacity waits as queued and preserves independent running owners", async () => {
   const sessionKey = "agent:main:capacity-wait";
   const sessionId = "capacity-wait-session";
   const runId = "capacity-wait-run";
   registerAgentRunContext(runId, { sessionKey, sessionId, agentId: "main" });
-  const chatAbortControllers = new Map();
+  rpcSourceTesting.clear();
   const registration = registerChatAbortController({
-    chatAbortControllers,
+    target: captureSessionTarget({
+      storeScope: storePath,
+      sessionKey,
+      incarnation: sessionId,
+      agentId: "main",
+    }),
     runId,
     sessionKey,
     sessionId,
@@ -511,13 +750,19 @@ it("projects only recorded capacity waits as queued and preserves independent ru
     timeoutMs: 60_000,
     kind: "agent",
   });
+  onTestFinished(() => registration.cleanup());
+  registration.initializeTiming();
   const state = () =>
     resolveVisibleActiveSessionRunState({
-      context: { chatAbortControllers },
+      storePath,
       requestedKey: sessionKey,
       canonicalKey: sessionKey,
       sessionId,
     });
+  if (!registration.entry) {
+    throw new Error("Missing RPC source");
+  }
+  releaseFixtureSources.push(await claimRpcSourceForTest(registration.entry));
   const releaseWait = registerAgentRunCapacityWait(runId, getAgentRunLifecycleGeneration());
   try {
     expect(state()).toEqual({ active: true, status: "queued", runIds: [runId] });
@@ -601,7 +846,7 @@ it("preserves the completed foreground row while hidden embedded maintenance rem
       includeSession: true,
     });
   let settled = false;
-  const cleanup = waitForEmbeddedAgentRunEnd(sessionId, null).then((ended) => {
+  const cleanup = waitForSessionRunEnd(sessionId, null).then((ended) => {
     settled = true;
     return ended;
   });
@@ -613,15 +858,15 @@ it("preserves the completed foreground row while hidden embedded maintenance rem
       runtimeMs: 273_418,
       session: { status: "done", hasActiveRun: false },
     });
-    expect(isEmbeddedAgentRunActive(sessionId)).toBe(true);
-    expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBe("running");
+    expect(isSessionRunActive(sessionId)).toBe(true);
+    expect(resolveSessionRunProgressState(sessionId)).toBe("running");
     clearAgentRunContext(runId);
     expect.soft(state()).toEqual({ active: false, runIds: [] });
-    expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBe("running");
+    expect(resolveSessionRunProgressState(sessionId)).toBe("running");
     expect(abortEmbeddedAgentRun(sessionId)).toBe(true);
     expect(aborted).toBe(true);
-    expect(isEmbeddedAgentRunActive(sessionId)).toBe(true);
-    expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeUndefined();
+    expect(isSessionRunActive(sessionId)).toBe(true);
+    expect(resolveSessionRunProgressState(sessionId)).toBeUndefined();
     await Promise.resolve();
     expect(settled).toBe(false);
   } finally {
@@ -632,8 +877,8 @@ it("preserves the completed foreground row while hidden embedded maintenance rem
 });
 
 it.each(["reply", "remote"] as const)(
-  "keeps a visible %s owner independent of hidden embedded maintenance",
-  (kind) => {
+  "preserves visible %s activity without overlapping hidden controller ownership",
+  async (kind) => {
     const sessionKey = `agent:main:hidden-with-${kind}`;
     const sessionId = `hidden-with-${kind}`;
     const runId = `hidden-${kind}`;
@@ -648,6 +893,12 @@ it.each(["reply", "remote"] as const)(
     registerAgentRunContext(runId, { sessionKey, sessionId, projectSessionActive: false });
     setActiveEmbeddedRun(sessionId, handle, sessionKey);
     let reply: ReturnType<typeof createReplyOperation> | undefined;
+    if (kind === "reply") {
+      expect(() => createReplyOperation({ sessionKey, sessionId, resetTriggered: false })).toThrow(
+        "already active",
+      );
+      clearActiveEmbeddedRun(sessionId, handle, sessionKey);
+    }
     if (kind === "reply") {
       reply = createReplyOperation({ sessionKey, sessionId, resetTriggered: false });
       reply.setPhase("running");
@@ -664,7 +915,9 @@ it.each(["reply", "remote"] as const)(
       reply?.complete();
       clearAgentRunContext(visibleRunId);
       expect(state()).toEqual({ active: false, runIds: [] });
-      expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBe("running");
+      expect(resolveSessionRunProgressState(sessionId)).toBe(
+        kind === "reply" ? undefined : "running",
+      );
     } finally {
       reply?.complete();
       clearAgentRunContext(visibleRunId);

@@ -26,6 +26,8 @@ import { buildMockOpenAiResponsesProvider } from "./test-openai-responses-model.
 import * as nodeTunnel from "./worker-environments/node-worker-tunnel.js";
 import { transport } from "./worker-environments/node-worker-tunnel.test-support.js";
 import {
+  BUNDLE_HASH,
+  MANIFEST_REF,
   REQUEST,
   seedActivePlacement,
 } from "./worker-environments/placement-dispatch-test-fixtures.js";
@@ -40,26 +42,35 @@ let fixtureActive = false;
 
 const cases = [
   {
-    name: "moves an offline device with a result already pending",
+    name: "moves an offline device with a result already pending, completes a fresh turn, and archives deletion",
     persisted: false,
     failed: false,
+    queueIsolation: false,
   },
   {
-    name: "recovers persisted abandonment after database reopen and in-process Gateway startup",
+    name: "moves main/global without dropping a queued research/global turn",
+    persisted: false,
+    failed: false,
+    queueIsolation: true,
+  },
+  {
+    name: "recovers persisted abandonment after database reopen and in-process Gateway startup, completes a fresh turn, and archives deletion",
     persisted: true,
     failed: false,
+    queueIsolation: false,
   },
   {
-    name: "recovers persisted abandonment with a different failure after database reopen and in-process Gateway startup",
+    name: "recovers persisted abandonment with a different failure after database reopen and in-process Gateway startup, completes a fresh turn, and archives deletion",
     persisted: true,
     failed: true,
+    queueIsolation: false,
   },
 ];
 
 it.for(cases)(
-  "$name, completes a fresh turn, and archives deletion",
+  "$name",
   { timeout: 90_000 },
-  async ({ persisted, failed }, { expect, onTestFinished, signal }) => {
+  async ({ persisted, failed, queueIsolation }, { expect, onTestFinished, signal }) => {
     // A hook timeout also leaves its async cleanup running. Do not let the next
     // case acquire HOME, SQLite, or this module's spy until that owner releases.
     if (fixtureActive) {
@@ -108,16 +119,38 @@ it.for(cases)(
       signal.throwIfAborted();
       const reply = "RECOVERED_SESSION_OK";
       const requestLog = state.path("provider-requests.jsonl");
+      const responseControl = state.path("provider-response-control.json");
+      const scriptedResponses = {
+        hold: queueIsolation,
+        responses: [{ text: "FIRST_GLOBAL_OK" }, { text: "QUEUED_GLOBAL_OK" }],
+      };
+      if (queueIsolation) {
+        await fs.writeFile(responseControl, JSON.stringify(scriptedResponses));
+      }
       const mockPort = await getFreePort();
+      const firstProviderRequest = createDeferred();
+      const queuedProviderRequest = createDeferred();
       signal.throwIfAborted();
       const mock = spawn(process.execPath, ["scripts/e2e/mock-openai-server.mjs"], {
         detached: process.platform !== "win32",
+        stdio: ["ignore", "pipe", "pipe", "ipc"],
         env: {
           PATH: process.env.PATH,
           MOCK_PORT: String(mockPort),
           SUCCESS_MARKER: reply,
           MOCK_REQUEST_LOG: requestLog,
+          ...(queueIsolation ? { MOCK_RESPONSE_CONTROL: responseControl } : {}),
         },
+      });
+      mock.on("message", (message: unknown) => {
+        if (!message || typeof message !== "object" || !("seq" in message)) {
+          return;
+        }
+        if (message.seq === 1) {
+          firstProviderRequest.resolve();
+        } else if (message.seq === 2) {
+          queuedProviderRequest.resolve();
+        }
       });
       childStopped = false;
       cleanups.push(async () => {
@@ -130,9 +163,14 @@ it.for(cases)(
         ).toBe("dead");
         childStopped = true;
       });
-      mock.stdout.resume();
-      mock.stderr.resume();
+      mock.stdout?.resume();
+      mock.stderr?.resume();
       let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
+      const probeRunId = "research-global-probe";
+      const queuedRunId = "research-global-queued";
+      const probeHandoff = createDeferred();
+      const queuedHandoff = createDeferred();
+      const queuedDelivered = createDeferred();
       let offlineDeviceSeeded = false;
       let cleaningUp = false;
       const offlineTransport = transport();
@@ -196,6 +234,7 @@ it.for(cases)(
       const token = "placement-test-token";
       const cfg = {
         agents: {
+          ...(queueIsolation ? { ownership: "explicit" as const } : {}),
           defaults: {
             workspace: state.workspaceDir,
             skipBootstrap: true,
@@ -208,6 +247,7 @@ it.for(cases)(
               },
             },
           },
+          ...(queueIsolation ? { entries: { main: {}, research: {} } } : {}),
         },
         models: {
           mode: "replace",
@@ -233,6 +273,21 @@ it.for(cases)(
           configPath: state.configPath,
           token,
           scopes: ["operator.admin", "operator.read", "operator.write"],
+          onEvent: ({ event, payload }) => {
+            if (event !== "chat") {
+              return;
+            }
+            const encoded = JSON.stringify(payload ?? {});
+            if (encoded.includes(probeRunId) && encoded.includes('"state":"final"')) {
+              probeHandoff.resolve();
+            }
+            if (encoded.includes(queuedRunId) && encoded.includes('"state":"final"')) {
+              queuedHandoff.resolve();
+            }
+            if (encoded.includes("QUEUED_GLOBAL_OK")) {
+              queuedDelivered.resolve();
+            }
+          },
         });
         await gateway.server.startupSettled;
         signal.throwIfAborted();
@@ -243,7 +298,8 @@ it.for(cases)(
       } else {
         await captureRuntimeConfigAsyncReader()();
       }
-      const { sessionId, sessionKey, agentId } = REQUEST;
+      const { sessionId, agentId } = REQUEST;
+      const sessionKey = queueIsolation ? "global" : REQUEST.sessionKey;
       const worktreeId = "abandonment-worktree";
       await insertRegistryWorktree(process.env, {
         id: worktreeId,
@@ -280,7 +336,43 @@ it.for(cases)(
         nodeDeviceId: "offline-device",
       });
       offlineDeviceSeeded = true;
-      const active = await seedActivePlacement(placements, { environmentId, ownerEpoch: 1 });
+      let active: Awaited<ReturnType<typeof seedActivePlacement>>;
+      if (queueIsolation) {
+        let current = await placements.startDispatch({ ...REQUEST, sessionKey });
+        current = await placements.transition({
+          sessionId,
+          from: "requested",
+          to: "provisioning",
+          expectedGeneration: current.generation,
+          patch: { environmentId },
+        });
+        current = await placements.transition({
+          sessionId,
+          from: "provisioning",
+          to: "syncing",
+          expectedGeneration: current.generation,
+          patch: { workerBundleHash: BUNDLE_HASH },
+        });
+        current = await placements.transition({
+          sessionId,
+          from: "syncing",
+          to: "starting",
+          expectedGeneration: current.generation,
+          patch: {
+            workspaceBaseManifestRef: MANIFEST_REF,
+            remoteWorkspaceDir: "/worker/workspace",
+          },
+        });
+        active = await placements.transition({
+          sessionId,
+          from: "starting",
+          to: "active",
+          expectedGeneration: current.generation,
+          patch: { activeOwnerEpoch: 1 },
+        });
+      } else {
+        active = await seedActivePlacement(placements, { environmentId, ownerEpoch: 1 });
+      }
       const source = { generation: active.generation, environmentId, ownerEpoch: 1 };
       const claim = await placements.claimTurn({
         sessionId,
@@ -320,21 +412,64 @@ it.for(cases)(
         throw new Error("Gateway fixture did not start");
       }
       const { client } = gateway;
+      if (queueIsolation) {
+        await client.request("chat.send", {
+          sessionKey: "global",
+          agentId: "research",
+          message: "Hold this first research turn open.",
+          idempotencyKey: "research-global-first",
+          queueMode: "followup",
+        });
+        await firstProviderRequest.promise;
+        await client.request("chat.send", {
+          sessionKey: "global",
+          agentId: "research",
+          message: "Keep this probe queued until its exact cancellation.",
+          idempotencyKey: probeRunId,
+          queueMode: "followup",
+        });
+        await client.request("chat.send", {
+          sessionKey: "global",
+          agentId: "research",
+          message: "Deliver this queued research turn after the first.",
+          idempotencyKey: queuedRunId,
+          queueMode: "followup",
+        });
+        await Promise.all([probeHandoff.promise, queuedHandoff.promise]);
+      }
       if (!persisted) {
         await expect(
           client.request("sessions.move", {
             key: sessionKey,
+            ...(queueIsolation ? { agentId } : {}),
             expected: source,
             target: { kind: "gateway" },
             abandonSource: true,
           }),
         ).resolves.toMatchObject({ ok: true, placement: { state: "local" } });
       }
+      if (queueIsolation) {
+        const cancelled = await client.request<{ aborted: boolean; runIds: string[] }>(
+          "chat.abort",
+          {
+            sessionKey: "global",
+            agentId: "research",
+            runId: probeRunId,
+          },
+        );
+        await fs.writeFile(responseControl, JSON.stringify({ ...scriptedResponses, hold: false }));
+        expect(cancelled).toMatchObject({ aborted: true, runIds: [probeRunId] });
+        await queuedProviderRequest.promise;
+        await queuedDelivered.promise;
+      }
       signal.throwIfAborted();
       expect(placements.get(sessionId)).toMatchObject({ state: "local", turnClaim: null });
       expect(await placements.listPendingWorkspaceResultsAsync()).toEqual([]);
       expect(placements.validateTurnClaim(claim)).toBe(false);
       expect(await placements.getPlacementMoveAsync(sessionId)).toBeUndefined();
+      if (queueIsolation) {
+        return;
+      }
       const environments = await createWorkerEnvironmentStore({ database });
       const retainedCleanup = environments.get(environmentId);
       expect(retainedCleanup).toMatchObject({

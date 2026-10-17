@@ -86,7 +86,14 @@ export function registerGoalAutomaticContinuationCases(
           queueMessage: async () => {},
         };
         params.replyOperation?.attachBackend(backend);
-        setActiveEmbeddedRun(params.sessionId, backend, sessionKey, params.sessionFile, "main");
+        setActiveEmbeddedRun(
+          params.sessionId,
+          backend,
+          sessionKey,
+          params.sessionFile,
+          "main",
+          params.replyOperation,
+        );
         secondStarted.resolve();
         try {
           await released.promise;

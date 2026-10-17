@@ -4,9 +4,9 @@ import { isAgentDeletionBlocked, withAgentDeletion } from "../agents/agent-lifec
 import { listConfiguredOwnerInputs } from "../agents/prepared-model-runtime.configured.js";
 import { prepareSecretsRuntimeSnapshot } from "../secrets/runtime.js";
 import {
-  beginSessionWorkAdmission,
+  beginSessionEffect,
   closeAgentWorkAdmissions,
-} from "../sessions/session-lifecycle-admission.js";
+} from "../sessions/session-controller.lifecycle.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { invalidateAgentDeletionJournalStatus } from "./agent-deletion-journal-status.js";
 import {
@@ -37,14 +37,14 @@ it("revokes queued work and refuses the next turn after a worker deletion withou
       serializeOwner: true,
       assertAllowed: () => {},
     };
-    const first = await beginSessionWorkAdmission(target);
+    const first = await beginSessionEffect(target);
     first.release();
     const directReads = vi.spyOn(stateReads, "withExistingOpenClawStateDatabaseCurrentReadOnly");
     expect(isAgentDeletionBlocked("doomed", options)).toBe(false);
     expect(directReads).not.toHaveBeenCalled();
     reads.mockClear();
-    const active = await beginSessionWorkAdmission(target);
-    const queued = beginSessionWorkAdmission(target);
+    const active = await beginSessionEffect(target);
+    const queued = beginSessionEffect(target);
     const refused = expect(queued).rejects.toThrow("deletion");
     const reopen = closeAgentWorkAdmissions({
       ...target,
@@ -63,7 +63,7 @@ it("revokes queued work and refuses the next turn after a worker deletion withou
           });
           await refused;
           expect(active.isActive()).toBe(true);
-          await expect(beginSessionWorkAdmission(target)).rejects.toThrow("deletion");
+          await expect(beginSessionEffect(target)).rejects.toThrow("deletion");
           expect(await readAgentDeletionJournalStatusInWorker("doomed", options)).toBe("pending");
           directReads.mockClear();
           expect(isAgentDeletionBlocked("doomed", options)).toBe(true);
@@ -74,7 +74,7 @@ it("revokes queued work and refuses the next turn after a worker deletion withou
         options,
       );
       reopen();
-      const resumed = await beginSessionWorkAdmission(target);
+      const resumed = await beginSessionEffect(target);
       resumed.release();
       expect(
         reads.mock.calls.filter(([, command]) => command.type === "agentDeletionJournal.status"),

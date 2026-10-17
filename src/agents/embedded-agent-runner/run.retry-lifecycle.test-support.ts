@@ -445,9 +445,13 @@ describe("direct embedded retry lifecycle", () => {
     },
   );
 
-  it.each([false, true])(
-    "cancels retry waits on lane expiry or caller abort after progress (progress=%s)",
-    async (progress) => {
+  it.each([
+    { progress: false, retryAfterSeconds: 3_600 },
+    { progress: true, retryAfterSeconds: 3_600 },
+    { progress: false, retryAfterSeconds: 30 * 24 * 60 * 60 },
+  ])(
+    "cancels retry waits on lane expiry or caller abort after progress (progress=$progress, floor=$retryAfterSeconds)",
+    async ({ progress, retryAfterSeconds }) => {
       const { sleepWithAbort } = await import("../../infra/backoff.js");
       const { sleepWithAbort: sleep } = await import("../../../packages/retry/src/index.js");
       const mockedSleep = vi.mocked(sleepWithAbort);
@@ -469,7 +473,7 @@ describe("direct embedded retry lifecycle", () => {
           wait = sleep(delayMs, signal).finally(() => {
             waitSettled = true;
           });
-          if (delayMs === 3_600_000) {
+          if (delayMs === retryAfterSeconds * 1_000) {
             sleepStarted.resolve();
           } else {
             remainingShortSleeps.shift()?.resolve();
@@ -488,7 +492,7 @@ describe("direct embedded retry lifecycle", () => {
           const assistant = makeAssistantMessageFixture({
             stopReason: "error",
             content: [],
-            errorMessage: `429 rate limit exceeded; Retry-After: ${progress && attempts < 4 ? 1 : 3600}`,
+            errorMessage: `429 rate limit exceeded; Retry-After: ${progress && attempts < 4 ? 1 : retryAfterSeconds}`,
           });
           return session.makeAttemptResult({
             lastAssistant: assistant,
@@ -513,7 +517,10 @@ describe("direct embedded retry lifecycle", () => {
           }
         }
         await Promise.race([sleepStarted.promise, pending]);
-        expect(mockedSleep).toHaveBeenCalledWith(3_600_000, expect.any(AbortSignal));
+        expect(mockedSleep).toHaveBeenCalledWith(
+          retryAfterSeconds * 1_000,
+          expect.any(AbortSignal),
+        );
         expect(waitSettled).toBe(false);
         if (progress) {
           caller.abort();

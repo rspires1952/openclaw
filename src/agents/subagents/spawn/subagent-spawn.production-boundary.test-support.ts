@@ -3,7 +3,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, it, vi, type Mock } from "vitest";
 import { createDeferred, withinTest } from "../../../../test/helpers/promise.js";
-import { captureRuntimeConfigAsyncReader, type OpenClawConfig } from "../../../config/config.js";
+import { captureRuntimeConfigAsyncReader } from "../../../config/config.js";
 import {
   appendTranscriptMessage,
   loadSessionEntry,
@@ -22,10 +22,16 @@ import {
   bindWorkerTurnOwner,
   getWorkerTurnExecutionIdentityCapability,
 } from "../../../gateway/worker-environments/placement-turn-claim-events.js";
+import { withTimeout } from "../../../infra/fs-safe.js";
 import {
   bindGatewayContextResolver,
   withPluginRuntimeGatewayRequestScope,
 } from "../../../plugins/runtime/gateway-request-scope.js";
+import { captureSessionTarget } from "../../../sessions/session-controller.lifecycle.js";
+import {
+  getRpcSource,
+  isRpcSourceExecuting,
+} from "../../../sessions/session-controller.rpc-sources.js";
 import { AsyncWorkScope } from "../../../shared/async-work-scope.js";
 import { openOpenClawStateDatabase } from "../../../state/openclaw-state-db.js";
 import { normalizeAcceptedSessionSpawnResult } from "../../accepted-session-spawn.js";
@@ -51,45 +57,6 @@ import { subagentRuns } from "../registry/subagent-registry-memory.js";
 import { writeSubagentSessionEntry } from "../registry/subagent-registry.persistence.test-support.js";
 import { resolveSubagentSessionStatus } from "../registry/subagent-session-metrics.js";
 import { testing as spawnTesting } from "./subagent-spawn.test-support.js";
-
-export function createSpawnBoundaryConfig(
-  workspace: string,
-  maxChildrenPerAgent?: number,
-): OpenClawConfig {
-  return {
-    logging: { audit: { enabled: true, executionIdentity: true } },
-    tools: { swarm: { enabled: true, maxConcurrent: 1 } },
-    agents: {
-      ownership: "explicit",
-      defaults: {
-        workspace,
-        systemAgent: { agentId: "main" },
-        model: { primary: "custom/test-model" },
-        ...(maxChildrenPerAgent !== undefined ? { subagents: { maxChildrenPerAgent } } : {}),
-      },
-      entries: { main: { workspace } },
-    },
-    models: {
-      mode: "replace",
-      providers: {
-        custom: {
-          api: "openai-completions",
-          baseUrl: "https://example.invalid/v1",
-          models: [
-            {
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              id: "test-model",
-              input: ["text"],
-              maxTokens: 1_024,
-              name: "Test model",
-              reasoning: false,
-            },
-          ],
-        },
-      },
-    },
-  };
-}
 
 export async function recordSpawnBoundaryFinal(params: {
   storePath: string;
@@ -192,7 +159,12 @@ export async function createSpawnBoundaryParent(params: {
     },
   });
   const parent = registerChatAbortController({
-    chatAbortControllers: context.chatAbortControllers,
+    target: captureSessionTarget({
+      storeScope: storePath,
+      sessionKey: parentSessionKey,
+      incarnation: "parent-session",
+      agentId: "main",
+    }),
     runId: parentRunId,
     sessionKey: parentSessionKey,
     sessionId: "parent-session",
@@ -366,6 +338,33 @@ export function createBoundSpawnInvocation(
 
 type BoundParent = Awaited<ReturnType<typeof createSpawnBoundaryParent>>;
 type GatewayRuntime = ReturnType<typeof createGatewayInstanceRuntime>;
+// Two loaded exact-head CI runs reached this cold model boundary in 28–37 seconds.
+const COLD_MODEL_ENTRY_TIMEOUT_MS = 60_000;
+
+/** Creates the shared embedded-entry waiter around the suite's model mock. */
+export function createEmbeddedRunWaiter(
+  runEmbeddedAgent: Mock<typeof import("../../embedded-agent.js").runEmbeddedAgent>,
+) {
+  return async (bound: BoundParent, childRunId: string, started?: Promise<void>, calls = 1) => {
+    try {
+      if (started) {
+        await withTimeout(started, COLD_MODEL_ENTRY_TIMEOUT_MS, {
+          message: "embedded execution entry timed out",
+        });
+        expect(runEmbeddedAgent).toHaveBeenCalledTimes(calls);
+      } else {
+        await vi.waitFor(() => expect(runEmbeddedAgent).toHaveBeenCalledTimes(calls), {
+          timeout: 15_000,
+        });
+      }
+    } catch (cause) {
+      throw new Error(
+        `Embedded execution did not arrive: ${JSON.stringify(readBoundExecutionState(bound, childRunId))}`,
+        { cause },
+      );
+    }
+  };
+}
 
 export async function prepareIsolatedChildAdmissionProof(bound: BoundParent) {
   const { parentSessionKey, storePath } = bound;
@@ -668,6 +667,7 @@ export function registerYieldedRequesterBatchCase(options: {
   );
 }
 
+/** Reads bounded lifecycle facts without exposing model input or workspace paths. */
 export function readBoundExecutionState(
   bound: Awaited<ReturnType<typeof createSpawnBoundaryParent>>,
   childRunId?: string,
@@ -676,7 +676,7 @@ export function readBoundExecutionState(
   const receipt = childRunId ? context.dedupe.get(`agent:${childRunId}`) : undefined;
   const payload = asOptionalRecord(receipt?.payload);
   const cause = asOptionalRecord(asOptionalRecord(receipt?.error)?.cause);
-  const controller = childRunId ? context.chatAbortControllers.get(childRunId) : undefined;
+  const controller = childRunId ? getRpcSource(childRunId) : undefined;
   const execution = childRunId ? subagentRuns.get(childRunId)?.execution : undefined;
   const collector = childRunId ? subagentRuns.get(childRunId) : undefined;
   const label = (value: unknown, allowed: readonly string[]) =>
@@ -697,8 +697,8 @@ export function readBoundExecutionState(
       "FailoverError",
     ]),
     controllerPresent: controller !== undefined,
-    controllerAborted: controller?.controller.signal.aborted,
-    executionStarted: controller?.executionStarted,
+    controllerAborted: controller?.input.abortSignal.aborted,
+    executionStarted: isRpcSourceExecuting(controller),
     executionStatus: label(execution?.status, ["queued", "running", "interrupted", "terminal"]),
     runStatus: label(
       childRunId ? resolveSubagentSessionStatus(subagentRuns.get(childRunId)) : undefined,

@@ -121,10 +121,11 @@ describe("requester settle routing and session authority", () => {
       });
     }
     registryRead.listSubagentRunsForRequester.mockReturnValue(cohort);
-    loadRequester.mockReturnValue({
+    const requester: Awaited<ReturnType<typeof deliveryRuntime.loadRequesterSessionEntry>> = {
       cfg: {},
       canonicalKey: requesterSessionKey,
       agentId: "main",
+      storePath: "/synthetic/requester-settle.sqlite",
       entry: {
         ...requesterIdentity,
         updatedAt: 1,
@@ -135,10 +136,11 @@ describe("requester settle routing and session authority", () => {
           origin: { provider: "webchat", to: requesterSessionKey, surface: "webchat" },
         },
       },
-    });
+    };
+    loadRequester.mockResolvedValue(requester);
     setSubagentAnnounceDeliveryDepsForTest({
       getRuntimeConfig: () => ({}),
-      loadRequesterSessionEntry: loadRequester,
+      loadRequesterSessionEntry: () => requester,
       getRequesterSessionActivity: () => ({
         sessionId: requesterIdentity.sessionId,
         isActive: false,

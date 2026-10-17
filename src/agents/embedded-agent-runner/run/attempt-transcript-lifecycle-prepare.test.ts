@@ -22,9 +22,9 @@ import {
 import type { InternalSessionEntry } from "../../../config/sessions/types.js";
 import { getAgentRunLifecycleGeneration } from "../../../infra/agent-run-registry.js";
 import {
-  isSessionWorkAdmissionActive,
-  runExclusiveSessionLifecycleMutation,
-} from "../../../sessions/session-lifecycle-admission.js";
+  isSessionControllerWorkActive,
+  runSessionMutation,
+} from "../../../sessions/session-controller.lifecycle.js";
 import { onSessionIdentityMutation } from "../../../sessions/session-lifecycle-events.js";
 import { createUserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
@@ -208,7 +208,7 @@ async function withInitialWriter(
     } finally {
       try {
         await prepared?.transcriptLifecycle.dispose();
-        expect(isSessionWorkAdmissionActive(target.storePath, [target.sessionKey])).toBe(false);
+        expect(isSessionControllerWorkActive(target.storePath, [target.sessionKey])).toBe(false);
       } finally {
         for (const owner of admissions) {
           owner.close();
@@ -640,12 +640,12 @@ describe("admitted lazy session writer", () => {
           });
           await Promise.resolve();
           expect(closed).toBe(false);
-          expect(isSessionWorkAdmissionActive(target.storePath, [target.sessionKey])).toBe(true);
+          expect(isSessionControllerWorkActive(target.storePath, [target.sessionKey])).toBe(true);
           expect(loadSessionEntry(target)).toBeUndefined();
           gate.resolve();
           await write;
           await closing;
-          expect(isSessionWorkAdmissionActive(target.storePath, [target.sessionKey])).toBe(false);
+          expect(isSessionControllerWorkActive(target.storePath, [target.sessionKey])).toBe(true);
           expect(loadSessionEntry(target)?.sessionId).toBe(target.sessionId);
         } finally {
           gate.resolve();
@@ -659,11 +659,11 @@ describe("admitted lazy session writer", () => {
 
   it("keeps its uncommitted creator visible inside a same-key lifecycle mutation", async () => {
     await withInitialWriter(async ({ target }) => {
-      await runExclusiveSessionLifecycleMutation("create", {
+      await runSessionMutation({
         scope: target.storePath,
         identities: [target.sessionKey],
         prepare: async () => {
-          expect(isSessionWorkAdmissionActive(target.storePath, [target.sessionKey])).toBe(true);
+          expect(isSessionControllerWorkActive(target.storePath, [target.sessionKey])).toBe(true);
         },
         run: async () => {
           expect(loadSessionEntry(target)).toBeUndefined();
@@ -675,7 +675,7 @@ describe("admitted lazy session writer", () => {
   it("rejects an existing row before reacquiring its enclosing lifecycle mutation", async () => {
     await withInitialWriter(async ({ manager, runParams, target }) => {
       manager.appendMessage(userMessage);
-      await runExclusiveSessionLifecycleMutation("create", {
+      await runSessionMutation({
         scope: target.storePath,
         identities: [target.sessionKey],
         run: async () => {
@@ -762,7 +762,7 @@ describe("admitted lazy session writer", () => {
       await withInitialWriter(
         async ({ manager, promptState, runParams, target }) => {
           expect(Boolean(promptState.sessionWriterFence)).toBe(existing);
-          expect(isSessionWorkAdmissionActive(target.storePath, [target.sessionKey])).toBe(
+          expect(isSessionControllerWorkActive(target.storePath, [target.sessionKey])).toBe(
             !existing,
           );
           await appendInitial(kind, manager);
@@ -776,7 +776,9 @@ describe("admitted lazy session writer", () => {
             expectedWriterRunId: runParams.runId,
           };
           expect(promptState.sessionWriterFence).toEqual(expectedFence);
-          expect(isSessionWorkAdmissionActive(target.storePath, [target.sessionKey])).toBe(false);
+          expect(isSessionControllerWorkActive(target.storePath, [target.sessionKey])).toBe(
+            !existing,
+          );
           expect(manager.getSessionTarget()).toMatchObject(expectedFence);
           manager.appendMessage(userMessage);
           expect(loadTranscriptEventsSync(target)).toHaveLength(3);
@@ -838,7 +840,7 @@ describe("admitted lazy session writer", () => {
           SessionTranscriptWriterClaimReboundError,
         );
         expect(promptState.sessionWriterFence).toBeUndefined();
-        expect(isSessionWorkAdmissionActive(target.storePath, [target.sessionKey])).toBe(true);
+        expect(isSessionControllerWorkActive(target.storePath, [target.sessionKey])).toBe(true);
         expect(loadSessionEntry(target)).toEqual(before);
         expect(loadTranscriptEventsSync(target)).toEqual([]);
       });
@@ -869,7 +871,7 @@ describe("admitted lazy session writer", () => {
         expect(loadSessionEntry(target)).toBeUndefined();
         expect(loadTranscriptEventsSync(target)).toEqual([]);
         expect(identities).toEqual([]);
-        expect(isSessionWorkAdmissionActive(target.storePath, [target.sessionKey])).toBe(true);
+        expect(isSessionControllerWorkActive(target.storePath, [target.sessionKey])).toBe(true);
 
         (await openManager()).appendMessage(userMessage);
         expect(promptState.sessionWriterFence?.expectedWriterRunId).toBe(runParams.runId);

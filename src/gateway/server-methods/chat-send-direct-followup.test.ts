@@ -6,7 +6,6 @@ import {
   withinTest,
 } from "../../../test/helpers/promise.js";
 import { createOperationalRunInstanceRef } from "../../agents/admitted-run-context.js";
-import { COMMAND_ADMISSION_OWNER } from "../../agents/agent-command-admission-owner.js";
 import { runWithAgentCommandRecoveryOwner } from "../../agents/agent-command-recovery-owner.js";
 import {
   clearActiveEmbeddedRun,
@@ -18,8 +17,7 @@ import type { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
 import type { executeAgentTurn } from "../../auto-reply/reply/agent-runner-execution.js";
 import { withFullRuntimeReplyConfig } from "../../auto-reply/reply/get-reply-fast-path.js";
 import * as replyRunHelpers from "../../auto-reply/reply/get-reply-run-helpers.js";
-import { clearFollowupQueueForTest } from "../../auto-reply/reply/queue.test-helpers.js";
-import { replyRunRegistry } from "../../auto-reply/reply/reply-run-registry.registry.js";
+import { clearSessionQueues } from "../../auto-reply/reply/queue/cleanup.js";
 import {
   loadSessionEntry,
   patchSessionEntryCore,
@@ -30,8 +28,11 @@ import {
   claimAgentRunDelegatedAuthority,
   releaseAgentRunDelegatedAuthority,
 } from "../../infra/agent-run-registry.js";
-import { diagnosticLogger } from "../../logging/diagnostic-runtime.js";
-import * as sessionAdmission from "../../sessions/session-lifecycle-admission.js";
+import { withSessionTurn } from "../../sessions/session-controller.admission.js";
+import { getSessionControllerOperation } from "../../sessions/session-controller.js";
+import { captureSessionTarget } from "../../sessions/session-controller.lifecycle.js";
+import { isRpcSourceQueued } from "../../sessions/session-controller.rpc-sources.js";
+import { rpcSourceTesting } from "../../sessions/session-lifecycle-admission.test-support.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.types.js";
 import { dispatchInboundMessageMock, installGatewayTestHooks } from "../test-helpers.js";
 import { handleChatAbortRequest } from "./chat-abort-handler.js";
@@ -83,7 +84,6 @@ it.for([false, true])(
       }),
       messageInjectionV2: { version: 2 as const, isAvailable: () => true, queueMessage: injected },
     };
-    const rejected = vi.spyOn(diagnosticLogger, "info");
     const queued = createDeferred();
     const dispatched = createDeferred();
     const started = createDeferred();
@@ -95,17 +95,6 @@ it.for([false, true])(
     const releaseDirect = createDeferred();
     const cleanupStarted = createDeferred();
     const releaseCleanup = createDeferred();
-    const waitingForCommand = createDeferred();
-    const readOwnerRelease = sessionAdmission.getSessionWorkAdmissionOwnerRelease;
-    const ownerObserver = vi
-      .spyOn(sessionAdmission, "getSessionWorkAdmissionOwnerRelease")
-      .mockImplementation((params) => {
-        const pending = readOwnerRelease(params);
-        if (params.owner === COMMAND_ADMISSION_OWNER && pending) {
-          waitingForCommand.resolve();
-        }
-        return pending;
-      });
     const lifecycleGeneration = getAgentEventLifecycleGeneration();
     const dispatchActual = await loadRealChatDispatch();
     dispatchInboundMessageMock.mockImplementation(async (raw: unknown) => {
@@ -119,8 +108,8 @@ it.for([false, true])(
         return result;
       };
       const onSettled = lifecycle.onSettled;
-      lifecycle.onSettled = () => {
-        onSettled?.();
+      lifecycle.onSettled = async () => {
+        await onSettled?.();
         settled.resolve();
       };
       try {
@@ -143,68 +132,73 @@ it.for([false, true])(
     });
     let command: Promise<void> | undefined;
     try {
-      command = runWithAgentCommandRecoveryOwner({
-        lifecycleGeneration,
-        mode: "claim",
-        opts: { message: "Synthetic subagent completion", runId: instance.runId },
-        prepare: async () => ({ ...fixture.scope, sessionAgentId: "main", isNewSession: false }),
-        run: async () => {
-          // The command producer records this fence before starting a direct embedded run.
-          await patchSessionEntryCore(fixture.scope, () => ({
-            status: undefined,
-            abortedLastRun: false,
-            restartRecoveryRuns: [{ runId: instance.runId, lifecycleGeneration }],
-          }));
-          await withGatewayToolCallerIdentity(
-            {
-              agentId: fixture.scope.agentId,
-              sessionKey: fixture.scope.sessionKey,
-              operationalRunInstance: instance,
-              embeddedRunToolAuthorityBinding: () => ({
-                source: "attempt",
-                assertActive: () => {},
-                project: () => "human-tools",
-                projectAsync: async () => "human-tools",
-              }),
-            },
-            () => setActiveEmbeddedRun(fixture.scope.sessionId, handle, fixture.scope.sessionKey),
-          );
-          directStarted.resolve();
-          await withinTest(releaseDirect.promise, signal);
-          clearActiveEmbeddedRun(fixture.scope.sessionId, handle);
-          cleanupStarted.resolve();
-          await withinTest(releaseCleanup.promise, signal);
-          await patchSessionEntryCore(fixture.scope, () => ({
-            restartRecoveryRuns: undefined,
-            status: "done",
-          }));
-        },
-      });
+      command = withSessionTurn(fixture.scope, async (operation, abortSignal) =>
+        runWithAgentCommandRecoveryOwner({
+          lifecycleGeneration,
+          mode: "claim",
+          opts: { message: "Synthetic subagent completion", runId: instance.runId, abortSignal },
+          prepare: async () => ({ ...fixture.scope, sessionAgentId: "main", isNewSession: false }),
+          run: async () => {
+            // The command producer records this fence before starting a direct embedded run.
+            await patchSessionEntryCore(fixture.scope, () => ({
+              status: undefined,
+              abortedLastRun: false,
+              restartRecoveryRuns: [{ runId: instance.runId, lifecycleGeneration }],
+            }));
+            await withGatewayToolCallerIdentity(
+              {
+                agentId: fixture.scope.agentId,
+                sessionKey: fixture.scope.sessionKey,
+                operationalRunInstance: instance,
+                embeddedRunToolAuthorityBinding: () => ({
+                  source: "attempt",
+                  assertActive: () => {},
+                  project: () => "human-tools",
+                  projectAsync: async () => "human-tools",
+                }),
+              },
+              () =>
+                setActiveEmbeddedRun(
+                  fixture.scope.sessionId,
+                  handle,
+                  fixture.scope.sessionKey,
+                  undefined,
+                  fixture.scope.agentId,
+                  expectDefined(operation, "direct turn owner"),
+                ),
+            );
+            directStarted.resolve();
+            await withinTest(releaseDirect.promise, signal);
+            clearActiveEmbeddedRun(fixture.scope.sessionId, handle);
+            cleanupStarted.resolve();
+            await withinTest(releaseCleanup.promise, signal);
+            await patchSessionEntryCore(fixture.scope, () => ({
+              restartRecoveryRuns: undefined,
+              status: "done",
+            }));
+          },
+        }),
+      );
       void command.catch(() => {});
       await withinTest(directStarted.promise, signal);
-      expect(replyRunRegistry.get(fixture.scope.sessionKey)).toBeUndefined();
+      const directOwner = expectDefined(
+        getSessionControllerOperation(fixture.scope.sessionKey),
+        "direct command controller owner",
+      );
       expect(loadSessionEntry(fixture.scope)).toMatchObject({
         abortedLastRun: false,
         restartRecoveryRuns: [{ runId: instance.runId, lifecycleGeneration }],
       });
       const ack = await fixture.send();
       expect(ack.mock.calls[0]?.[1]).toMatchObject({ status: "started" });
-      expect(rejected).toHaveBeenCalledWith(
-        "direct steering rejected; keeping input for followup",
-        expect.objectContaining({ reason, runId: instance.runId }),
-      );
       await waitForGate(
         queued.promise,
         dispatched.promise,
         "Dispatch returned without queue custody",
       );
-      expect(fixture.context.chatQueuedTurns.has(fixture.params.idempotencyKey)).toBe(true);
+      expect(isRpcSourceQueued(rpcSourceTesting.get(fixture.params.idempotencyKey))).toBe(true);
       await withinTest(dispatched.promise, signal);
-      await waitForGate(
-        waitingForCommand.promise,
-        settled.promise,
-        "Queued input was abandoned while its direct predecessor still owned execution",
-      );
+      expect(getSessionControllerOperation(fixture.scope.sessionKey)).toBe(directOwner);
       expect(consumed).toEqual([]);
       expect(injected).not.toHaveBeenCalled();
       if (cancel) {
@@ -234,6 +228,7 @@ it.for([false, true])(
       }
       releaseDirect.resolve();
       await withinTest(cleanupStarted.promise, signal);
+      expect(getSessionControllerOperation(fixture.scope.sessionKey)).toBe(directOwner);
       expect(
         (await listSessionPendingInputs(fixture.scope)).items.map((input) => input.state),
       ).toEqual([cancel ? "cancelled" : "queued"]);
@@ -256,11 +251,17 @@ it.for([false, true])(
       releaseDirect.resolve();
       releaseCleanup.resolve();
       await command?.catch(() => {});
-      clearFollowupQueueForTest(fixture.scope.sessionKey);
+      clearSessionQueues(
+        [fixture.scope.sessionKey],
+        captureSessionTarget({
+          storeScope: fixture.scope.storePath,
+          sessionKey: fixture.scope.sessionKey,
+          incarnation: fixture.scope.sessionId,
+          agentId: fixture.scope.agentId,
+        }),
+      );
       await fixture.cleanup();
-      rejected.mockRestore();
       runtimeLoader.mockRestore();
-      ownerObserver.mockRestore();
     }
   },
 );

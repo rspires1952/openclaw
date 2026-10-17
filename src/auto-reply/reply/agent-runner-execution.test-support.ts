@@ -18,11 +18,8 @@ import {
   setRuntimeConfigSnapshot,
 } from "../../config/runtime-snapshot.js";
 import type { ModelDefinitionConfig } from "../../config/types.models.js";
-import {
-  createUserTurnTranscriptRecorder,
-  type PersistedUserTurnMessage,
-} from "../../sessions/user-turn-transcript.js";
-import { createTestUserTurnTranscriptTarget } from "../../sessions/user-turn-transcript.test-support.js";
+import { withSessionTurn } from "../../sessions/session-controller.admission.js";
+import type { ReplyOperation } from "../../sessions/session-controller.js";
 import type { TemplateContext } from "../templating.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import type { AgentTurnParams } from "./agent-runner-execution.types.js";
@@ -31,7 +28,7 @@ import type {
   mintReplyMessageActionTurnCapability,
 } from "./agent-runner-utils.js";
 import type { FollowupRun } from "./queue.js";
-import type { ReplyOperation } from "./reply-run-registry.js";
+import { prepareReplyToolAuthority } from "./reply-tool-authority.js";
 import type { TypingSignaler } from "./typing-mode.js";
 
 type RunEntryParams = Parameters<typeof runEmbeddedAgentEntry<EmbeddedAgentRunResult>>[0];
@@ -206,8 +203,10 @@ vi.mock("../../agents/embedded-agent-helpers.js", async () => {
   };
 });
 
-vi.mock("../../config/sessions.js", () => ({
+vi.mock("../../config/sessions.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../config/sessions.js")>()),
   resolveGroupSessionKey: vi.fn(() => null),
+  resolveSessionStorePathCore: vi.fn(() => "/tmp/mock-sessions.json"),
   resolveSessionTranscriptPath: vi.fn(),
   updateSessionStore: state.updateSessionStoreMock,
 }));
@@ -348,8 +347,26 @@ vi.mock("./reply-media-paths.js", async (importOriginal) => ({
 export async function getRawExecuteAgentTurnForTest() {
   const execute = (await import("./agent-runner-execution.js")).executeAgentTurn;
   return async (...args: Parameters<typeof execute>) => {
-    setRuntimeConfigSnapshot(args[0].followupRun.run.config);
-    return execute(...args);
+    const [params] = args;
+    setRuntimeConfigSnapshot(params.followupRun.run.config);
+    const sessionKey = params.sessionKey ?? params.followupRun.run.sessionKey;
+    if (params.replyOperation || !sessionKey) {
+      return await execute(...args);
+    }
+    return await withSessionTurn(
+      {
+        sessionKey,
+        sessionId: params.followupRun.run.sessionId,
+        storePath: params.storePath,
+        agentId: params.followupRun.run.agentId,
+      },
+      async (replyOperation) => {
+        await replyOperation?.bindToolAuthoritySnapshotAsync(
+          prepareReplyToolAuthority(params.followupRun),
+        );
+        return await execute({ ...params, replyOperation });
+      },
+    );
   };
 }
 
@@ -539,14 +556,6 @@ export function createFollowupRun(): FollowupRun {
       blockReplyBreak: "message_end",
     },
   } as unknown as FollowupRun;
-}
-
-export function createTestUserTurnRecorder(message: PersistedUserTurnMessage) {
-  return createUserTurnTranscriptRecorder({
-    message,
-    target: createTestUserTurnTranscriptTarget(),
-    updateMode: "none",
-  });
 }
 
 export function requireRecord(value: unknown, label: string): Record<string, unknown> {

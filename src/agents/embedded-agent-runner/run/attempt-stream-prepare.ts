@@ -1,5 +1,4 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import type { ReplyToolAuthorityPreparation } from "../../../auto-reply/reply/reply-run-registry.contracts.js";
 import { SILENT_REPLY_TOKEN } from "../../../auto-reply/tokens.js";
 import { captureAgentRunLifecycleGeneration } from "../../../infra/agent-events.js";
 import { validateAgentRunDelegatedAuthority } from "../../../infra/agent-run-registry.js";
@@ -15,6 +14,7 @@ import {
 import { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
 import { getModelProviderRuntimePluginHandle } from "../../../plugins/provider-hook-runtime.js";
 import { projectNestedToolActivityForHooks } from "../../../sessions/nested-tool-activity.js";
+import type { ReplyToolAuthorityPreparation } from "../../../sessions/session-controller.contracts.js";
 import { prepareAgentRunTerminalReply } from "../../agent-run-terminal-reply.js";
 import { countActiveToolExecutions } from "../../embedded-agent-subscribe.handlers.tools.start.js";
 import { subscribeEmbeddedAgentSession } from "../../embedded-agent-subscribe.js";
@@ -32,10 +32,9 @@ import type { ToolSearchCatalogToolExecutor } from "../../tool-search.js";
 import { isRunnerAbortError } from "../abort.js";
 import { log } from "../logger.js";
 import {
-  ACTIVE_EMBEDDED_RUN_REGISTRATIONS,
-  ACTIVE_EMBEDDED_RUNS,
+  getEmbeddedRunAttachment,
+  getActiveNativeAttempt,
   ACTIVE_EMBEDDED_RUNS_BY_RUN_ID,
-  setActiveEmbeddedRunLifecycleGeneration,
 } from "../run-state.js";
 import {
   clearActiveEmbeddedRun,
@@ -249,7 +248,7 @@ function prepareStream(
                       input.runAbortController.signal.aborted ||
                       input.getRunState().aborted ||
                       admission.closed ||
-                      ACTIVE_EMBEDDED_RUNS.get(attempt.sessionId) !== queueHandle
+                      getActiveNativeAttempt(attempt.sessionId) !== queueHandle
                     ) {
                       throw new Error("Nested tool finalization is no longer current");
                     }
@@ -330,7 +329,14 @@ function prepareStream(
       : undefined;
 
   const clearActiveRun = () =>
-    clearActiveEmbeddedRun(attempt.sessionId, queueHandle, attempt.sessionKey, attempt.sessionFile);
+    clearActiveEmbeddedRun(
+      attempt.sessionId,
+      queueHandle,
+      attempt.sessionKey,
+      attempt.sessionFile,
+      undefined,
+      registration,
+    );
   let toolMetasForTerminal: readonly AsyncStartedToolMeta[] = [];
   // Terminal callbacks run after queue construction; keep the queue in this
   // phase so active-run clearing and subscription teardown share one owner.
@@ -396,7 +402,7 @@ function prepareStream(
     sessionManager: activeSession.sessionManager,
     subscription,
     isCurrent: () =>
-      ACTIVE_EMBEDDED_RUNS.get(attempt.sessionId) === queueHandle && !input.getRunState().aborted,
+      getActiveNativeAttempt(attempt.sessionId) === queueHandle && !input.getRunState().aborted,
     isReplaySafeTool: input.isReplaySafeTool,
     nestedToolActivityState: input.nestedToolActivityState,
   });
@@ -426,9 +432,9 @@ function prepareStream(
     registration?.toolAuthority?.assertActive();
     return (
       registration !== undefined &&
-      ACTIVE_EMBEDDED_RUN_REGISTRATIONS.get(queueHandle) === registration &&
-      ACTIVE_EMBEDDED_RUNS.get(attempt.sessionId) === queueHandle &&
-      ACTIVE_EMBEDDED_RUNS_BY_RUN_ID.get(attempt.runId) === queueHandle
+      getEmbeddedRunAttachment(queueHandle) === registration &&
+      getActiveNativeAttempt(attempt.sessionId) === queueHandle &&
+      ACTIVE_EMBEDDED_RUNS_BY_RUN_ID.get(attempt.runId)?.handle === queueHandle
     );
   };
   const canInject = () => isSteeringAdmissionOpen() && hasCurrentRegistration();
@@ -533,7 +539,7 @@ function prepareStream(
   const canApplyPermissionMode = () =>
     admission.accepting &&
     !input.runAbortController.signal.aborted &&
-    ACTIVE_EMBEDDED_RUNS_BY_RUN_ID.get(attempt.runId) === queueHandle;
+    ACTIVE_EMBEDDED_RUNS_BY_RUN_ID.get(attempt.runId)?.handle === queueHandle;
   const applyPermissionMode = input.applyPermissionMode;
   const queueHandle: AttemptStreamQueueHandle = {
     kind: "embedded",
@@ -589,9 +595,9 @@ function prepareStream(
               !externalAbortAccepted &&
               !attempt.abortSignal?.aborted &&
               registration !== undefined &&
-              ACTIVE_EMBEDDED_RUN_REGISTRATIONS.get(queueHandle) === registration &&
-              ACTIVE_EMBEDDED_RUNS.get(attempt.sessionId) === queueHandle &&
-              ACTIVE_EMBEDDED_RUNS_BY_RUN_ID.get(attempt.runId) === queueHandle
+              getEmbeddedRunAttachment(queueHandle) === registration &&
+              getActiveNativeAttempt(attempt.sessionId) === queueHandle &&
+              ACTIVE_EMBEDDED_RUNS_BY_RUN_ID.get(attempt.runId)?.handle === queueHandle
             );
           }
           stalledModelRecoveryAccepted =
@@ -606,19 +612,19 @@ function prepareStream(
     cancel: abortActiveRunExternally,
     abort: abortActiveRunExternally,
   };
-  attempt.replyOperation?.attachBackend(queueHandle);
-  setActiveEmbeddedRunLifecycleGeneration(
-    queueHandle,
-    attempt.lifecycleGeneration ?? captureAgentRunLifecycleGeneration(attempt.runId),
-  );
   setActiveEmbeddedRun(
     attempt.sessionId,
     queueHandle,
     attempt.sessionKey,
     attempt.sessionFile,
     input.hookAgentId,
+    attempt.replyOperation,
+    attempt.lifecycleGeneration ?? captureAgentRunLifecycleGeneration(attempt.runId),
   );
-  const registration = ACTIVE_EMBEDDED_RUN_REGISTRATIONS.get(queueHandle);
+  const registration = getEmbeddedRunAttachment(queueHandle);
+  if (registration) {
+    registration.runCleanupSettlement = attempt.runCleanupSettlement;
+  }
   if (attempt.deferTerminalLifecycle && attempt.onDeferredLifecycleOwner) {
     deferredLifecycleOwner = createEmbeddedAttemptDeferredLifecycleOwner({
       runId: attempt.runId,
@@ -628,8 +634,8 @@ function prepareStream(
       isCurrent: () =>
         registration?.delegatedAuthority !== undefined &&
         validateAgentRunDelegatedAuthority(registration.delegatedAuthority) &&
-        ACTIVE_EMBEDDED_RUN_REGISTRATIONS.get(queueHandle) === registration &&
-        ACTIVE_EMBEDDED_RUNS.get(attempt.sessionId) === queueHandle,
+        getEmbeddedRunAttachment(queueHandle) === registration &&
+        getActiveNativeAttempt(attempt.sessionId) === queueHandle,
       trajectoryRecorder: input.trajectoryRecorder ?? null,
       clearActiveRun: () => {
         try {
@@ -651,6 +657,7 @@ function prepareStream(
   return {
     subscription,
     queueHandle,
+    registration,
     deferredLifecycleOwner,
     toolSearchCatalogExecutor,
     getBeforeAgentFinalizeRevisionReason: () => beforeAgentFinalizeRevisionReason,

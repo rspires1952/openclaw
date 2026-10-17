@@ -4,7 +4,7 @@ import { writeSessionEntry } from "../../config/sessions/session-accessor.sqlite
 import { replaceSessionEntrySync } from "../../config/sessions/session-accessor.sqlite-entry.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
-import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
+import { runSessionMutation } from "../../sessions/session-controller.lifecycle.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { createOutboundTestPlugin, createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
@@ -125,7 +125,8 @@ describe("generation-bound result delivery", () => {
       const { generation, update } = fixture();
       const entered = createDeferred();
       const released = createDeferred();
-      const mutation = runExclusiveSessionLifecycleMutation("reset", {
+      const mutation = runSessionMutation({
+        kind: "reset",
         scope: generation.storePath,
         identities: [generation.sessionKey, generation.sessionId],
         prepare: async () => {

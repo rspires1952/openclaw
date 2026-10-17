@@ -3,27 +3,28 @@
 import { useChatAbortRegistryFixture } from "./chat.abort-registry.test-support.js";
 import { writeFile } from "node:fs/promises";
 import { expect, it, vi } from "vitest";
+import { resolveActiveEmbeddedRunOwner } from "../../agents/embedded-agent-runner/runs.js";
 import {
-  clearActiveEmbeddedRun,
-  resolveActiveEmbeddedRunOwner,
-  setActiveEmbeddedRun,
-} from "../../agents/embedded-agent-runner/runs.js";
-import { createEmbeddedRunHandle } from "../../agents/embedded-agent-runner/runs.test-support.js";
+  clearTestEmbeddedRun as clearActiveEmbeddedRun,
+  registerTestEmbeddedRun as setActiveEmbeddedRun,
+  createEmbeddedRunHandle,
+} from "../../agents/embedded-agent-runner/runs.test-support.js";
 import { markStartupOrphanedMainSessionsForRecovery } from "../../agents/main-session-recovery/main-session-restart-recovery-marking.js";
 import { resolveAgentRunAbortLifecycleFields } from "../../agents/run-termination.js";
+import { subagentRuns } from "../../agents/subagents/registry/subagent-registry-memory.js";
+import { subscribeSubagentRunChanges } from "../../agents/subagents/registry/subagent-registry-publication.js";
 import {
-  cancelSubagentRequesterSettleWake,
   markRequesterTurnYielded,
   markSubagentRunTerminated,
   registerSubagentRun,
+  retireSubagentObligations,
   settleRequesterAfterSessionSpawns,
 } from "../../agents/subagents/registry/subagent-registry.js";
 import { writeSubagentSessionEntry } from "../../agents/subagents/registry/subagent-registry.persistence.test-support.js";
 import { getSubagentRunByChildSessionKey } from "../../agents/subagents/registry/subagent-registry.test-helpers.js";
 import { enqueueFollowupRun, getFollowupQueueDepth } from "../../auto-reply/reply/queue.js";
 import { createQueueTestRun } from "../../auto-reply/reply/queue.test-helpers.js";
-import { clearFollowupDrainCallback } from "../../auto-reply/reply/queue/drain.js";
-import { clearFollowupQueue } from "../../auto-reply/reply/queue/state.js";
+import { clearSessionQueues } from "../../auto-reply/reply/queue/cleanup.js";
 import { getRuntimeConfig } from "../../config/config.js";
 import {
   loadExactSessionEntryReadOnly,
@@ -32,6 +33,7 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import { emitAgentEvent, getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 import { isPathInside } from "../../infra/path-guards.js";
+import { listRpcSourceEntries } from "../../sessions/session-controller.rpc-sources.js";
 import { closeOpenClawAgentDatabaseByPathAsync } from "../../state/openclaw-agent-db.js";
 import { listOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.test-support.js";
 import { persistGatewaySessionLifecycleEvent } from "../session-lifecycle-state.js";
@@ -46,6 +48,16 @@ const parentRunId = "yielded-parent-run";
 const childKey = "agent:main:subagent:yielded-child";
 const childId = "yielded-child-session";
 const childRunId = "yielded-child-run";
+
+function observeChildPublications() {
+  const entries = [subagentRuns.get(childRunId)];
+  const stop = subscribeSubagentRunChanges("persistence", ({ runIds }) => {
+    if (!runIds || runIds.includes(childRunId)) {
+      entries.push(subagentRuns.get(childRunId));
+    }
+  });
+  return { entries, stop };
+}
 
 async function seedYieldedParent() {
   for (const [sessionKey, sessionId] of [
@@ -162,7 +174,7 @@ it.each(["unchanged", "new turn", "reset incarnation", "partial cancellation"] a
       getRuntimeConfig,
       getSessionEventSubscriberConnIds: () => new Set(),
     });
-    expect(context.chatAbortControllers.size).toBe(0);
+    expect(listRpcSourceEntries()).toHaveLength(0);
     expect(resolveActiveEmbeddedRunOwner(parentId)).toBeUndefined();
     const captured = loadSessionEntry({ agentId: "main", sessionKey: parentKey });
     if (!captured) {
@@ -204,6 +216,7 @@ it.each(["unchanged", "new turn", "reset incarnation", "partial cancellation"] a
         stream: "lifecycle",
         data: { phase: "end", ...resolveAgentRunAbortLifecycleFields(AbortSignal.abort()) },
       });
+      clearActiveEmbeddedRun(childId, child, childKey);
     });
     const child = createEmbeddedRunHandle({ runId: childRunId, abort: childAbort });
     setActiveEmbeddedRun(childId, child, childKey);
@@ -211,6 +224,7 @@ it.each(["unchanged", "new turn", "reset incarnation", "partial cancellation"] a
     const respond = vi.fn<RespondFn>(() => {
       acknowledgment.entry = loadSessionEntry({ agentId: "main", sessionKey: parentKey });
     });
+    const publications = observeChildPublications();
     try {
       await sessionAbortHandlers["sessions.abort"]!({
         req: { type: "req", id: "stop", method: "sessions.abort" },
@@ -259,9 +273,12 @@ it.each(["unchanged", "new turn", "reset incarnation", "partial cancellation"] a
         lastRunId: parentRunId,
       });
       await fixture.settle();
-      expect((await getSubagentRunByChildSessionKey(childKey))?.killReconciliation).toMatchObject({
-        suppressTaskDelivery: true,
-      });
+      expect(
+        publications.entries.some(
+          (entry) => entry?.killReconciliation?.suppressTaskDelivery === true,
+        ),
+      ).toBe(true);
+      expect(await getSubagentRunByChildSessionKey(childKey)).toBeNull();
       expect(
         await markStartupOrphanedMainSessionsForRecovery({
           cfg: getRuntimeConfig(),
@@ -273,6 +290,7 @@ it.each(["unchanged", "new turn", "reset incarnation", "partial cancellation"] a
         abortedLastRun: true,
       });
     } finally {
+      publications.stop();
       await replacementPersistence;
       clearActiveEmbeddedRun(childId, child, childKey);
     }
@@ -330,7 +348,7 @@ it.each([
   const childOutcome = structuredClone(completedChild.execution.outcome);
   if (!pendingWake) {
     // Isolate queue clearing from a still-pending child continuation.
-    await cancelSubagentRequesterSettleWake(completedChild, () => {});
+    await retireSubagentObligations(completedChild, () => {}, { requesterNotified: true });
     expect((await getSubagentRunByChildSessionKey(childKey))?.requesterSettleWake).toBeUndefined();
   }
   const before = loadSessionEntry({ agentId: "main", sessionKey: parentKey });
@@ -345,6 +363,7 @@ it.each([
     getRuntimeConfig,
     getSessionEventSubscriberConnIds: () => new Set(),
   });
+  const publications = observeChildPublications();
   try {
     await sessionAbortHandlers["sessions.abort"]!({
       req: { type: "req", id: "stop", method: "sessions.abort" },
@@ -380,12 +399,23 @@ it.each([
     }
     const retiredChild = await getSubagentRunByChildSessionKey(childKey);
     expect(retiredChild?.requesterSettleWake).toBeUndefined();
-    expect(retiredChild?.execution.outcome).toEqual(childOutcome);
-  } finally {
-    for (const key of [parentKey, parentId]) {
-      clearFollowupQueue(key);
-      clearFollowupDrainCallback(key);
-      expect(getFollowupQueueDepth(key)).toBe(0);
+    for (const entry of publications.entries) {
+      if (entry) {
+        expect(entry.execution.outcome).toEqual(childOutcome);
+      }
     }
+    if (pendingWake) {
+      expect(retiredChild).toBeNull();
+    } else {
+      expect(retiredChild?.execution.outcome).toEqual(childOutcome);
+    }
+  } finally {
+    publications.stop();
+    clearSessionQueues([parentKey, parentId], followup.controllerInput?.target);
+    if (followup.controllerInput) {
+      await followup.controllerInput.settlement.promise;
+    }
+    expect(getFollowupQueueDepth(parentKey)).toBe(0);
+    expect(getFollowupQueueDepth(parentId)).toBe(0);
   }
 });

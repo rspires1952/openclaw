@@ -2,10 +2,10 @@ import { afterEach, expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import { withAgentDeletion } from "../../agents/agent-lifecycle-registry.js";
 import {
-  clearActiveEmbeddedRun,
-  setActiveEmbeddedRun,
-} from "../../agents/embedded-agent-runner/runs.js";
-import { createEmbeddedRunHandle } from "../../agents/embedded-agent-runner/runs.test-support.js";
+  clearTestEmbeddedRun as clearActiveEmbeddedRun,
+  registerTestEmbeddedRun as setActiveEmbeddedRun,
+  createEmbeddedRunHandle,
+} from "../../agents/embedded-agent-runner/runs.test-support.js";
 import { captureRuntimeConfigAsyncReader, getRuntimeConfig } from "../../config/config.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import {
@@ -14,9 +14,9 @@ import {
 } from "../../config/sessions/session-accessor.sqlite-entry.js";
 import * as sessionInventory from "../../config/sessions/session-entry-read-runtime.js";
 import {
-  beginSessionWorkAdmission,
-  type SessionWorkAdmissionLease,
-} from "../../sessions/session-lifecycle-admission.js";
+  beginSessionEffect,
+  type SessionEffectRef,
+} from "../../sessions/session-controller.lifecycle.js";
 import * as deletionJournals from "../../state/agent-deletion-journal.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { resumeAgentDeletions } from "../server-agent-deletion-recovery.js";
@@ -136,8 +136,8 @@ it("preserves another agent's replacement run and admissions in a shared store d
     });
     setActiveEmbeddedRun(sessionId, original, "agent:doomed:active", undefined, "doomed");
     const draining = drainAgentDeletionRuns("doomed", cfg, createDirectChatContext(), () => {});
-    let active: SessionWorkAdmissionLease | undefined;
-    let pending: Promise<SessionWorkAdmissionLease> | undefined;
+    let active: SessionEffectRef | undefined;
+    let pending: Promise<SessionEffectRef> | undefined;
     const activeInterrupted = vi.fn(() => active?.release());
     const pendingInterrupted = vi.fn();
     try {
@@ -149,11 +149,10 @@ it("preserves another agent's replacement run and admissions in a shared store d
         scope: storePath,
         identities: ["agent:keeper:active", sessionId],
         owner: Symbol("keeper-turn"),
-        serializeOwner: true,
         assertAllowed: () => {},
       };
-      active = await beginSessionWorkAdmission({ ...admission, onInterrupt: activeInterrupted });
-      pending = beginSessionWorkAdmission({ ...admission, onInterrupt: pendingInterrupted });
+      active = await beginSessionEffect({ ...admission, onInterrupt: activeInterrupted });
+      pending = beginSessionEffect({ ...admission, onInterrupt: pendingInterrupted });
       void pending.catch(() => {});
       inventory.resolve([]);
       await expect(draining).resolves.toBeUndefined();
@@ -223,7 +222,7 @@ it.each([false, true])(
         terminalAtMs: null,
         recoveryError: null,
       };
-      const admission = await beginSessionWorkAdmission({
+      const admission = await beginSessionEffect({
         agentId: "doomed",
         scope: state.path("agents/doomed/sessions/sessions.json"),
         identities: [baseKey, sessionId],

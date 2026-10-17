@@ -652,18 +652,25 @@ it(
       ).resolves.toMatchObject({
         profile: { id: replacement.id },
       });
+      await expect(
+        administrator.request<{ status: string }>(
+          "agent.wait",
+          { runId: steering.runId, timeoutMs: 30_000 },
+          { timeoutMs: 35_000 },
+        ),
+      ).resolves.toMatchObject({ status: "pending", timeoutPhase: "queue" });
+      backingHold.resume.resolve();
+      await Promise.race([
+        steeringHold.entered.promise,
+        backingTerminal.then((result) => {
+          throw new Error(`Accepted steering lost its backing run: ${JSON.stringify(result)}`);
+        }),
+      ]);
       const steeringTerminal = administrator.request<{ status: string }>(
         "agent.wait",
         { runId: steering.runId, timeoutMs: 30_000 },
         { timeoutMs: 35_000 },
       );
-      backingHold.resume.resolve();
-      await Promise.race([
-        steeringHold.entered.promise,
-        Promise.all([backingTerminal, steeringTerminal]).then((results) => {
-          throw new Error(`Accepted steering lost its backing run: ${JSON.stringify(results)}`);
-        }),
-      ]);
       await expect(
         administrator.request("agent.wait", { runId: backing.runId, timeoutMs: 100 }),
       ).resolves.toMatchObject({ status: "timeout" });

@@ -1,9 +1,11 @@
 import { resolveSessionAgentId } from "../agents/agent-scope.js";
-import { resolveActiveEmbeddedRunSessionId } from "../agents/embedded-agent-runner/active-run-projections.js";
-import { queueGuardedEmbeddedAgentMessageWithOutcomeAsync } from "../agents/embedded-agent-runner/runs.js";
+import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import { readSessionSubmittedInput } from "../config/sessions/session-accessor.pending-inputs.js";
 import { resolveSessionTranscriptRuntimeTarget } from "../config/sessions/session-accessor.transcript-target.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { captureSessionTarget } from "../sessions/session-controller.lifecycle.js";
+import { getSessionControllerOperation } from "../sessions/session-controller.state.js";
+import { steerSessionControllerOperation } from "../sessions/session-controller.steer.js";
 import {
   buildPersistedUserTurnMessage,
   createUserTurnTranscriptRecorder,
@@ -19,16 +21,25 @@ export async function steerPluginActiveRun(params: {
   assertCurrent: () => void;
 }): Promise<PluginActiveRunSteerResult> {
   const sessionKey = params.input.sessionKey.trim();
-  const sessionId = resolveActiveEmbeddedRunSessionId(sessionKey);
-  if (!sessionId) {
+  const agentId = resolveSessionAgentId({ config: params.cfg, sessionKey });
+  const operation = getSessionControllerOperation(
+    sessionKey,
+    captureSessionTarget({
+      storeScope: resolveSessionStorePathCore(params.cfg.session?.store, { agentId }),
+      sessionKey,
+      agentId,
+    }),
+  );
+  if (!operation) {
     return { steered: false, reason: "no_active_run" };
   }
+  const sessionId = operation.sessionId;
   const target = {
     sessionId,
     expectedSessionId: sessionId,
     sessionKey,
     sessionEntry: undefined,
-    agentId: resolveSessionAgentId({ config: params.cfg, sessionKey }),
+    agentId,
     config: params.cfg,
   };
   const idempotencyKey = params.input.idempotencyKey?.trim();
@@ -68,10 +79,10 @@ export async function steerPluginActiveRun(params: {
     target,
   });
   params.assertCurrent();
-  const outcome = await queueGuardedEmbeddedAgentMessageWithOutcomeAsync(
-    sessionId,
-    params.input.text,
-    {
+  const outcome = await steerSessionControllerOperation({
+    operation,
+    text: params.input.text,
+    options: {
       steeringMode: "all",
       debounceMs: 0,
       waitForTranscriptCommit: false,
@@ -80,18 +91,16 @@ export async function steerPluginActiveRun(params: {
       assertCurrent: params.assertCurrent,
       userTurnTranscriptRecorder: recorder,
     },
-    () => {
-      params.assertCurrent();
-      return true;
-    },
-  );
-  return outcome.queued
-    ? { steered: true, ...(outcome.runId ? { runId: outcome.runId } : {}) }
+  });
+  return outcome.status !== "rejected"
+    ? { steered: true, ...(outcome.targetRunId ? { runId: outcome.targetRunId } : {}) }
     : {
         steered: false,
         reason:
           outcome.reason === "guarded_injection_unsupported"
             ? "active runtime does not support guarded steering"
-            : outcome.reason,
+            : outcome.reason === "injection_unavailable" || outcome.reason === "not_running"
+              ? "not_streaming"
+              : outcome.reason,
       };
 }

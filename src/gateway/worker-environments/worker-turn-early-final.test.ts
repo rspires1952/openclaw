@@ -3,8 +3,8 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred, withinTest } from "../../../test/helpers/promise.js";
-import { waitForEmbeddedAgentRunEnd } from "../../agents/embedded-agent-runner/runs.js";
 import { makeAgentAssistantMessage } from "../../agents/test-helpers/agent-message-fixtures.js";
+import { waitForSessionRunEnd } from "../../sessions/session-controller.native-runtime.js";
 import type { WorkerSessionTurnClaim } from "./placement-record.js";
 import type { WorkerTurnTunnelHandle } from "./tunnel-contract.js";
 import {
@@ -150,7 +150,7 @@ describe("worker final reply before workspace settlement", () => {
           });
           expect(followupWorkspace).toBe("accepted worker content");
         }
-        await withinTest(waitForEmbeddedAgentRunEnd(SESSION_ID, null), signal);
+        await withinTest(waitForSessionRunEnd(SESSION_ID, null), signal);
         if (outcome === "failure") {
           expect(reconcileActivePlacement).toHaveBeenCalledOnce();
           const pending = await placements.listPendingWorkspaceResultsAsync();
@@ -195,7 +195,7 @@ describe("worker final reply before workspace settlement", () => {
       } finally {
         reconcileRelease.resolve();
         await Promise.allSettled([first, followup]);
-        await waitForEmbeddedAgentRunEnd(SESSION_ID, null);
+        await waitForSessionRunEnd(SESSION_ID, null);
         input.preparedRunAdmission.close();
         followupInput.preparedRunAdmission.close();
       }

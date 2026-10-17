@@ -106,7 +106,7 @@ export function registerRequesterStartupAdmissionTests({
       expect(retained.suppressCompletionDelivery).not.toBe(true);
 
       if (outcome === "cancel") {
-        await registry.cancelSubagentRequesterSettleWake(retained, () => {});
+        await registry.retireSubagentObligations(retained, () => {}, { requesterNotified: true });
       } else if (outcome === "replace") {
         await registry.addSubagentRunForTests({
           ...retained,

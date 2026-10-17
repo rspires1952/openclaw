@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getAgentToolExecutionContext } from "../../../packages/agent-core/src/tool-execution-context.js";
 import { GatewayClientRequestError } from "../../../packages/gateway-client/src/request-error.js";
-import { resolveActiveReplyOperationForSessionId } from "../../auto-reply/reply/reply-run-registry.js";
 import {
   captureSessionEventTargetForHost,
   enqueueSessionEventForHost,
@@ -17,6 +16,7 @@ import {
 } from "../../infra/exec-request-context.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { runWithGatewayDetachedWorkContinuation } from "../../process/gateway-work-admission.js";
+import { resolveActiveReplyOperationForSessionId } from "../../sessions/session-controller.js";
 import { runOutsidePreparedModelRuntimePluginGenerationScope } from "../prepared-model-runtime-generation-scope.js";
 import { jsonResult, ToolInputError } from "./common.js";
 import { getGatewayToolCallerIdentity } from "./gateway-caller-context.js";

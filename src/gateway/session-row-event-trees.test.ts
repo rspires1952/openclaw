@@ -10,10 +10,12 @@ import {
   replaceSessionEntrySync,
   resetSessionEntryLifecycle,
 } from "../config/sessions/session-accessor.js";
+import { rpcSourceTesting } from "../sessions/session-lifecycle-admission.test-support.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { createGatewayConnectionState } from "./server-connection-state.js";
+import { createActiveRpcSourceForTest } from "./server-methods/rpc-source-fixtures.test-support.js";
 import {
   emitSessionsChanged,
   flushPendingSessionsChangedEvents,
@@ -144,19 +146,24 @@ it.each(["sessions.list", "sessions.subscribe"])(
         expect(payloadFor(peers[0]!).ancestorSessionRefs).toHaveLength(1);
 
         // Runtime-only content can change and return without invalidating stored row facts.
-        connection.chatAbortControllers.set("ancestor-run", {
-          controller: new AbortController(),
-          agentId: "main",
-          sessionKey: root,
-          sessionId: root,
-          startedAtMs: 1,
-          expiresAtMs: 2,
-        });
+        rpcSourceTesting.set(
+          "ancestor-run",
+          await createActiveRpcSourceForTest(
+            {},
+            {
+              agentId: "main",
+              sessionKey: root,
+              sessionId: root,
+              storeScope: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+            },
+          ),
+        );
         publish("activity-summary");
         expect(payloadFor(peers[0]!).ancestorSessions).toEqual([
           expect.objectContaining({ key: root, hasActiveRun: true }),
         ]);
-        connection.chatAbortControllers.delete("ancestor-run");
+        rpcSourceTesting.get("ancestor-run")?.input.claim?.operation?.complete();
+        rpcSourceTesting.delete("ancestor-run");
         publish();
         expect(payloadFor(peers[0]!).ancestorSessions).toEqual([
           expect.objectContaining({ key: root, hasActiveRun: false }),
@@ -213,7 +220,6 @@ it("publishes fresh ancestor rows through private intermediates with list visibi
       cfg,
     });
     const context = requestContext(cfg);
-    context.chatAbortControllers = connection.chatAbortControllers;
     context.broadcastToConnIds = connection.broadcastToConnIds;
     context.getSessionEventSubscriberConnIds = connection.sessionEventSubscribers.getAll;
     await initializeSessionReadContext(context);

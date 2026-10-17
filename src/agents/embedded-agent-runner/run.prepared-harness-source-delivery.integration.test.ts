@@ -25,6 +25,7 @@ import {
 import type { InternalGetReplyOptions } from "../../auto-reply/reply/get-reply.types.js";
 import { buildSourceConversationContext } from "../../auto-reply/reply/groups.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
+import { prepareReplyToolAuthority } from "../../auto-reply/reply/reply-tool-authority.js";
 import {
   bindSourceReplyDeliveryRuntime,
   createSourceReplyDeliveryRuntime,
@@ -190,6 +191,7 @@ describe("prepared harness source delivery", () => {
       modelOverride: "gpt-5.4",
     });
     const followupRun = createFollowupRun();
+    followupRun.run.config = { session: { store: "/tmp/mock-sessions.json" } };
     const emittedStreamingCallbacks: string[] = [];
     let forbiddenSdkAuthorityObserved = false;
     let modelVisiblePrompt = "";
@@ -435,6 +437,7 @@ describe("prepared harness source delivery", () => {
         onModeResolved: runtimeOpts.onSourceReplyDeliveryModeResolved,
       });
       bindSourceReplyDeliveryRuntime(followupRun.run, sourceReplyDeliveryRuntime);
+      runtimeOpts.replyOperation?.bindToolAuthoritySnapshot(prepareReplyToolAuthority(followupRun));
       // Dispatch already captured its session snapshot; the embedded fixture uses
       // a SQLite compatibility key and has no durable row for writer admission.
       sessionStoreMocks.currentEntry = undefined;
@@ -452,9 +455,10 @@ describe("prepared harness source delivery", () => {
         shouldEmitToolOutput: () => false,
         pendingToolTasks: new Set(),
         isHeartbeat: false,
-        sessionKey: "main",
+        sessionKey: runtimeOpts.replyOperation?.key ?? "main",
         getActiveSessionEntry: () => undefined,
         resolvedVerboseLevel: "off",
+        replyOperation: runtimeOpts.replyOperation,
       });
       if (execution.kind !== "success") {
         const failedParams = embeddedParams as {
@@ -748,6 +752,7 @@ describe("prepared harness source delivery", () => {
       };
       const release = vi.fn(async () => {});
       const acquisitionStarted = createDeferred();
+      const acquisitionAborted = createDeferred();
       const resumeAcquisition = createDeferred();
       const queueTimeout = createDeferred<never>();
       const queuedTasks: Promise<unknown>[] = [];
@@ -757,6 +762,7 @@ describe("prepared harness source delivery", () => {
         async (_input, options?: PreparedModelRuntimeLeaseOptions) => {
           const signal = options?.abortSignal;
           acquisitionSignal = signal;
+          signal?.addEventListener("abort", () => acquisitionAborted.resolve(), { once: true });
           acquisitionStarted.resolve();
           await resumeAcquisition.promise;
           signal?.throwIfAborted();
@@ -795,13 +801,11 @@ describe("prepared harness source delivery", () => {
         workspaceDir,
         enqueue:
           outcome === "queue timeout"
-            ? async (task, options) => {
+            ? async (task) => {
                 const pending = task();
                 queuedTasks.push(pending);
                 // Reject the global queue while its acquisition callback still owns work.
-                return options?.taskTimeoutAbortSignal
-                  ? await Promise.race([pending, queueTimeout.promise])
-                  : await pending;
+                return await Promise.race([pending, queueTimeout.promise]);
               }
             : undefined,
       };
@@ -831,7 +835,7 @@ describe("prepared harness source delivery", () => {
           } else {
             reason.name = "CommandLaneTaskTimeoutError";
             queueTimeout.reject(reason);
-            await observed;
+            await acquisitionAborted.promise;
           }
           expect(acquisitionSignal?.aborted).toBe(true);
           expect(acquisitionSignal?.reason).toBe(reason);

@@ -505,6 +505,7 @@ async function runSweepSample(childCount: number): Promise<Sample> {
   let sessionEffects = 0;
   let recoveryProjections = 0;
   let lostContextCompletions = 0;
+  let retiredObligations = 0;
   const sweeper = createSubagentRegistrySweeper({
     runs,
     resumedRuns: new Set(),
@@ -548,6 +549,9 @@ async function runSweepSample(childCount: number): Promise<Sample> {
       sessionEffects += 1;
     },
     retireSupersededRun: async () => {},
+    retireObligations: async () => {
+      retiredObligations += 1;
+    },
     getRunsForChildSession: getSubagentRunsForChildSession,
     getRunsForCollectorGroup: () => [],
     warn: () => {},
@@ -563,10 +567,11 @@ async function runSweepSample(childCount: number): Promise<Sample> {
       retainedCurrent === childCount &&
       sessionEffects === 0 &&
       recoveryProjections === childCount &&
-      lostContextCompletions === 0;
+      lostContextCompletions === 0 &&
+      retiredObligations === 0;
     if (!ok) {
       throw new Error(
-        `registry sweep invariant failed: ${JSON.stringify({ childCount, removedRows, retainedCurrent, sessionEffects, recoveryProjections, lostContextCompletions })}`,
+        `registry sweep invariant failed: ${JSON.stringify({ childCount, removedRows, retainedCurrent, sessionEffects, recoveryProjections, lostContextCompletions, retiredObligations })}`,
       );
     }
     return {
@@ -579,6 +584,7 @@ async function runSweepSample(childCount: number): Promise<Sample> {
         sessionEffects,
         recoveryProjections,
         lostContextCompletions,
+        retiredObligations,
       },
     };
   } finally {

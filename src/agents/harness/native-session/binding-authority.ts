@@ -1,4 +1,3 @@
-import type { ReplyToolAuthorityPreparation } from "../../../auto-reply/reply/reply-run-registry.contracts.js";
 import { loadSessionEntryReadOnly } from "../../../config/sessions/session-accessor.js";
 import {
   captureNativeSessionEntryCurrentRead,
@@ -32,6 +31,7 @@ import {
 import type { SessionEntry } from "../../../config/sessions/types.js";
 import { readDatabasePathIdentitySync } from "../../../infra/sqlite-worker-identity.js";
 import { isIncognitoSessionKey } from "../../../routing/session-key.js";
+import type { ReplyToolAuthorityPreparation } from "../../../sessions/session-controller.contracts.js";
 import {
   capturePreparedToolAuthorityReads,
   type PreparedToolAuthorityRead,

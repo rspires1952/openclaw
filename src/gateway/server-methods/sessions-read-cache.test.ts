@@ -7,7 +7,6 @@ import {
   addSubagentRunForTests,
   resetSubagentRegistryForTests,
 } from "../../agents/subagents/registry/subagent-registry.test-helpers.js";
-import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import * as sessionAccessor from "../../config/sessions/session-accessor.js";
 import {
@@ -28,6 +27,7 @@ import { mergeSessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resetAgentEventsForTest } from "../../infra/agent-events.js";
 import { clearAgentRunContext, registerAgentRunContext } from "../../infra/agent-run-registry.js";
+import { rpcSourceTesting } from "../../sessions/session-lifecycle-admission.test-support.js";
 import { sessionChanges } from "../../sessions/session-row-changes.js";
 import {
   registerOpenClawAgentDatabase,
@@ -49,7 +49,12 @@ import {
 } from "../session-row-backfill.test-support.js";
 import { getSessionRowProjection } from "../session-row-projection-access.js";
 import type { GatewaySessionRow } from "../session-utils.types.js";
+import { createRpcSourceForTest } from "../test-helpers.rpc-source.js";
 import type { WorkerSessionPlacementRecord } from "../worker-environments/placement-store.js";
+import {
+  captureRpcTargetForTest,
+  createActiveRpcSourceForTest,
+} from "./rpc-source-fixtures.test-support.js";
 import {
   identifiedClient,
   initializeSessionReadContext,
@@ -177,30 +182,46 @@ describe("resident sessions.list", () => {
         const request = { agentId: "main", ...filter, limit: 50 };
         const filtered = Boolean(filter.search || filter.activeOnly);
         const terminalScope = { agentId: "main", sessionKey: "agent:main:active" };
+        const storeScope = captureRpcTargetForTest({
+          ...terminalScope,
+          sessionId: "main-active",
+        }).storeScope;
         await replaceSessionEntry(terminalScope, {
           ...loadSessionEntry(terminalScope)!,
           status: "done",
         });
-        context.chatAbortControllers.set("retained-terminal", {
-          sessionId: "main-active",
-          sessionKey: terminalScope.sessionKey,
-          agentId: "main",
-          projectSessionActive: false,
-        } as never);
+        rpcSourceTesting.set(
+          "retained-terminal",
+          createRpcSourceForTest(
+            { projectSessionActive: false },
+            {
+              sessionId: "main-active",
+              sessionKey: terminalScope.sessionKey,
+              agentId: "main",
+              storeScope,
+              phase: "consumed",
+            },
+          ),
+        );
         if (filtered) {
           expect((await listSessions({ client, context, request })).sessions).toEqual([]);
         }
-        const operation = createReplyOperation({
-          sessionId: "main-active",
-          sessionKey: "agent:main:active",
-          resetTriggered: false,
-        });
+        const activeSource = await createActiveRpcSourceForTest(
+          {},
+          {
+            sessionId: "main-active",
+            sessionKey: terminalScope.sessionKey,
+            agentId: "main",
+            storeScope,
+          },
+        );
+        rpcSourceTesting.set("active-reply", activeSource);
         try {
           const active = await listSessions({ client, context, request });
           expect(active.sessions.find((row) => row.key === terminalScope.sessionKey)).toMatchObject(
             { hasActiveRun: true, status: "running" },
           );
-          operation.complete();
+          activeSource.release();
           if (!filtered) {
             vi.spyOn(Date, "now").mockReturnValue(Date.now() + 1_000);
           }
@@ -213,7 +234,7 @@ describe("resident sessions.list", () => {
             ).toMatchObject({ hasActiveRun: false, status: "done" });
           }
         } finally {
-          operation.complete();
+          activeSource.release();
         }
       });
     },
@@ -880,11 +901,22 @@ describe("resident sessions.list", () => {
         const context = requestContext(config);
         if (filter.activeOnly) {
           for (const name of ["first", "second", "third"]) {
-            context.chatAbortControllers.set(`page-run-${name}`, {
-              sessionId: `page-${name}`,
-              sessionKey: `agent:main:page-${name}`,
-              agentId: "main",
-            } as never);
+            rpcSourceTesting.set(
+              `page-run-${name}`,
+              await createActiveRpcSourceForTest(
+                {},
+                {
+                  sessionId: `page-${name}`,
+                  sessionKey: `agent:main:page-${name}`,
+                  agentId: "main",
+                  storeScope: captureRpcTargetForTest({
+                    sessionId: `page-${name}`,
+                    sessionKey: `agent:main:page-${name}`,
+                    agentId: "main",
+                  }).storeScope,
+                },
+              ),
+            );
           }
         }
         const client = identifiedClient("viewer@example.com");

@@ -5,7 +5,6 @@ import {
   GatewayErrorDetailCodes,
 } from "../../../packages/gateway-protocol/src/gateway-error-details.js";
 import { withGroupThreadTurn } from "../../auto-reply/group-thread-context.js";
-import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.js";
 import { resolveReactionMessageId } from "../../channels/plugins/actions/reaction-message-id.js";
 import type {
   ChannelMessageActionContext,
@@ -35,6 +34,7 @@ import type { PluginHookMessageSendingResult } from "../../plugins/hook-message.
 import { createHookRunner } from "../../plugins/hooks.js";
 import { createMockPluginRegistry } from "../../plugins/hooks.test-fixtures.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
+import { createReplyOperation } from "../../sessions/session-controller.js";
 import {
   createChannelTestPluginBase,
   createTestRegistry,

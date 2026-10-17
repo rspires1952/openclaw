@@ -17,7 +17,6 @@ import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { sessionChanges } from "../sessions/session-row-changes.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import type { ChatAbortControllerEntry } from "./chat-abort.js";
 import { disposeSessionReadContexts } from "./server-methods/sessions-read-cache.test-support.js";
 import {
   copyGitWorkspace,
@@ -186,7 +185,7 @@ test.for([
       };
       const stopTitleObserver = sessionChanges.subscribe(checkTitle);
       const pastedText = `Pasted deployment plan ${"x".repeat(2_000)}`;
-      const context = { chatAbortControllers: new Map<string, ChatAbortControllerEntry>() };
+      const context = {};
       const message = "Review this rollout [[reply_to_current]]";
       const attachment = {
         type: "file",
