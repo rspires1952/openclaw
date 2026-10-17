@@ -8,7 +8,7 @@ import type {
 } from "../../api/types.ts";
 import { pathForAgentPanel } from "../../app-route-paths.ts";
 import { togglePinnedAgent } from "../../app/bootstrap-navigation-preferences.ts";
-import type { ApplicationContext, ApplicationGatewaySnapshot } from "../../app/context.ts";
+import type { ApplicationContext } from "../../app/context.ts";
 import {
   beginPanelRefresh,
   completePanelRefresh,
@@ -81,7 +81,7 @@ import {
   syncAgentsCanonicalLocation,
 } from "./route-navigation.ts";
 import type { AgentsRouteData } from "./route.ts";
-import { AgentSelectionDrafts } from "./selection-drafts.ts";
+import { AgentSelectionDrafts, type RetainedIdentitySave } from "./selection-drafts.ts";
 import { clearAgentSkillFilter, createAgentSkillActions, loadAgentSkills } from "./skills.ts";
 import { createAgentToolActions } from "./tool-config.ts";
 import type { AgentsProps } from "./view.tsx";
@@ -129,14 +129,7 @@ export class AgentsPageState
   @viewState() identitySaving = false;
   @viewState() identityError: string | null = null;
   private identityAutosaveTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly identitySaves = new Map<
-    string,
-    {
-      client: GatewayBrowserClient;
-      snapshot: ApplicationGatewaySnapshot | null;
-      promise: Promise<void>;
-    }
-  >();
+  private identitySaves = new Map<string, RetainedIdentitySave>();
   @viewState() agentSkillsLoading = false;
   @viewState() agentSkillsError: string | null = null;
   @viewState() agentSkillsReport: SkillStatusReport | null = null;
@@ -333,11 +326,13 @@ export class AgentsPageState
   }
 
   override connect() {
+    this.identitySaves = this.selectionDrafts.bindContext(this.context);
     this.gateway.connect();
     super.connect();
   }
 
   override disconnect() {
+    this.selectionDrafts.retainCurrentIdentity();
     this.clearIdentityAutosave();
     this.githubIdentity.dispose();
     this.subscriptions.clear();

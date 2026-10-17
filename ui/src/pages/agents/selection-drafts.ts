@@ -1,4 +1,5 @@
-import type { ApplicationGatewaySnapshot } from "../../app/context.ts";
+import type { GatewayBrowserClient } from "../../api/gateway.ts";
+import type { ApplicationContext, ApplicationGatewaySnapshot } from "../../app/context.ts";
 import {
   retainAgentFileDrafts,
   type AgentFilesState,
@@ -20,19 +21,60 @@ type Selection = {
   profileId: string | null;
 };
 
+type RetainedIdentityWork = {
+  profileId: string | null;
+  identities: Map<string, { profileId: string | null; draft: AgentIdentityDraft }>;
+  saves: Map<string, RetainedIdentitySave>;
+};
+
+export type RetainedIdentitySave = {
+  client: GatewayBrowserClient;
+  snapshot: ApplicationGatewaySnapshot | null;
+  promise: Promise<void>;
+};
+
+const retainedIdentityWork = new WeakMap<ApplicationContext, RetainedIdentityWork>();
+
+function identityWorkFor(context: ApplicationContext): RetainedIdentityWork {
+  let work = retainedIdentityWork.get(context);
+  if (!work) {
+    work = { profileId: null, identities: new Map(), saves: new Map() };
+    retainedIdentityWork.set(context, work);
+  }
+  return work;
+}
+
 /** Owns private editor drafts across the selected target's presentation lifetime. */
 export class AgentSelectionDrafts {
   private readonly files = new Map<string, RetainedAgentFileDrafts>();
-  private readonly identities = new Map<
-    string,
-    { profileId: string | null; draft: AgentIdentityDraft }
-  >();
+  private identities = new Map<string, { profileId: string | null; draft: AgentIdentityDraft }>();
   private profileId: string | null = null;
+  private lifetime: RetainedIdentityWork | null = null;
 
   constructor(
     private readonly host: AgentSelectionDraftHost,
     private readonly resetSelection: () => void,
   ) {}
+
+  bindContext(context: ApplicationContext): Map<string, RetainedIdentitySave> {
+    this.lifetime = identityWorkFor(context);
+    this.identities = this.lifetime.identities;
+    this.profileId = this.lifetime.profileId;
+    return this.lifetime.saves;
+  }
+
+  retainCurrentIdentity() {
+    const { host } = this;
+    if (
+      host.agentsSelectedId &&
+      Object.values(host.identityDraft).some((value) => value !== null)
+    ) {
+      this.identities.set(host.agentsSelectedId, {
+        profileId: this.profileId,
+        draft: host.identityDraft,
+      });
+    }
+  }
 
   observeGateway(snapshot: Pick<ApplicationGatewaySnapshot, "phase" | "selfUser">) {
     if (snapshot.phase !== "connected") {
@@ -41,40 +83,50 @@ export class AgentSelectionDrafts {
     const profileId = snapshot.selfUser?.id ?? null;
     if (profileId !== this.profileId) {
       this.identities.clear();
+      this.lifetime?.saves.clear();
       resetIdentityDraft(this.host);
       this.profileId = profileId;
+      if (this.lifetime) {
+        this.lifetime.profileId = profileId;
+      }
     }
+  }
+
+  private restoreIdentity(selectedId: string | null, profileId: string | null): boolean {
+    if (!selectedId) {
+      return false;
+    }
+    const retained = this.identities.get(selectedId);
+    if (!retained) {
+      return false;
+    }
+    if (retained.profileId !== profileId) {
+      if (profileId !== null) {
+        this.identities.delete(selectedId);
+      }
+      return false;
+    }
+    this.identities.delete(selectedId);
+    this.host.identityDraft = retained.draft;
+    return true;
   }
 
   select(selection: Selection) {
     const { host } = this;
     const { selectedId, profileId } = selection;
     if (selectedId === host.agentsSelectedId) {
-      return false;
+      return this.restoreIdentity(selectedId, profileId);
     }
     if (host.agentsSelectedId) {
       const drafts = retainAgentFileDrafts(host);
       if (drafts) {
         this.files.set(host.agentsSelectedId, drafts);
       }
-      if (Object.values(host.identityDraft).some((value) => value !== null)) {
-        this.identities.set(host.agentsSelectedId, {
-          profileId: this.profileId,
-          draft: host.identityDraft,
-        });
-      }
+      this.retainCurrentIdentity();
     }
     host.agentsSelectedId = selectedId;
     this.resetSelection();
-    let restoredIdentity = false;
-    if (selectedId) {
-      const retained = this.identities.get(selectedId);
-      this.identities.delete(selectedId);
-      if (retained?.profileId === profileId) {
-        host.identityDraft = retained.draft;
-        restoredIdentity = true;
-      }
-    }
+    const restoredIdentity = this.restoreIdentity(selectedId, profileId);
     const files = selectedId ? this.files.get(selectedId) : undefined;
     if (files && selectedId) {
       this.files.delete(selectedId);
@@ -89,5 +141,6 @@ export class AgentSelectionDrafts {
   clear() {
     this.files.clear();
     this.identities.clear();
+    this.lifetime?.saves.clear();
   }
 }

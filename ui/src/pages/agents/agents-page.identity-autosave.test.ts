@@ -117,3 +117,88 @@ it("retains a newer identity edit for its agent when selection changes during a 
     selection.dispose();
   }
 });
+
+it("saves the newest edit after leaving and returning while an older save is in flight", async () => {
+  const firstUpdate = createDeferred<object>();
+  const request = vi.fn(async (method: string, params: { name?: string }) => {
+    if (method === "agents.update" && params.name === "First name") {
+      return firstUpdate.promise;
+    }
+    return {};
+  });
+  const client = { request } as unknown as GatewayBrowserClient;
+  const agents = agentsCapability(async () => ({ agentId: "main", workspace: "main", files: [] }));
+  const agentIdentity = {
+    invalidate: vi.fn(),
+    ensure: vi.fn(async () => undefined),
+    get: vi.fn(() => null),
+    entries: vi.fn(() => []),
+    subscribe: vi.fn(() => () => undefined),
+  } as unknown as ApplicationContext["agentIdentity"];
+  const context = {
+    ...pageContext(gateway(snapshot(client)), agents, { agentIdentity }),
+    runtimeConfig: {
+      subscribe: vi.fn(() => () => undefined),
+      runExternalMutation: async (task: (client: GatewayBrowserClient) => Promise<unknown>) => ({
+        ok: true as const,
+        value: await task(client),
+        refresh: { ok: true as const },
+      }),
+    } as unknown as ApplicationContext["runtimeConfig"],
+  };
+
+  const firstPage = createAgentsPage();
+  firstPage.context = context;
+  firstPage.connect();
+  firstPage.agentsSelectedId = "main";
+  firstPage.identityDraft = { name: "First name", emoji: null, avatar: null };
+  firstPage.scheduleIdentitySave(0);
+  await vi.waitFor(() =>
+    expect(request).toHaveBeenCalledWith("agents.update", {
+      agentId: "main",
+      name: "First name",
+    }),
+  );
+
+  firstPage.identityDraft = { name: "Second name", emoji: null, avatar: null };
+  firstPage.scheduleIdentitySave(30);
+  firstPage.disconnect();
+
+  const secondPage = createAgentsPage();
+  secondPage.context = context;
+  secondPage.connect();
+  await secondPage.refreshAgents("ensure");
+  expect(secondPage.identityDraft.name).toBe("Second name");
+  expect(request).toHaveBeenCalledTimes(1);
+
+  firstUpdate.resolve({});
+  await vi.waitFor(() =>
+    expect(request).toHaveBeenCalledWith("agents.update", {
+      agentId: "main",
+      name: "Second name",
+    }),
+  );
+});
+
+it("does not restore a retained identity draft for a different profile", async () => {
+  const client = { request: vi.fn(async () => ({})) } as unknown as GatewayBrowserClient;
+  const agents = agentsCapability(async () => ({ agentId: "main", workspace: "main", files: [] }));
+  const currentGateway = gateway({ ...snapshot(client), selfUser: { id: "alice" } as never });
+  const context = pageContext(currentGateway, agents);
+
+  const firstPage = createAgentsPage();
+  firstPage.context = context;
+  firstPage.connect();
+  firstPage.agentsSelectedId = "main";
+  firstPage.identityDraft = { name: "Alice's draft", emoji: null, avatar: null };
+  firstPage.disconnect();
+
+  Object.assign(currentGateway, {
+    snapshot: { ...snapshot(client), selfUser: { id: "bob" } },
+  });
+  const secondPage = createAgentsPage();
+  secondPage.context = context;
+  secondPage.connect();
+  await secondPage.refreshAgents("ensure");
+  expect(secondPage.identityDraft.name).toBeNull();
+});

@@ -55,6 +55,7 @@ export type TestAgentsPage = AgentFilesState & {
     hostDisconnected: () => void;
   };
   applyRoute: () => void;
+  connect: () => void;
   readonly viewProps: AgentsPageState["viewProps"];
   disconnect: () => void;
   gateway: {
