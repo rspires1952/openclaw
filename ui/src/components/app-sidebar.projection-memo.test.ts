@@ -7,6 +7,7 @@ import type { GatewaySessionRow } from "../api/types.ts";
 import { createChatSubmissions } from "../app/chat-submissions.ts";
 import type { ApplicationOverlaySnapshot } from "../app/overlays-types.ts";
 import { rosterActivityStore } from "../lib/agents/roster-activity-store.ts";
+import * as sessionDisplay from "../lib/session-display.ts";
 import {
   SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD,
   sessionPullRequestsForGateway,
@@ -132,6 +133,28 @@ async function expectRowRefresh(sidebar: Sidebar, change: () => void) {
 }
 
 describe("sidebar projection memo", () => {
+  it("retains unaffected row and subtree projections across a one-row publication", async () => {
+    const child = session("child", { parentSessionKey: key("parent") });
+    const parent = session("parent", { childSessions: [child.key] });
+    const stable = session("stable");
+    const { sidebar, publish } = await mount([parent, child, stable]);
+    const firstParent = sidebar.findSidebarMenuSessionByKey(parent.key)!;
+    const firstChild = firstParent.children[0]!;
+    const firstStable = sidebar.findSidebarMenuSessionByKey(stable.key)!;
+    const firstPin = sidebar.findSidebarSessionByKey(stable.key);
+    const labels = vi.spyOn(sessionDisplay, "resolveSessionDisplayName");
+    publish([parent, { ...child, label: "Child updated", unread: true }, stable]);
+    await settleLitElement(sidebar);
+    const nextParent = sidebar.findSidebarMenuSessionByKey(parent.key)!;
+    expect(nextParent).not.toBe(firstParent);
+    expect(nextParent.children[0]).not.toBe(firstChild);
+    expect(nextParent.children[0]?.label).toBe("Child updated");
+    expect(nextParent.unreadChildCount).toBe(1);
+    expect(sidebar.findSidebarMenuSessionByKey(stable.key)).toBe(firstStable);
+    expect(sidebar.findSidebarSessionByKey(stable.key)).toBe(firstPin);
+    expect(labels).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps a pending boot read across connected view recreation and retires it on detach", async () => {
     const pending = createDeferred<SidebarSnapshotModel | null>();
     const read = vi

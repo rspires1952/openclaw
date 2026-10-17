@@ -64,12 +64,7 @@ export function createSessionRosterObservations(
   lists: ReadonlyMap<string, ObservedSessionList>,
 ) {
   const provenance = createSessionRowProvenance();
-  const { owner, identity, inheritRow, mergeRow, rowRevision } = provenance;
-  let needsFullProjection = true;
-  const observeReadRow: typeof provenance.observeReadRow = (...args) => {
-    needsFullProjection = true;
-    provenance.observeReadRow(...args);
-  };
+  const { owner, identity, inheritRow, mergeRow, rowRevision, observeReadRow } = provenance;
   const registeredRows = new Set<RegisteredRow>();
   const invalidatedRows = new Map<RegisteredRow, string | undefined>();
   const refresh = createSessionEventRefreshCoordinator({
@@ -223,9 +218,6 @@ export function createSessionRosterObservations(
         event?.results.set(entry, projected.eventResult);
       }
     }
-    if (changedLists.length > 0 || changedRows.length > 0) {
-      needsFullProjection = true;
-    }
     return {
       changed: changedLists.length > 0 || changedRows.length > 0,
       notify() {
@@ -318,7 +310,6 @@ export function createSessionRosterObservations(
   const observations = {
     descriptions,
     reset() {
-      needsFullProjection = true;
       provenance.reset();
       registeredRows.clear();
       invalidatedRows.clear();
@@ -369,18 +360,8 @@ export function createSessionRosterObservations(
           matchesExistingSession(row, key, agentId ?? ownerAgentId ?? null),
       ),
     mergeRows: merge,
-    projectFields: (...args: Parameters<typeof projectFields>) => {
-      needsFullProjection = true;
-      return projectFields(...args);
-    },
+    projectFields,
     prepareProjection,
-    prepareEventProjection: (rows?: readonly Pick<GatewaySessionRow, "sessionId">[]) =>
-      prepareProjection(needsFullProjection ? undefined : rows),
-    completeEventProjection: () => {
-      // Reads and local changes converge once across all held views. Until the
-      // next such change, only the event's incarnations can donate new facts.
-      needsFullProjection = false;
-    },
     projectRows: (rows: readonly GatewaySessionRow[]) => prepareProjection(rows).projectRows(rows),
     stageObservedRows,
     stageManagedResults,
@@ -410,10 +391,8 @@ export function createSessionRosterObservations(
       provenance,
       stage: stageManagedResults,
     }),
-    copyRow: (row: GatewaySessionRow, patch: Partial<GatewaySessionRow>) => {
-      needsFullProjection = true;
-      return inheritRow({ ...row, ...patch }, row);
-    },
+    copyRow: (row: GatewaySessionRow, patch: Partial<GatewaySessionRow>) =>
+      inheritRow({ ...row, ...patch }, row),
     captureReconciliation(revision: number) {
       const scope = host.connection.capture();
       return {

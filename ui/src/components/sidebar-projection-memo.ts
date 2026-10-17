@@ -223,6 +223,7 @@ export function projectSidebarNavigation(
     compareSessions,
     highlightCurrentSession: isSessionRouteId(host.activeRouteId) && !creating,
     runtimeSampledAtByRow,
+    rowCache: host.sessionProjection.rows,
     loadingChildSessionKeys: host.sessionData.loadingChildSessionKeys,
     outboxAttentionCountForSessionKey: (key) =>
       host.storedOutboxes?.attentionCountForSession(key) ?? 0,

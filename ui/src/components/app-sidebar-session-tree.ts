@@ -15,6 +15,7 @@ import {
   type SidebarRecentSession,
   type SidebarSessionAttention,
 } from "./app-sidebar-session-types.ts";
+import type { SidebarSessionRowCache } from "./sidebar-session-row-cache.ts";
 
 function summarizeChildren(
   children: readonly SidebarRecentSession[],
@@ -82,6 +83,7 @@ function summarizeChildren(
  */
 export function projectSessionTree(params: {
   roots: readonly GatewaySessionRow[];
+  cache?: SidebarSessionRowCache;
   mainSessionKeys?: ReadonlySet<string>;
   rowsByKey: ReadonlyMap<string, GatewaySessionRow>;
   loadingChildKeys: ReadonlySet<string>;
@@ -148,56 +150,74 @@ export function projectSessionTree(params: {
     const unloadedChildKeys = childSessionKeys.filter((key) => !rowsByKey.has(key));
     // Parents expose only direct unloaded keys. Loaded descendants fold transitively;
     // terminal outcomes still require child details.
-    const unloadedAttention = unloadedChildKeys.map((key) => ({
-      key,
-      attention: resolveAttention({
+    const loadingChildren = [...childLoadParentKeys].some((key) => loadingChildKeys.has(key));
+    const project = (): SidebarRecentSession => {
+      const unloadedAttention = unloadedChildKeys.map((key) => ({
         key,
-        agentId: parseAgentSessionKey(key)?.agentId ?? projected.agentId,
-      }),
-    }));
-    const summary = summarizeChildren(
-      descendants,
-      unloadedAttention.map((entry) => entry.attention),
-    );
-    const subagentSummary = summarizeChildren(
-      descendants,
-      unloadedAttention
-        .filter((entry) => isSubagentSessionKey(entry.key))
-        .map((entry) => entry.attention),
-      true,
-    );
-    const attention = summarizeSidebarSessionAttention([projected.attention, summary.attention]);
-    // Sum descendants before adding the parent's conflicts, then clamp once.
-    const workspaceConflictCount = Math.min(
-      Number.MAX_SAFE_INTEGER,
-      (projected.workspaceConflictCount ?? 0) + summary.workspaceConflictCount,
-    );
-    // The Gateway flag includes the row's own live or queued subagent run.
-    // Only an idle row proves unloaded descendant work from that flag alone.
-    const hasUnloadedDescendantRun =
-      row.archived !== true && !projected.hasActiveRun && row.hasActiveSubagentRun;
-    subagentSummary.runningChildCount = Math.max(
-      subagentSummary.runningChildCount,
-      hasUnloadedDescendantRun && summary.runningChildCount === 0 ? 1 : 0,
-    );
-    return {
-      ...projected,
-      ...summary,
-      ownAttention: projected.attention,
-      ownWorkspaceConflictCount: projected.workspaceConflictCount,
-      subagentSummary,
-      attention,
-      childSessionKeys: navigationChildKeys,
-      // Hidden runs still need reads to discover their persistent descendants.
-      childLoadParentKeys: childSessionKeys.length > 0 ? [...childLoadParentKeys] : [],
-      children,
-      loadingChildren: [...childLoadParentKeys].some((key) => loadingChildKeys.has(key)),
-      containsActiveDescendant: children.some(
-        (child) => child.active || child.visuallyActive || child.containsActiveDescendant,
-      ),
-      workspaceConflictCount: workspaceConflictCount || undefined,
-      runningChildCount: Math.max(summary.runningChildCount, hasUnloadedDescendantRun ? 1 : 0),
+        attention: resolveAttention({
+          key,
+          agentId: parseAgentSessionKey(key)?.agentId ?? projected.agentId,
+        }),
+      }));
+      const summary = summarizeChildren(
+        descendants,
+        unloadedAttention.map((entry) => entry.attention),
+      );
+      const subagentSummary = summarizeChildren(
+        descendants,
+        unloadedAttention
+          .filter((entry) => isSubagentSessionKey(entry.key))
+          .map((entry) => entry.attention),
+        true,
+      );
+      const attention = summarizeSidebarSessionAttention([projected.attention, summary.attention]);
+      // Sum descendants before adding the parent's conflicts, then clamp once.
+      const workspaceConflictCount = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        (projected.workspaceConflictCount ?? 0) + summary.workspaceConflictCount,
+      );
+      // The Gateway flag includes the row's own live or queued subagent run.
+      // Only an idle row proves unloaded descendant work from that flag alone.
+      const hasUnloadedDescendantRun =
+        row.archived !== true && !projected.hasActiveRun && row.hasActiveSubagentRun;
+      subagentSummary.runningChildCount = Math.max(
+        subagentSummary.runningChildCount,
+        hasUnloadedDescendantRun && summary.runningChildCount === 0 ? 1 : 0,
+      );
+      return {
+        ...projected,
+        ...summary,
+        ownAttention: projected.attention,
+        ownWorkspaceConflictCount: projected.workspaceConflictCount,
+        subagentSummary,
+        attention,
+        childSessionKeys: navigationChildKeys,
+        // Hidden runs still need reads to discover their persistent descendants.
+        childLoadParentKeys: childSessionKeys.length > 0 ? [...childLoadParentKeys] : [],
+        children,
+        loadingChildren,
+        containsActiveDescendant: children.some(
+          (child) => child.active || child.visuallyActive || child.containsActiveDescendant,
+        ),
+        workspaceConflictCount: workspaceConflictCount || undefined,
+        runningChildCount: Math.max(summary.runningChildCount, hasUnloadedDescendantRun ? 1 : 0),
+      };
     };
+    return (
+      params.cache?.read(
+        projected,
+        [
+          loadingChildren,
+          resolveAttention,
+          childSessionKeys.length,
+          ...childSessionKeys,
+          unloadedChildKeys.length,
+          ...unloadedChildKeys,
+          ...descendants,
+        ],
+        project,
+      ) ?? project()
+    );
   };
 
   const rootKeys = new Set(roots.filter((row) => row.archived !== true).map((row) => row.key));

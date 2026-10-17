@@ -24,6 +24,7 @@ import {
   collectPromotedMainChildRows,
   collectSidebarSessionChildKeys,
 } from "./app-sidebar-session-parent.ts";
+import type { SidebarSessionProjection } from "./app-sidebar-session-projection.ts";
 import { projectSessionTree } from "./app-sidebar-session-tree.ts";
 import {
   SIDEBAR_SESSION_NO_ATTENTION,
@@ -38,6 +39,7 @@ type AgentSessionRowsHost = {
     | Pick<ApplicationContext, "agents" | "gateway" | "sessions">
     | undefined;
   readonly sessionData: SessionDataOwner;
+  readonly sessionProjection?: SidebarSessionProjection;
   visibleSessionCatalogs(): readonly SessionCatalog[];
   selectedAgentMainSessionKey(agentId: string): string;
   readonly sessionsShowCron: boolean;
@@ -260,6 +262,7 @@ export function projectSidebarAgentSessionRows({
   // fetched child rows: a catalog-adopted promoted child intentionally
   // renders as its live row inside the Coding catalog, never as a thread.
   const projected = projectSessionTree({
+    cache: host.sessionProjection?.trees,
     mainSessionKeys,
     roots: orderedRootRows.filter(
       (row) => !adopted.has(row.key) && (!grouped || visibleRowsByKey.has(row.key)),
@@ -325,6 +328,7 @@ export function projectSidebarHomeSession({
   const scopedRow = { ...row, agentId, sidebarRoot: true };
   const own = navigationState.toSidebarSession(scopedRow);
   const home = projectSessionTree({
+    cache: host.sessionProjection?.trees,
     roots: [scopedRow],
     mainSessionKeys: new Set([row.key, host.selectedAgentMainSessionKey(agentId)]),
     rowsByKey: collectSidebarSessionRowsByKey({

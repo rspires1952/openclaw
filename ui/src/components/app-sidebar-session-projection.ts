@@ -33,6 +33,7 @@ import { sessionAttentionSubtitle } from "./session-attention-presentation.ts";
 import { areSessionCatalogsSettled, type SessionDataInputs } from "./session-data-catalog.ts";
 import type { SessionDataOwner } from "./session-data.ts";
 import { resolveSidebarSessionSubtitle } from "./session-row-subtitle.ts";
+import { SidebarSessionRowCache } from "./sidebar-session-row-cache.ts";
 import { summarizeTeamSessionSlots } from "./solid/session-presentation.tsx";
 
 const SIDEBAR_CREATED_ORDER_CAP = 1_000;
@@ -135,6 +136,9 @@ function isOperatorCriticalSubtitle(session: SidebarRecentSession): boolean {
 }
 
 export class SidebarSessionProjection {
+  readonly rows = new SidebarSessionRowCache();
+  readonly trees = new SidebarSessionRowCache();
+
   constructor(private readonly now: () => number = () => Date.now()) {}
 
   // Record frame admission only; owner.updated can precede child DOM bindings.

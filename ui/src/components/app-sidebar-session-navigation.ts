@@ -147,6 +147,8 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
   readonly pinnedSessions = createSidebarPinnedSessions(this);
   readonly sessionProjection = new SidebarSessionProjection();
   private readonly navigationMemo = new SidebarProjectionMemo<SidebarSessionNavigationState>();
+  private readonly zoneMemo = new SidebarProjectionMemo<ReturnType<typeof personalSidebarZone>>();
+  private readonly visibleOrderMemo = new SidebarProjectionMemo<SidebarRecentSession[]>();
   private readonly rowsMemo = new SidebarProjectionMemo<SidebarRecentSession[]>();
   private readonly catalogsMemo = new SidebarProjectionMemo<SidebarSessionCatalog[]>();
   private readonly sectionsMemo = new SidebarProjectionMemo<SidebarVisibleSections>();
@@ -349,6 +351,9 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
     return pendingKey ? result.rows.filter((row) => row.key !== pendingKey) : result.rows;
   }
 
+  private readonly resolveAgentStatusNote = (row: GatewaySessionRow) =>
+    this.attention.resolveSessionAgentStatus(row)?.note;
+
   getSessionNavigationState(): SidebarSessionNavigationState {
     const data = this.sessionData;
     const currentResult = this.groupedSessionSource?.result ?? data.sessionsResult;
@@ -363,7 +368,7 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
           this,
           createSidebarSessionRowsComparator(this.readSidebarSessionSortOptions),
           this.runtimeSampledAtByRow,
-          (row) => this.attention.resolveSessionAgentStatus(row)?.note,
+          this.resolveAgentStatusNote,
         ),
     );
   }
@@ -447,7 +452,23 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
   }
 
   reconciledSidebarZone(rows = this.selectedAgentSessionRows(this.getSessionNavigationState())) {
-    return personalSidebarZone(this, rows);
+    return this.zoneMemo.read(
+      () => [
+        rows,
+        this.sidebarEntries,
+        this.sidebarSnapshot,
+        this.sidebarPluginSnapshot,
+        this.getRouteSessionKey(),
+        this.context,
+        this.context?.sessions.revision,
+        this.navigationCatalog.dashboards,
+        this.pinnedSessions.revision,
+        this.context?.plugins.registryStatus,
+        this.context?.gateway.snapshot.hello,
+        ...this.pluginNavigation(),
+      ],
+      () => personalSidebarZone(this, rows),
+    );
   }
 
   /** Explicit personal unpins remove a reference, never shared session metadata. */
@@ -463,7 +484,11 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
   protected visibleSessionRowsInOrder(): SidebarRecentSession[] {
     const rows = this.selectedAgentSessionRows(this.getSessionNavigationState());
     const { visibleRows } = this.zonedVisibleSections(rows);
-    return this.sessionProjection.visibleRowsInOrder(this.reconciledSidebarZone(rows), visibleRows);
+    const zone = this.reconciledSidebarZone(rows);
+    return this.visibleOrderMemo.read(
+      () => [zone, visibleRows],
+      () => this.sessionProjection.visibleRowsInOrder(zone, visibleRows),
+    );
   }
 
   protected visibleSessionTreeInOrder(): SidebarRecentSession[] {

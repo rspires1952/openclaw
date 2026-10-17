@@ -91,6 +91,7 @@ export function createSidebarPinnedSessions(host: {
   readonly sessionDataContext: PersonalNavigationHost["sessionDataContext"];
   readonly sessionData: Pick<SessionDataOwner, "requestSessionDataUpdate">;
 }) {
+  let revision = 0;
   let source: ApplicationContext["sessions"] | undefined;
   let scope: SessionConnectionScope | null = null;
   const requested = new Map<string, "pending" | "settled">();
@@ -101,6 +102,7 @@ export function createSidebarPinnedSessions(host: {
     if (nextSource !== source || !scope || !nextSource?.isConnectionScopeCurrent(scope)) {
       requested.clear();
       rows.clear();
+      revision += 1;
       source = nextSource;
       scope = source?.captureConnectionScope() ?? null;
     }
@@ -114,6 +116,7 @@ export function createSidebarPinnedSessions(host: {
     }
     for (const row of snapshot) {
       if (!rows.has(row.key) && requested.get(row.key) !== "settled") {
+        revision += 1;
         rows.set(row.key, {
           key: row.key,
           kind: "direct",
@@ -154,6 +157,7 @@ export function createSidebarPinnedSessions(host: {
         } else if (!rows.delete(key)) {
           return;
         }
+        revision += 1;
         if (host.isConnected) {
           host.sessionData.requestSessionDataUpdate();
         }
@@ -180,7 +184,15 @@ export function createSidebarPinnedSessions(host: {
     return rows.get(key);
   }
 
-  return { synchronize, seed, get };
+  return {
+    synchronize,
+    seed,
+    get,
+    get revision() {
+      synchronize();
+      return revision;
+    },
+  };
 }
 
 export function personalSidebarZone(host: PersonalNavigationHost, rows: SidebarRecentSession[]) {
@@ -217,11 +229,12 @@ export function personalSidebarZone(host: PersonalNavigationHost, rows: SidebarR
 export function projectUnpinnedSessionRows(
   rows: readonly SidebarRecentSession[],
 ): SidebarRecentSession[] {
-  return rows.map((row) => ({
-    ...row,
-    pinned: false,
-    children: projectUnpinnedSessionRows(row.children),
-  }));
+  return rows.map((row) => {
+    const children = projectUnpinnedSessionRows(row.children);
+    return !row.pinned && children.every((child, index) => child === row.children[index])
+      ? row
+      : { ...row, pinned: false, children };
+  });
 }
 
 export function personalSidebarOwnerFilterId(

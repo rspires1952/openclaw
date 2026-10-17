@@ -49,7 +49,7 @@ export function createSessionRosterProjection(
       return mergeRow(current, row, agentId);
     });
   };
-  const prepareProjection = (requestedRows?: readonly Pick<GatewaySessionRow, "sessionId">[]) => {
+  const prepareProjection = (requestedRows?: readonly GatewaySessionRow[]) => {
     // Identity includes the verbatim session ID; other IDs cannot donate facts.
     // Event planning still captures every held identity once when no rows are supplied.
     const sessionIds =
@@ -57,9 +57,6 @@ export function createSessionRosterProjection(
       new Set(requestedRows.flatMap((row) => (row.sessionId?.trim() ? [row.sessionId] : [])));
     const { state, primaryRows, observedRows } = captureHeldRows(sessionIds);
     const projectFields = (row: GatewaySessionRow, agentId?: string | null) => {
-      if (sessionIds && !sessionIds.has(row.sessionId)) {
-        return row;
-      }
       const key = identity(row, agentId);
       if (!key) {
         return row;
