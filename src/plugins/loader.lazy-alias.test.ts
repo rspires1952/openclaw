@@ -39,10 +39,6 @@ import { createPluginRecord } from "./status.test-fixtures.js";
 beforeEach(() => resetPluginCache());
 const roots: string[] = [];
 const requireFixture = createRequire(import.meta.url);
-type Metadata = {
-  load: (name: string) => unknown;
-  loadEsm: (name: string) => Promise<unknown>;
-};
 
 function writeFile(root: string, name: string, content: string) {
   const target = path.join(root, name);
@@ -55,17 +51,19 @@ function fixture() {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-lazy-alias-")));
   roots.push(root);
   fs.mkdirSync(path.join(root, "extensions"));
-  const write = (name: string, content: string) => writeFile(root, name, content);
-  const json = (name: string, value: unknown) => write(name, JSON.stringify(value));
-  json("package.json", {
-    name: "openclaw",
-    type: "module",
-    bin: { openclaw: "./openclaw.mjs" },
-    exports: {
-      "./plugin-sdk/used": "./dist/plugin-sdk/used.js",
-      "./plugin-sdk/unused": "./dist/plugin-sdk/unused.js",
-    },
-  });
+  writeFile(
+    root,
+    "package.json",
+    JSON.stringify({
+      name: "openclaw",
+      type: "module",
+      bin: { openclaw: "./openclaw.mjs" },
+      exports: {
+        "./plugin-sdk/used": "./dist/plugin-sdk/used.js",
+        "./plugin-sdk/unused": "./dist/plugin-sdk/unused.js",
+      },
+    }),
+  );
   const used = writeFile(root, "dist/plugin-sdk/used.js", 'export const value = "dist";');
   const unused = writeFile(root, "dist/plugin-sdk/unused.js", 'export const value = "unused";');
   writeFile(root, "src/plugin-sdk/used.ts", 'export const value: string = "source";');
@@ -74,15 +72,7 @@ function fixture() {
     "dist/extensions/demo/cli-metadata.cjs",
     'module.exports = { marker: "metadata", load: (name) => require(name), loadEsm: (name) => import(name) };',
   );
-  const loader = () =>
-    createPluginModuleLoader({ devSourceRoot: root, pluginSdkResolution: "dist" });
-  const privateAlias = (name: string) => {
-    json("scripts/lib/plugin-sdk-private-local-only-subpaths.json", [name]);
-    write(`dist/plugin-sdk/${name}.js`, "export const privateValue = true;");
-  };
-  const install = (pluginModulePath = entry) =>
-    installOpenClawPluginSdkNativeResolver({ pluginModulePath, devSourceRoot: root });
-  return { root, entry, used, unused, write, json, loader, privateAlias, install };
+  return { root, entry, used, unused };
 }
 
 afterEach(() => {
@@ -164,13 +154,15 @@ describe("native plugin alias preparation", () => {
     "preserves explicit %s SDK preference without native module hooks in %s",
     async (pluginSdkResolution, environment, expected) => {
       const f = fixture();
-      const source = f.write(
+      const source = writeFile(
+        f.root,
         "external/index.ts",
         'export { value } from "openclaw/plugin-sdk/used";',
       );
       // Native resolver hooks live for the process. A no-hook runtime must not
       // mark this worker's resolver installed before the native-alias cases run.
-      const probe = f.write(
+      const probe = writeFile(
+        f.root,
         "no-native-hooks.mts",
         [
           'import Module from "node:module";',
@@ -206,17 +198,19 @@ describe("native plugin alias preparation", () => {
     "evaluates shared SDK imports before concurrent lazy CJS plugins require them (%s)",
     async (sdkImport) => {
       const f = fixture();
-      f.write("dist/plugin-sdk/leaf.js", 'export const value = "dist";');
-      f.write("dist/plugin-sdk/used.js", 'export { value } from "./leaf.js";');
-      const bundledEntry = f.write(
+      writeFile(f.root, "dist/plugin-sdk/leaf.js", 'export const value = "dist";');
+      writeFile(f.root, "dist/plugin-sdk/used.js", 'export { value } from "./leaf.js";');
+      const bundledEntry = writeFile(
+        f.root,
         "dist/extensions/bundled/index.cjs",
         `module.exports = { start: () => import("${sdkImport === "alias" ? "openclaw/plugin-sdk/used" : "../../plugin-sdk/used.js"}") };`,
       );
       const pluginDir = path.join(f.root, "external");
-      f.json("external/package.json", { name: "external-fixture" });
-      f.write("external/lazy.cjs", 'module.exports = require("openclaw/plugin-sdk/used");');
-      const entry = f.write(
-        "external/index.cjs",
+      writeFile(pluginDir, "package.json", JSON.stringify({ name: "external-fixture" }));
+      writeFile(pluginDir, "lazy.cjs", 'module.exports = require("openclaw/plugin-sdk/used");');
+      const entry = writeFile(
+        pluginDir,
+        "index.cjs",
         'module.exports = { start: () => import("./lazy.cjs") };',
       );
       const record = createPluginRecord({
@@ -227,7 +221,7 @@ describe("native plugin alias preparation", () => {
       });
       const registry = createEmptyPluginRegistry();
       registry.plugins.push(record);
-      const load = f.loader();
+      const load = createPluginModuleLoader({ devSourceRoot: f.root, pluginSdkResolution: "dist" });
       const bundled = load(bundledEntry) as { start: () => Promise<{ value: string }> };
       const external = load(entry, { record, rootDir: pluginDir, registry }) as {
         start: () => Promise<{ default: { value: string } }>;
@@ -250,15 +244,24 @@ describe("native plugin alias preparation", () => {
 
   it("defers the full map until a workspace alias is demanded", () => {
     const f = fixture();
-    f.write("dist/retry/index.js", 'export const value = "family";');
-    f.json("extensions/fixture-owner/package.json", { name: "@openclaw/fixture-owner" });
-    f.write("extensions/fixture-owner/diagnostic-api.ts", 'export const value = "source";');
-    const entry = f.write(
+    writeFile(f.root, "dist/retry/index.js", 'export const value = "family";');
+    writeFile(
+      f.root,
+      "extensions/fixture-owner/package.json",
+      JSON.stringify({ name: "@openclaw/fixture-owner" }),
+    );
+    writeFile(
+      f.root,
+      "extensions/fixture-owner/diagnostic-api.ts",
+      'export const value = "source";',
+    );
+    const entry = writeFile(
+      f.root,
       "dist/extensions/demo/family.cjs",
       'module.exports = require("@openclaw/retry");',
     );
     const read = vi.spyOn(fs, "readFileSync");
-    const load = f.loader();
+    const load = createPluginModuleLoader({ devSourceRoot: f.root, pluginSdkResolution: "dist" });
     expect(load(f.entry)).toMatchObject({ marker: "metadata" });
     expect(read.mock.calls.filter(([target]) => target === f.unused)).toEqual([]);
     expect(load(entry)).toMatchObject({ value: "family" });
@@ -269,8 +272,11 @@ describe("native plugin alias preparation", () => {
     const f = fixture();
     const outside = fixture();
     const read = vi.spyOn(fs, "readFileSync");
-    const load = f.loader();
-    const metadata = load(f.entry) as Metadata;
+    const load = createPluginModuleLoader({ devSourceRoot: f.root, pluginSdkResolution: "dist" });
+    const metadata = load(f.entry) as {
+      load: (name: string) => unknown;
+      loadEsm: (name: string) => Promise<unknown>;
+    };
     expect(metadata.load("node:path")).toHaveProperty("join");
     expect(() => metadata.load("@openclaw/plugin-sdk-other/used")).toThrow();
     expect(() => metadata.load("@openclaw/not-a-workspace/used")).toThrow();
@@ -294,10 +300,10 @@ describe("native plugin alias preparation", () => {
       const f = fixture();
       const outside = fixture();
       fs.writeFileSync(f.used, "await Promise.resolve(); export const url = import.meta.url;");
-      f.install();
+      installOpenClawPluginSdkNativeResolver({ pluginModulePath: f.entry, devSourceRoot: f.root });
       const metadata = createRequire(kind === "unregistered" ? outside.entry : f.entry)(
         kind === "unregistered" ? outside.entry : f.entry,
-      ) as Metadata;
+      ) as { loadEsm: (name: string) => Promise<unknown> };
       const url = pathToFileURL(f.used);
       if (kind === "query") {
         url.search = "?generation=1";
@@ -308,14 +314,22 @@ describe("native plugin alias preparation", () => {
 
   it("captures private QA denial before late use even if ambient authorization changes", async () => {
     const f = fixture();
-    f.privateAlias("qa-runtime");
+    writeFile(
+      f.root,
+      "scripts/lib/plugin-sdk-private-local-only-subpaths.json",
+      JSON.stringify(["qa-runtime"]),
+    );
+    writeFile(f.root, "dist/plugin-sdk/qa-runtime.js", "export const privateValue = true;");
     vi.stubEnv("OPENCLAW_ENABLE_PRIVATE_QA_CLI", "0");
-    const load = f.loader();
-    const metadata = load(f.entry) as Metadata;
+    const load = createPluginModuleLoader({ devSourceRoot: f.root, pluginSdkResolution: "dist" });
+    const metadata = load(f.entry) as {
+      load: (name: string) => unknown;
+      loadEsm: (name: string) => Promise<unknown>;
+    };
     vi.stubEnv("OPENCLAW_ENABLE_PRIVATE_QA_CLI", "1");
     expect(() => metadata.load("@openclaw/plugin-sdk/qa-runtime")).toThrow();
     await expect(metadata.loadEsm("@openclaw/plugin-sdk/qa-runtime")).rejects.toThrow();
-    f.install();
+    installOpenClawPluginSdkNativeResolver({ pluginModulePath: f.entry, devSourceRoot: f.root });
     expect(metadata.load("@openclaw/plugin-sdk/qa-runtime")).toMatchObject({ privateValue: true });
     await expect(metadata.loadEsm("@openclaw/plugin-sdk/qa-runtime")).resolves.toMatchObject({
       privateValue: true,
@@ -325,14 +339,19 @@ describe("native plugin alias preparation", () => {
   it("does not reuse a bundled private alias grant for an external plugin", () => {
     const f = fixture();
     vi.stubEnv("OPENCLAW_ENABLE_PRIVATE_QA_CLI", "0");
-    f.privateAlias("demoted-helper");
-    const external = f.write("external/index.cjs", "module.exports = {};");
-    f.json("external/package.json", { name: "external-fixture" });
-    f.install();
+    writeFile(
+      f.root,
+      "scripts/lib/plugin-sdk-private-local-only-subpaths.json",
+      JSON.stringify(["demoted-helper"]),
+    );
+    writeFile(f.root, "dist/plugin-sdk/demoted-helper.js", "export const privateValue = true;");
+    const external = writeFile(f.root, "external/index.cjs", "module.exports = {};");
+    writeFile(f.root, "external/package.json", JSON.stringify({ name: "external-fixture" }));
+    installOpenClawPluginSdkNativeResolver({ pluginModulePath: f.entry, devSourceRoot: f.root });
     expect(createRequire(f.entry)("@openclaw/plugin-sdk/demoted-helper")).toMatchObject({
       privateValue: true,
     });
-    f.install(external);
+    installOpenClawPluginSdkNativeResolver({ pluginModulePath: external, devSourceRoot: f.root });
     expect(() => createRequire(external).resolve("@openclaw/plugin-sdk/demoted-helper")).toThrow();
   });
 
@@ -340,11 +359,19 @@ describe("native plugin alias preparation", () => {
     const f = fixture();
     vi.stubEnv("OPENCLAW_ENABLE_PRIVATE_QA_CLI", "0");
     const packageName = "@openclaw/llama-cpp-provider";
-    const packageRoot = `node_modules/${packageName}`;
-    const manifest = f.json(`${packageRoot}/package.json`, { name: "external-fixture" });
-    const entry = f.write(`${packageRoot}/index.cjs`, "module.exports = {};");
-    f.write("dist/plugin-sdk/ssrf-runtime-internal.js", "export const privateValue = true;");
-    f.install(entry);
+    const packageRoot = path.join(f.root, "node_modules", packageName);
+    const manifest = writeFile(
+      packageRoot,
+      "package.json",
+      JSON.stringify({ name: "external-fixture" }),
+    );
+    const entry = writeFile(packageRoot, "index.cjs", "module.exports = {};");
+    writeFile(
+      f.root,
+      "dist/plugin-sdk/ssrf-runtime-internal.js",
+      "export const privateValue = true;",
+    );
+    installOpenClawPluginSdkNativeResolver({ pluginModulePath: entry, devSourceRoot: f.root });
     fs.writeFileSync(manifest, JSON.stringify({ name: packageName }));
     const resolve = () =>
       createRequire(entry).resolve("@openclaw/plugin-sdk/ssrf-runtime-internal");
@@ -357,7 +384,8 @@ describe("native plugin alias preparation", () => {
     vi.stubEnv("OPENCLAW_DEV_SOURCE_ROOT", a.root);
     vi.stubEnv("NODE_ENV", "production");
     fs.writeFileSync(a.used, 'export { value } from "./missing.js";');
-    const entry = a.write(
+    const entry = writeFile(
+      a.root,
       "extensions/demo/transform.ts",
       'import { value } from "@openclaw/plugin-sdk/used"; export const marker: string = value;',
     );
@@ -387,13 +415,13 @@ describe("native plugin alias preparation", () => {
   ] as const)("keeps late Commander action aliases for %s registration", async (registration) => {
     const runRegistration = async () => {
       const f = fixture();
+      const pluginDir = path.dirname(f.entry);
       // Use the supported entrypoint metadata fallback, including nested CLI descriptors.
       fs.unlinkSync(f.entry);
       const observed = path.join(f.root, "action.json");
-      const descriptors = [{ name: "late", description: "Late import", hasSubcommands: false }];
-      const parentPath = registration === "nodes" ? ["nodes"] : [];
-      const entry = f.write(
-        "dist/extensions/demo/index.cjs",
+      const entry = writeFile(
+        pluginDir,
+        "index.cjs",
         `module.exports = { id: "demo", register(api) {
       api.registerCli(({ program }) => program.command("late").action(async () => {
         const results = await Promise.allSettled([
@@ -403,18 +431,27 @@ describe("native plugin alias preparation", () => {
         require("node:fs").writeFileSync(${JSON.stringify(observed)}, JSON.stringify(results.map(result =>
           result.status === "fulfilled" ? result.value.value : { error: result.reason.code, message: result.reason.message }
         )));
-      }), ${JSON.stringify({ commands: ["late"], descriptors, parentPath })});
+      }), { commands: ["late"], descriptors: [{ name: "late", description: "Late import", hasSubcommands: false }], parentPath: ${JSON.stringify(registration === "nodes" ? ["nodes"] : [])} });
     } };`,
       );
-      f.json("dist/extensions/demo/package.json", {
-        name: "demo",
-        openclaw: { extensions: ["./index.cjs"] },
-      });
-      f.json("dist/extensions/demo/openclaw.plugin.json", {
-        id: "demo",
-        configSchema: { type: "object", properties: {} },
-        ...(registration === "nodes" ? {} : { cliCommands: descriptors }),
-      });
+      writeFile(
+        pluginDir,
+        "package.json",
+        JSON.stringify({ name: "demo", openclaw: { extensions: ["./index.cjs"] } }),
+      );
+      writeFile(
+        pluginDir,
+        "openclaw.plugin.json",
+        JSON.stringify({
+          id: "demo",
+          configSchema: { type: "object", properties: {} },
+          ...(registration === "nodes"
+            ? {}
+            : {
+                cliCommands: [{ name: "late", description: "Late import", hasSubcommands: false }],
+              }),
+        }),
+      );
       const cfg = {
         plugins: {
           allow: ["demo"],
@@ -430,7 +467,10 @@ describe("native plugin alias preparation", () => {
         OPENCLAW_DEV_SOURCE_ROOT: f.root,
       };
       const program = new Command().exitOverride();
-      const parse = () => program.parseAsync([...parentPath, "late"], { from: "user" });
+      const parse = () =>
+        program.parseAsync(registration === "nodes" ? ["nodes", "late"] : ["late"], {
+          from: "user",
+        });
       if (registration === "explicit") {
         const sessionCache = createPluginCache();
         const registrationCache = createPluginCache();
@@ -475,26 +515,28 @@ describe("native plugin alias preparation", () => {
           await registerPluginCliCommandsFromValidatedConfig(program, env, undefined, {
             mode: registration === "deferred" ? "lazy" : "eager",
           });
-        } else {
-          const name =
-            registration === "nodes"
-              ? "nodes"
-              : registration === "pairing-before"
-                ? "pairing"
-                : "plugins";
-          // Eager traversal forwards the active invocation to every core registrar. Memory's
-          // plugin-loading policy exercises both before/after branches without changing policy.
-          const argv =
-            registration === "nodes"
-              ? ["node", "openclaw", "nodes", "late"]
-              : ["node", "openclaw", "memory", "status"];
-          await registerSubCliByName(program, name, argv);
-          if (registration !== "nodes") {
-            const names = program.commands.map((command) => command.name());
-            expect(names.indexOf("late") < names.indexOf(name)).toBe(
-              registration === "pairing-before",
-            );
-          }
+          await parse();
+          expect(JSON.parse(fs.readFileSync(observed, "utf8"))).toEqual(["source", "unused"]);
+          return;
+        }
+        const name =
+          registration === "nodes"
+            ? "nodes"
+            : registration === "pairing-before"
+              ? "pairing"
+              : "plugins";
+        // Eager traversal forwards the active invocation to every core registrar. Memory's
+        // plugin-loading policy exercises both before/after branches without changing policy.
+        const argv =
+          registration === "nodes"
+            ? ["node", "openclaw", "nodes", "late"]
+            : ["node", "openclaw", "memory", "status"];
+        await registerSubCliByName(program, name, argv);
+        if (registration !== "nodes") {
+          const names = program.commands.map((command) => command.name());
+          expect(names.indexOf("late") < names.indexOf(name)).toBe(
+            registration === "pairing-before",
+          );
         }
         await parse();
       }
@@ -522,7 +564,8 @@ describe("native plugin alias preparation", () => {
   it("captures explicit aliases before lazy evaluation", () => {
     const f = fixture();
     const owner = createPluginCache();
-    const target = f.write(
+    const target = writeFile(
+      f.root,
       "target.ts",
       'import { value } from "fixture-alias"; export const marker = value;',
     );
@@ -541,7 +584,8 @@ describe("native plugin alias preparation", () => {
       expect(loaded).toMatchObject({ marker: "dist" });
       expect(same(target)).toBe(loaded);
       const next = getCachedPluginModuleLoader({ ...params, aliasMap: aliases });
-      const nextTarget = f.write(
+      const nextTarget = writeFile(
+        f.root,
         "next-target.ts",
         'import { value } from "fixture-alias"; export const marker = value;',
       );
