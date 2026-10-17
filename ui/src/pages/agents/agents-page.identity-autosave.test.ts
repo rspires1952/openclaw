@@ -202,3 +202,41 @@ it("does not restore a retained identity draft for a different profile", async (
   await secondPage.refreshAgents("ensure");
   expect(secondPage.identityDraft.name).toBeNull();
 });
+
+it("does not replay a retained draft into another Gateway while Agents is unmounted", async () => {
+  const firstClient = { request: vi.fn(async () => ({})) } as unknown as GatewayBrowserClient;
+  const secondClient = { request: vi.fn(async () => ({})) } as unknown as GatewayBrowserClient;
+  const agents = agentsCapability(async () => ({ agentId: "main", workspace: "main", files: [] }));
+  const currentGateway = gateway(snapshot(firstClient));
+  Object.assign(currentGateway, {
+    connection: { gatewayUrl: "ws://first-gateway.test" },
+    connectionRevision: 1,
+  });
+  const context = pageContext(currentGateway, agents);
+
+  const firstPage = createAgentsPage();
+  firstPage.context = context;
+  firstPage.connect();
+  firstPage.agentsSelectedId = "main";
+  firstPage.identityDraft = {
+    name: "First Gateway",
+    emoji: null,
+    avatar: "data:image/png;base64,AAAA",
+  };
+  firstPage.disconnect();
+
+  Object.assign(currentGateway, {
+    snapshot: snapshot(secondClient),
+    connection: { gatewayUrl: "ws://second-gateway.test" },
+    connectionRevision: 2,
+  });
+  const secondPage = createAgentsPage();
+  secondPage.context = context;
+  secondPage.connect();
+  await secondPage.refreshAgents("ensure");
+  expect(secondPage.identityDraft).toEqual({ name: null, emoji: null, avatar: null });
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 30);
+  });
+  expect(secondClient.request).not.toHaveBeenCalledWith("agents.update", expect.anything());
+});

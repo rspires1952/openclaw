@@ -168,6 +168,7 @@ export class AgentsPageState
       this.resetModelCatalog();
     },
     onSnapshot: ({ snapshot: gatewaySnapshot, becameAvailable, becameConnected }) => {
+      this.identitySaves = this.selectionDrafts.bindContext(this.context);
       this.selectionDrafts.observeGateway(gatewaySnapshot);
       this.syncGatewayState();
       if (becameAvailable && !becameConnected) {
@@ -403,6 +404,7 @@ export class AgentsPageState
 
   private resetForSourceChange() {
     this.selectionDrafts.clear();
+    this.identitySaves = this.selectionDrafts.bindContext(this.context);
     this.agentsList = null;
     this.agentsSelectedId = null;
     this.resetSelectionState();

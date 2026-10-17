@@ -22,9 +22,16 @@ type Selection = {
 };
 
 type RetainedIdentityWork = {
+  scope: GatewayScope;
   profileId: string | null;
   identities: Map<string, { profileId: string | null; draft: AgentIdentityDraft }>;
   saves: Map<string, RetainedIdentitySave>;
+};
+
+type GatewayScope = {
+  gateway: ApplicationContext["gateway"];
+  connectionRevision: number;
+  gatewayUrl: string;
 };
 
 export type RetainedIdentitySave = {
@@ -36,9 +43,20 @@ export type RetainedIdentitySave = {
 const retainedIdentityWork = new WeakMap<ApplicationContext, RetainedIdentityWork>();
 
 function identityWorkFor(context: ApplicationContext): RetainedIdentityWork {
+  const gateway = context.gateway;
+  const scope: GatewayScope = {
+    gateway,
+    connectionRevision: gateway.connectionRevision ?? 0,
+    gatewayUrl: gateway.connection?.gatewayUrl ?? "",
+  };
   let work = retainedIdentityWork.get(context);
-  if (!work) {
-    work = { profileId: null, identities: new Map(), saves: new Map() };
+  if (
+    !work ||
+    work.scope.gateway !== scope.gateway ||
+    work.scope.connectionRevision !== scope.connectionRevision ||
+    work.scope.gatewayUrl !== scope.gatewayUrl
+  ) {
+    work = { scope, profileId: null, identities: new Map(), saves: new Map() };
     retainedIdentityWork.set(context, work);
   }
   return work;
@@ -57,7 +75,11 @@ export class AgentSelectionDrafts {
   ) {}
 
   bindContext(context: ApplicationContext): Map<string, RetainedIdentitySave> {
-    this.lifetime = identityWorkFor(context);
+    const lifetime = identityWorkFor(context);
+    if (this.lifetime && this.lifetime !== lifetime) {
+      resetIdentityDraft(this.host);
+    }
+    this.lifetime = lifetime;
     this.identities = this.lifetime.identities;
     this.profileId = this.lifetime.profileId;
     return this.lifetime.saves;
