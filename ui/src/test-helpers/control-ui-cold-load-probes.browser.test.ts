@@ -71,7 +71,7 @@ describe("serialized cold-load probes", () => {
         receiverPreserved: true,
         nativeRestored: true,
         storedOwner: true,
-        ownerProbes: ownerProbes,
+        ownerProbes,
         sidebarMethods: ownerProbes ? ["requestUpdate", "prepareRender", "commitRender"] : [],
         chatPasses: ownerProbes ? ["openclaw-chat-page", "openclaw-chat-pane"] : [],
         frameCount: ownerProbes ? 1 : 0,
