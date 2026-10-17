@@ -120,6 +120,30 @@ export async function readCurrentCodexAppServerBindingAsync(
   return decodeCurrentCodexAppServerBinding(key, await state.lookup(key), identity);
 }
 
+/** Final guards read the storage owner's committed facts through their retained lifetime. */
+export async function prepareCurrentCodexAppServerBinding(
+  state: {
+    prepareRead: (key: string) => Promise<
+      | {
+          read(): StoredCodexAppServerBinding | undefined;
+          release(): void;
+        }
+      | undefined
+    >;
+  },
+  identity: CodexAppServerBindingIdentity,
+) {
+  const key = bindingStoreKey(identity);
+  const prepared = await state.prepareRead(key);
+  if (!prepared) {
+    throw new Error("Codex binding guards require worker-published state");
+  }
+  return {
+    read: () => decodeCurrentCodexAppServerBinding(key, prepared.read(), identity),
+    release: () => prepared.release(),
+  };
+}
+
 function decodeCurrentCodexAppServerBinding(
   key: string,
   raw: unknown,

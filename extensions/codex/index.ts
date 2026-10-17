@@ -5,9 +5,10 @@ import {
   resolveLivePluginConfigObject,
 } from "openclaw/plugin-sdk/plugin-config-runtime";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import type {
-  PluginStateKeyedStore,
-  PluginStateSyncKeyedStore,
+import {
+  preparePluginStateRead,
+  type PluginStateKeyedStore,
+  type PluginStateSyncKeyedStore,
 } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { registerCodexCliMetadata } from "./cli-metadata.js";
 import {
@@ -154,6 +155,7 @@ export default definePluginEntry({
     const lazyBindingStateStore: Parameters<typeof createLazyCodexAppServerBindingStore>[0] = {
       // Final effect guards retain raw SDK revocations through 2026-12-31.
       lookup: (key) => openBindingStateStore().lookup(key),
+      prepareRead: (key) => preparePluginStateRead(openBindingMutationStore(), key),
       asyncReads: {
         lookup: (key) => openBindingMutationStore().lookup(key),
         lookupMany: (keys) => openBindingMutationStore().lookupMany(keys),

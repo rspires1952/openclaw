@@ -48,6 +48,7 @@ import {
   ownsStoredSessionGeneration,
   preserveCodexNativeSubagentSubmissions,
   readCurrentCodexAppServerBinding,
+  prepareCurrentCodexAppServerBinding,
   readCurrentCodexAppServerBindingAsync,
   readCurrentCodexAppServerBindings,
   readCurrentCodexNativeSubagentSubmissions,
@@ -153,6 +154,7 @@ export type CodexBindingStateStore = Omit<
   "lookup" | "assertLeaseCurrent"
 > &
   Pick<PluginStateSyncKeyedStore<StoredCodexAppServerBinding>, "lookup"> & {
+    prepareRead: Parameters<typeof prepareCurrentCodexAppServerBinding>[0]["prepareRead"];
     asyncReads: Pick<
       PluginStateKeyedStore<StoredCodexAppServerBinding>,
       "lookup" | "lookupMany" | "entries"
@@ -168,6 +170,9 @@ export type CodexAppServerBindingStore = {
   managedThreads?: CodexManagedThreadStore;
   /** Final synchronous effect guard; prepare ordinary reads through readAsync. */
   read(identity: CodexAppServerBindingIdentity): CodexAppServerThreadBinding | undefined;
+  prepareRead(
+    identity: CodexAppServerBindingIdentity,
+  ): ReturnType<typeof prepareCurrentCodexAppServerBinding>;
   readAsync(
     identity: CodexAppServerBindingIdentity,
   ): Promise<CodexAppServerThreadBinding | undefined>;
@@ -422,6 +427,7 @@ export function createCodexAppServerBindingStore(
 
   return {
     read: (identity) => readCurrentCodexAppServerBinding(state, identity),
+    prepareRead: (identity) => prepareCurrentCodexAppServerBinding(state, identity),
     readAsync: (identity) => readCurrentCodexAppServerBindingAsync(state.asyncReads, identity),
     readMany: (identities) => readCurrentCodexAppServerBindings(state.asyncReads, identities),
     readNativeSubagentAssignments: (identity, owner) =>

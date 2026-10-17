@@ -1,9 +1,17 @@
 import assert from "node:assert/strict";
 import { describe, expect, it } from "vitest";
 import { appendSessionManagerActor } from "../../agents/sessions/session-manager-actor-append.js";
+import {
+  appendTranscriptEvent,
+  appendTranscriptMessage,
+  replaceSessionEntry,
+  waitForSessionTranscriptProjection,
+} from "../../config/sessions/session-accessor.js";
 import { readTranscriptEventRows } from "../../config/sessions/session-accessor.sqlite-read.js";
 import type { SessionActorAuthority } from "../../config/sessions/session-actor-contract.js";
 import { createDurableSessionActorFactory } from "../../config/sessions/session-actor-durable.js";
+import { collectSessionAdmissionReferences } from "../../config/sessions/session-history-eviction-candidates.js";
+import { createReadonlySessionHistoryReader } from "../../gateway/session-history-readonly-reader.js";
 import { readOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db-identity.js";
 import { closeOpenClawAgentDatabases } from "../../state/openclaw-agent-db-lifecycle.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
@@ -23,6 +31,126 @@ describe
   "$agentEngine durable session actor",
   ({ stateEngine, agentEngine }) => {
     const pair = useMixedAgentPair(stateEngine, agentEngine);
+
+    it("protects admitted session keys and their previous generations during reclamation", async () => {
+      const database = withEngineStoreAdmission(() =>
+        openOpenClawAgentDatabase({ agentId: "main" }),
+      );
+      const scope = {
+        agentId: "main",
+        sessionKey: "agent:main:admitted-é",
+        storePath: database.path,
+      };
+      await replaceSessionEntry(scope, { sessionId: "admitted-old", updatedAt: 1 });
+      await replaceSessionEntry(scope, { sessionId: "admitted-current", updatedAt: 2 });
+      await replaceSessionEntry(
+        { ...scope, sessionKey: "agent:main:unrelated" },
+        { sessionId: "unrelated", updatedAt: 3 },
+      );
+      const protectedIds = withEngineStoreAdmission(() =>
+        collectSessionAdmissionReferences({
+          database,
+          admissionIdentities: [scope.sessionKey, "admitted-by-id"],
+        }),
+      );
+      expect(protectedIds).toEqual(
+        new Set([scope.sessionKey, "admitted-by-id", "admitted-old", "admitted-current"]),
+      );
+    });
+
+    it("reads cold compacted history and retains exact run visibility across a reset", async () => {
+      const database = withEngineStoreAdmission(() =>
+        openOpenClawAgentDatabase({ agentId: "main" }),
+      );
+      const scope = {
+        agentId: "main",
+        sessionKey: "agent:main:cold-history",
+        sessionId: "cold-history",
+        storePath: database.path,
+      };
+      const messages: Array<[string, Record<string, unknown>]> = [
+        [
+          "hidden-input",
+          {
+            role: "user",
+            content: "Internal checkpoint",
+            idempotencyKey: "worker-run:user",
+            provenance: {
+              kind: "inter_session",
+              sourceTool: "sessions_send",
+              sourceRole: "subagent",
+            },
+          },
+        ],
+        [
+          "hidden-answer",
+          { role: "assistant", content: "Internal answer", __openclaw: { runId: "worker-run" } },
+        ],
+        [
+          "other-steer",
+          { role: "user", content: "Another run", __openclaw: { steerTargetRunId: "other-run" } },
+        ],
+        [
+          "still-hidden",
+          { role: "assistant", content: "Still internal", __openclaw: { runId: "worker-run" } },
+        ],
+        [
+          "human-steer",
+          {
+            role: "user",
+            content: "Show progress",
+            __openclaw: { steerTargetRunId: "worker-run" },
+          },
+        ],
+        [
+          "visible-answer",
+          { role: "assistant", content: "Visible progress", __openclaw: { runId: "worker-run" } },
+        ],
+      ];
+      await replaceSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+      await appendTranscriptEvent(scope, { type: "session", version: 3, id: scope.sessionId });
+      for (const [index, [eventId, message]] of messages.entries()) {
+        await appendTranscriptMessage(scope, {
+          eventId,
+          parentId: messages[index - 1]?.[0] ?? null,
+          message,
+        });
+      }
+      for (const type of ["compaction", "reset"] as const) {
+        expect(
+          await appendTranscriptEvent(scope, {
+            type,
+            id: type,
+            parentId: type === "compaction" ? "visible-answer" : "compaction",
+            timestamp: new Date(2).toISOString(),
+            firstKeptEntryId: "hidden-input",
+            ...(type === "compaction"
+              ? { summary: "Compacted checkpoint", tokensBefore: 100 }
+              : { reason: "new" }),
+          }),
+        ).toBe(true);
+        await waitForSessionTranscriptProjection(scope);
+        withEngineStoreAdmission(() => closeOpenClawAgentDatabases(pair.root));
+        await cleanupSessionStateForTest({ stateDir: pair.root });
+        withEngineStoreAdmission(() => {
+          openOpenClawAgentDatabase({ agentId: "main" });
+          const reader = createReadonlySessionHistoryReader({
+            transcript: { ...scope, sessionFile: scope.sessionKey },
+            database: { agentId: scope.agentId, path: scope.storePath },
+            entryValidationKey: scope.sessionKey,
+          });
+          const page = reader.readHistoryEventPage({ maxMessages: 20, offset: 0 });
+          expect(page.events.map(({ event }) => event)).toEqual(
+            [...messages.map(([id]) => id), type].map((id) => expect.objectContaining({ id })),
+          );
+          const visibility = reader.subagentCoordination;
+          expect(visibility.isSubagentRunMessage("worker-run", 2)).toBe(true);
+          expect(visibility.isSubagentRunMessage("worker-run", 4)).toBe(true);
+          expect(visibility.isSubagentRunMessage("worker-run", 6)).toBe(false);
+          expect(visibility.isSubagentRunMessage("missing-run", 6)).toBe(false);
+        });
+      }
+    });
 
     it("commits transcript appends, retains warm state, rolls back refused writes, and reopens", async () => {
       const options = { agentId: "main", env: process.env };

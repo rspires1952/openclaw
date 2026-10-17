@@ -25,6 +25,20 @@ export function createCodexTestBindingStateStore(
     comparison: JSON.stringify([key, values.get(key)]),
   });
   return {
+    prepareRead: async (key) => {
+      let active = true;
+      return {
+        read() {
+          if (!active) {
+            throw new Error("Codex binding reader is released");
+          }
+          return values.get(key);
+        },
+        release() {
+          active = false;
+        },
+      };
+    },
     asyncReads: {
       lookup: async (key) => values.get(key),
       lookupMany: async (keys) => keys.map((key) => ({ ok: true, value: values.get(key) })),

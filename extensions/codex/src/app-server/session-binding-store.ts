@@ -10,6 +10,7 @@ import {
 import {
   readCurrentNativePendingAssignments,
   readCurrentCodexAppServerBinding,
+  prepareCurrentCodexAppServerBinding,
   readCurrentCodexAppServerBindingAsync,
   readCurrentCodexAppServerBindings,
   readCurrentCodexNativeSubagentSubmissions,
@@ -35,6 +36,7 @@ export function createLazyCodexAppServerBindingStore(
   return {
     ...(managedThreads ? { managedThreads } : {}),
     read: (identity) => readCurrentCodexAppServerBinding(state, identity),
+    prepareRead: (identity) => prepareCurrentCodexAppServerBinding(state, identity),
     readAsync: (identity) => readCurrentCodexAppServerBindingAsync(state.asyncReads, identity),
     readMany: (identities) => readCurrentCodexAppServerBindings(state.asyncReads, identities),
     readNativeSubagentAssignments: (identity, owner) =>
