@@ -1,5 +1,6 @@
 import { expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
+import type { ApplicationConfigCapability } from "../../app/config.ts";
 import { mountSolid } from "../../test-helpers/solid-render.tsx";
 import { createAgentViewTestProps } from "./agents-view.test-helpers.ts";
 import { Agents } from "./view.tsx";
@@ -58,6 +59,36 @@ it("opens agent avatar selection from the keyboard and respects the busy state",
     vi.restoreAllMocks();
     mounted.dispose();
 
+    container.remove();
+  }
+});
+
+it("keeps avatar editing usable when upload policy changes without remounting", async () => {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const base = createAgentViewTestProps();
+  const withUploads = (enabled: boolean) => ({
+    ...base,
+    overview: {
+      ...base.overview,
+      applicationConfig: { current: { uploadsEnabled: enabled } } as ApplicationConfigCapability,
+    },
+  });
+  const mounted = mountSolid(Agents, withUploads(false), container);
+  try {
+    mounted.update(withUploads(true));
+    await page.getByRole("button", { name: "Edit avatar", exact: true }).click();
+    const popover = container.querySelector<HTMLElement>(".agent-identity-editor__popover");
+    expect(popover?.matches(":popover-open")).toBe(true);
+
+    mounted.update(withUploads(false));
+    expect(popover?.matches(":popover-open")).toBe(false);
+
+    mounted.update(withUploads(true));
+    await page.getByRole("button", { name: "Edit avatar", exact: true }).click();
+    expect(popover?.matches(":popover-open")).toBe(true);
+  } finally {
+    mounted.dispose();
     container.remove();
   }
 });

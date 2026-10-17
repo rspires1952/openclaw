@@ -336,7 +336,7 @@ describe("AgentsPage routing", () => {
   });
 
   it.each(["same target", "different target", "excluded target", "profile", "source"])(
-    "retains an identity draft through discovery retirement only for its current owner (%s)",
+    "retains an identity draft for its original agent and profile through selection changes (%s)",
     (change) => {
       const listeners = new Set<() => void>();
       const client = {
@@ -390,7 +390,7 @@ describe("AgentsPage routing", () => {
         listeners.forEach((listener) => listener());
         expect(page.agentsSelectedId).toBe(change === "excluded target" ? "research" : "main");
         expect(page.identityDraft.name).toBe(
-          change === "same target" ? "Lunar museum guide" : null,
+          change === "same target" || change === "different target" ? "Lunar museum guide" : null,
         );
       } finally {
         page.subscriptions.hostDisconnected();

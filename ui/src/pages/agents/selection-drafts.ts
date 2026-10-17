@@ -17,21 +17,17 @@ type AgentSelectionDraftHost = AgentFilesState & {
 
 type Selection = {
   selectedId: string | null;
-  intentRevision: number;
-  awaitingRoster: boolean;
   profileId: string | null;
 };
 
 /** Owns private editor drafts across the selected target's presentation lifetime. */
 export class AgentSelectionDrafts {
   private readonly files = new Map<string, RetainedAgentFileDrafts>();
+  private readonly identities = new Map<
+    string,
+    { profileId: string | null; draft: AgentIdentityDraft }
+  >();
   private profileId: string | null = null;
-  private identity: {
-    agentId: string;
-    profileId: string | null;
-    intentRevision: number;
-    draft: AgentIdentityDraft;
-  } | null = null;
 
   constructor(
     private readonly host: AgentSelectionDraftHost,
@@ -44,7 +40,7 @@ export class AgentSelectionDrafts {
     }
     const profileId = snapshot.selfUser?.id ?? null;
     if (profileId !== this.profileId) {
-      this.identity = null;
+      this.identities.clear();
       resetIdentityDraft(this.host);
       this.profileId = profileId;
     }
@@ -52,38 +48,31 @@ export class AgentSelectionDrafts {
 
   select(selection: Selection) {
     const { host } = this;
-    const { selectedId, intentRevision, awaitingRoster, profileId } = selection;
-    if (this.identity?.intentRevision !== intentRevision) {
-      this.identity = null;
-    }
+    const { selectedId, profileId } = selection;
     if (selectedId === host.agentsSelectedId) {
-      return;
+      return false;
     }
     if (host.agentsSelectedId) {
       const drafts = retainAgentFileDrafts(host);
       if (drafts) {
         this.files.set(host.agentsSelectedId, drafts);
       }
-      // Retire the editor with discovery, retaining only its private unsaved draft.
-      this.identity =
-        !selectedId &&
-        awaitingRoster &&
-        Object.values(host.identityDraft).some((value) => value !== null)
-          ? {
-              agentId: host.agentsSelectedId,
-              profileId: this.profileId,
-              intentRevision,
-              draft: host.identityDraft,
-            }
-          : null;
+      if (Object.values(host.identityDraft).some((value) => value !== null)) {
+        this.identities.set(host.agentsSelectedId, {
+          profileId: this.profileId,
+          draft: host.identityDraft,
+        });
+      }
     }
     host.agentsSelectedId = selectedId;
     this.resetSelection();
+    let restoredIdentity = false;
     if (selectedId) {
-      const identity = this.identity;
-      this.identity = null;
-      if (identity?.agentId === selectedId && identity.profileId === profileId) {
-        host.identityDraft = identity.draft;
+      const retained = this.identities.get(selectedId);
+      this.identities.delete(selectedId);
+      if (retained?.profileId === profileId) {
+        host.identityDraft = retained.draft;
+        restoredIdentity = true;
       }
     }
     const files = selectedId ? this.files.get(selectedId) : undefined;
@@ -94,10 +83,11 @@ export class AgentSelectionDrafts {
       host.agentFileConflict = files.conflict;
       // Loaded bases stay empty: returning must read disk while retaining the draft's ancestry.
     }
+    return restoredIdentity;
   }
 
   clear() {
     this.files.clear();
-    this.identity = null;
+    this.identities.clear();
   }
 }

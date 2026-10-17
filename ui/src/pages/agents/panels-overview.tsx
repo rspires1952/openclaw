@@ -1,4 +1,5 @@
 import {
+  createEffect,
   createMemo,
   createSignal,
   createUniqueId,
@@ -235,6 +236,14 @@ export function AgentOverview(
   const avatarOverlay = createOverlay(avatarPickerId, undefined, {
     exclusiveGroup: "menu",
   });
+  createEffect(
+    () => uploadsEnabled(params.applicationConfig),
+    (enabled) => {
+      if (!enabled) {
+        avatarOverlay.request(false);
+      }
+    },
+  );
   let avatarTrigger: HTMLButtonElement | undefined;
   let avatarSurface: HTMLDivElement | undefined;
   onSettled(() => {
@@ -282,36 +291,30 @@ export function AgentOverview(
       >
         <div class="settings-row settings-row--stacked">
           <div class="agent-identity-editor">
-            {uploadsEnabled(params.applicationConfig) ? (
-              <button
-                ref={(element) => (avatarTrigger = element)}
-                type="button"
-                class="agent-identity-editor__avatar"
-                aria-label={t("agents.identity.chooseAvatar")}
-                aria-expanded={avatarPickerOpen() ? "true" : "false"}
-                aria-controls={avatarPickerId}
-                disabled={identityBusy()}
-                onClick={() => avatarOverlay.request(!avatarOverlay.open)}
-              >
-                {renderIdentityAvatar()}
-                <span class="agent-identity-editor__avatar-edit" aria-hidden="true">
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  >
-                    <path d="m16 5 3 3M4 20l4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z" />
-                  </svg>
-                </span>
-              </button>
-            ) : (
-              <span class="agent-identity-editor__avatar" aria-hidden="true">
-                {renderIdentityAvatar()}
+            <button
+              ref={(element) => (avatarTrigger = element)}
+              type="button"
+              class="agent-identity-editor__avatar"
+              aria-label={t("agents.identity.chooseAvatar")}
+              aria-expanded={avatarPickerOpen() ? "true" : "false"}
+              aria-controls={avatarPickerId}
+              disabled={identityBusy() || !uploadsEnabled(params.applicationConfig)}
+              onClick={() => avatarOverlay.request(!avatarOverlay.open)}
+            >
+              {renderIdentityAvatar()}
+              <span class="agent-identity-editor__avatar-edit" aria-hidden="true">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <path d="m16 5 3 3M4 20l4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z" />
+                </svg>
               </span>
-            )}
+            </button>
             <div class="agent-identity-editor__content">
               <div class="agent-identity-editor__fields">
                 <label class="field">

@@ -8,7 +8,7 @@ import type {
 } from "../../api/types.ts";
 import { pathForAgentPanel } from "../../app-route-paths.ts";
 import { togglePinnedAgent } from "../../app/bootstrap-navigation-preferences.ts";
-import type { ApplicationContext } from "../../app/context.ts";
+import type { ApplicationContext, ApplicationGatewaySnapshot } from "../../app/context.ts";
 import {
   beginPanelRefresh,
   completePanelRefresh,
@@ -129,6 +129,14 @@ export class AgentsPageState
   @viewState() identitySaving = false;
   @viewState() identityError: string | null = null;
   private identityAutosaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly identitySaves = new Map<
+    string,
+    {
+      client: GatewayBrowserClient;
+      snapshot: ApplicationGatewaySnapshot | null;
+      promise: Promise<void>;
+    }
+  >();
   @viewState() agentSkillsLoading = false;
   @viewState() agentSkillsError: string | null = null;
   @viewState() agentSkillsReport: SkillStatusReport | null = null;
@@ -364,12 +372,13 @@ export class AgentsPageState
 
   private syncSettingsSelection() {
     const selection = this.context.settingsAgentSelection;
-    this.selectionDrafts.select({
+    const restoredIdentity = this.selectionDrafts.select({
       selectedId: selection.state.selectedId,
-      intentRevision: selection.intentRevision,
-      awaitingRoster: !selection.state.selectedId && !this.context.agents.state.agentsList,
       profileId: this.context.gateway.snapshot.selfUser?.id ?? null,
     });
+    if (restoredIdentity) {
+      this.scheduleIdentitySave(0);
+    }
   }
 
   private syncCurrentAgentFiles(agents = this.context.agents) {
@@ -797,14 +806,25 @@ export class AgentsPageState
     }
     const client = this.client;
     const agentId = this.agentsSelectedId;
-    if (!client || !agentId || this.identitySaving) {
+    if (!client || !agentId) {
+      return;
+    }
+    const activeSave = this.identitySaves.get(agentId);
+    if (activeSave?.client === client && activeSave.snapshot === this.gateway.snapshot) {
+      await activeSave.promise;
+      if (this.client === client && this.agentsSelectedId === agentId) {
+        this.scheduleIdentitySave(0);
+      }
+      return;
+    }
+    if (this.identitySaving) {
       return;
     }
     const generation = this.requestGeneration;
     const agents = this.context.agents;
     const agentIdentity = this.context.agentIdentity;
     const draftAtStart = this.identityDraft;
-    await saveIdentityDraft({
+    const save = saveIdentityDraft({
       host: this,
       config: this.context.config,
       expectedClient: client,
@@ -819,6 +839,14 @@ export class AgentsPageState
         this.isCurrentRequest(client, generation, agentId, { agents, agentIdentity }),
       onSaved: () => this.syncAgentState(agents),
     });
+    this.identitySaves.set(agentId, { client, snapshot: this.gateway.snapshot, promise: save });
+    try {
+      await save;
+    } finally {
+      if (this.identitySaves.get(agentId)?.promise === save) {
+        this.identitySaves.delete(agentId);
+      }
+    }
     if (
       this.isCurrentRequest(client, generation, agentId, { agents, agentIdentity }) &&
       this.identityDraft !== draftAtStart

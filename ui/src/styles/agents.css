@@ -119,6 +119,10 @@
   height: 20px;
 }
 
+.agent-identity-editor__avatar:disabled .agent-identity-editor__avatar-edit {
+  display: none;
+}
+
 .agent-identity-editor__avatar:is(button):is(:hover, :focus-visible, [aria-expanded="true"])
   .agent-identity-editor__avatar-edit {
   opacity: 1;
