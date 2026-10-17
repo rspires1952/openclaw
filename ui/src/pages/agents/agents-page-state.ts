@@ -1126,6 +1126,7 @@ export class AgentsPageState
           const generation = this.requestGeneration;
           if (
             !client ||
+            !selectedAgentId ||
             !canEditIdentity() ||
             !this.canCall("agents.avatar.generate", "operator.admin")
           ) {
@@ -1133,7 +1134,7 @@ export class AgentsPageState
           }
           const result = await client.request<GeneratedAvatar>(
             "agents.avatar.generate",
-            { prompt },
+            { agentId: selectedAgentId, prompt },
             { timeoutMs: 100_000 },
           );
           if (!this.isCurrentRequest(client, generation, selectedAgentId ?? undefined, {})) {

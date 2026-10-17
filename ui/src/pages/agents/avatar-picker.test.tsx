@@ -117,14 +117,12 @@ it("shows a Blobster silhouette and generating label while a preview is pending"
 });
 
 it("shows generation failures without changing the selected avatar", async () => {
-  const view = mount(
-    vi.fn().mockRejectedValue(new Error("Sign in to ClawHub to generate an avatar.")),
-  );
+  const view = mount(vi.fn().mockRejectedValue(new Error("Selected model is unavailable.")));
   view.describe("Explorer");
   view.click("Generate");
   await waitForFast(() =>
     expect(view.container.querySelector('[role="alert"]')?.textContent).toContain(
-      "Sign in to ClawHub",
+      "Selected model is unavailable",
     ),
   );
   expect(view.props.onSelect).not.toHaveBeenCalled();
